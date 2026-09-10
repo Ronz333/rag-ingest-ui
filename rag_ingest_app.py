@@ -2,13 +2,13 @@ import os
 import re
 import uuid
 import shutil
-import tempfile
 import zipfile
+import hashlib
 import subprocess
 import gradio as gr
 import ollama
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 from pypdf import PdfReader
 
 # Konfiguration
@@ -18,19 +18,18 @@ LLM_MODEL = os.getenv("OLLAMA_MODEL", "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruc
 EMBED_MODEL = "bge-m3"
 COLLECTION_NAME = "pcb_knowledge_base"
 
-# Untergestützte Dateiendungen (Inklusive KiCad 8 S-Expressions, SPICE, C/C++)
-ALLOWED_EXTENSIONS = {
-    ".pdf", ".py", ".md", ".txt", ".json",
+# Relevante Dateiendungen (KiCad + Code + Doku)
+TEXT_EXTENSIONS = {
+    ".py", ".md", ".txt", ".json",
     ".kicad_sym", ".kicad_mod", ".kicad_pcb", ".kicad_sch",
-    ".cir", ".lib", ".c", ".cpp", ".h", ".hpp", ".dxf"
+    ".sch", ".net", ".cir", ".c", ".h", ".cpp"
 }
 
-# Clients initialisieren
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 qdrant_client = QdrantClient(url=QDRANT_HOST)
 
 def ensure_qdrant_collection(vector_size: int):
-    """Erstellt die Qdrant-Collection bei Bedarf."""
+    """Erstellt die Qdrant-Collection bei Bedarf mit korrekter Vektordimension."""
     collections = [c.name for c in qdrant_client.get_collections().collections]
     if COLLECTION_NAME not in collections:
         qdrant_client.create_collection(
@@ -38,116 +37,150 @@ def ensure_qdrant_collection(vector_size: int):
             vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
         )
 
+def calculate_sha256(text: str) -> str:
+    """Erzeugt einen eindeutigen SHA256-Hash des Dateiinhalts."""
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+def is_file_indexed(rel_path: str, content_hash: str) -> bool:
+    """Prüft im Qdrant-Payload, ob exakt dieser Pfad mit genau diesem Inhalt existiert."""
+    try:
+        results, _ = qdrant_client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="file_path", match=MatchValue(value=rel_path)),
+                    FieldCondition(key="content_hash", match=MatchValue(value=content_hash))
+                ]
+            ),
+            limit=1
+        )
+        return len(results) > 0
+    except Exception:
+        return False
+
 def extract_text_from_file(file_path: str) -> str:
-    """Liest Text aus PDFs sowie allen textbasierten EDA-Dateien (KiCad, SPICE, Code)."""
+    """Extrahiert Text aus PDFs und allen Klartext-/KiCad-Formaten."""
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".pdf":
-        reader = PdfReader(file_path)
-        return "\n".join([page.extract_text() or "" for page in reader.pages])
+        try:
+            reader = PdfReader(file_path)
+            return "\n".join([page.extract_text() or "" for page in reader.pages])
+        except Exception:
+            return ""
     else:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        except Exception:
+            return ""
 
-def collect_valid_files_from_dir(target_dir: str):
-    """Durchsucht einen Ordner rekursiv nach allen unterstützen Dateiformaten."""
-    valid_files = []
-    for root, dirs, files in os.walk(target_dir):
-        # .git Ordner ignorieren
+def collect_files_from_dir(directory: str):
+    """Durchsucht ein Verzeichnis rekursiv nach unterstützten Dateitypen."""
+    collected = []
+    for root, _, files in os.walk(directory):
         if ".git" in root:
             continue
-        for file in files:
-            ext = os.path.splitext(file)[1].lower()
-            if ext in ALLOWED_EXTENSIONS:
-                valid_files.append(os.path.join(root, file))
-    return valid_files
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in TEXT_EXTENSIONS or ext == ".pdf":
+                full_path = os.path.join(root, f)
+                rel_path = os.path.relpath(full_path, directory)
+                collected.append((rel_path, full_path))
+    return collected
 
 def process_and_ingest(files, github_url):
-    all_files_to_process = []
-    temp_dirs_to_clean = []
+    if not files and not (github_url and github_url.strip()):
+        yield "❌ Bitte Dateien/ZIPs hochladen oder eine GitHub-URL angeben."
+        return
 
-    status_log = f"🚀 Starte Ingestion-Pipeline\n"
+    session_id = str(uuid.uuid4())[:8]
+    temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
+    os.makedirs(temp_work_dir, exist_ok=True)
+
+    status_log = f"🚀 Starte Ingestion-Prozess (Session: {session_id})\n"
     status_log += f"Embedding-Modell: {EMBED_MODEL} | Qdrant: {QDRANT_HOST}\n\n"
     yield status_log
 
-    # 1. GitHub Repository verarbeiten (falls angegeben)
-    if github_url and github_url.strip():
-        url = github_url.strip()
-        status_log += f"📦 Clone GitHub Repository: {url}...\n"
-        yield status_log
+    files_to_process = []  # Liste aus (relativer Pfad, absoluter Dateipfad)
 
-        repo_dir = tempfile.mkdtemp(prefix="git_repo_")
-        temp_dirs_to_clean.append(repo_dir)
-
-        try:
-            subprocess.run(["git", "clone", "--depth", "1", url, repo_dir], check=True, capture_output=True, text=True)
-            repo_files = collect_valid_files_from_dir(repo_dir)
-            all_files_to_process.extend(repo_files)
-            status_log += f"   ↳ {len(repo_files)} relevante Dateien im Repository gefunden.\n\n"
-            yield status_log
-        except Exception as e:
-            status_log += f"   ❌ Fehler beim Clonen von Git: {e}\n\n"
-            yield status_log
-
-    # 2. Hochgeladene Dateien & ZIPs verarbeiten
-    if files:
-        for file_obj in files:
-            filepath = file_obj.name
-            filename = os.path.basename(filepath)
-            ext = os.path.splitext(filename)[1].lower()
-
-            if ext == ".zip":
-                status_log += f"📂 Entpacke ZIP-Archiv: {filename}...\n"
-                yield status_log
-                zip_dir = tempfile.mkdtemp(prefix="zip_extract_")
-                temp_dirs_to_clean.append(zip_dir)
-
-                with zipfile.ZipFile(filepath, 'r') as zip_ref:
-                    zip_ref.extractall(zip_dir)
-
-                extracted_files = collect_valid_files_from_dir(zip_dir)
-                all_files_to_process.extend(extracted_files)
-                status_log += f"   ↳ {len(extracted_files)} relevante Dateien im ZIP gefunden.\n\n"
-                yield status_log
-            elif ext in ALLOWED_EXTENSIONS:
-                all_files_to_process.append(filepath)
-
-    if not all_files_to_process:
-        status_log += "❌ Keine verarbeitbaren Dateien gefunden."
-        yield status_log
-        return
-
-    status_log += f"📊 Gesamtzahl zu verarbeitender Dateien: {len(all_files_to_process)}\n\n"
-    yield status_log
-
-    # 3. Schleife über alle gesammelten Dateien (LLM-Aufbereitung + Embedding)
     try:
-        for idx, filepath in enumerate(all_files_to_process, 1):
-            filename = os.path.basename(filepath)
-            status_log += f"[{idx}/{len(all_files_to_process)}] Verarbeite: {filename}\n"
+        # 1. Dateiuploads & ZIPs verarbeiten
+        if files:
+            for file_obj in files:
+                fname = os.path.basename(file_obj.name)
+                ext = os.path.splitext(fname)[1].lower()
+
+                if ext == ".zip":
+                    status_log += f"📦 Entpacke ZIP-Archiv: {fname}...\n"
+                    yield status_log
+                    zip_extract_dir = os.path.join(temp_work_dir, f"zip_{uuid.uuid4()[:4]}")
+                    with zipfile.ZipFile(file_obj.name, 'r') as zip_ref:
+                        zip_ref.extractall(zip_extract_dir)
+                    extracted = collect_files_from_dir(zip_extract_dir)
+                    files_to_process.extend(extracted)
+                    status_log += f"   ↳ {len(extracted)} relevante Datei(en) im ZIP gefunden.\n"
+                    yield status_log
+                elif ext in TEXT_EXTENSIONS or ext == ".pdf":
+                    files_to_process.append((fname, file_obj.name))
+
+        # 2. GitHub Repository crawlen
+        if github_url and github_url.strip():
+            url = github_url.strip()
+            status_log += f"🌐 Crawle GitHub Repository: {url}...\n"
+            yield status_log
+            repo_dir = os.path.join(temp_work_dir, "repo")
+            res = subprocess.run(
+                ["git", "clone", "--depth", "1", url, repo_dir],
+                capture_output=True, text=True
+            )
+            if res.returncode == 0:
+                repo_files = collect_files_from_dir(repo_dir)
+                files_to_process.extend(repo_files)
+                status_log += f"   ↳ {len(repo_files)} relevante Datei(en) im Git-Repo gefunden.\n"
+            else:
+                status_log += f"   ❌ Git-Clone fehlgeschlagen: {res.stderr[:200]}\n"
             yield status_log
 
-            # Text extrahieren
-            raw_text = extract_text_from_file(filepath)
+        if not files_to_process:
+            status_log += "\n❌ Keine unterstützten Dateien (.py, .kicad_*, .pdf, .md etc.) gefunden."
+            yield status_log
+            return
+
+        status_log += f"\n📊 Gesamt: {len(files_to_process)} Datei(en) in der Warteschlange.\n\n"
+        yield status_log
+
+        # 3. Indizierung der Dateien mit Hash-Deduplizierung
+        for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
+            raw_text = extract_text_from_file(file_path)
             if not raw_text.strip():
-                status_log += f"   ⚠️ Datei leer oder nicht lesbar. Übersprungen.\n"
+                status_log += f"[{idx}/{len(files_to_process)}] ⚠️ Datei leer/ungültig: {rel_path}\n"
                 yield status_log
                 continue
 
-            # LLM-Analyse
-            status_log += f"   ↳ Strukturierung via LLM ({LLM_MODEL})...\n"
+            content_hash = calculate_sha256(raw_text)
+
+            # Prüfe, ob exakt dieser relativer Pfad mit demselben Inhalt bereits in Qdrant liegt
+            if is_file_indexed(rel_path, content_hash):
+                status_log += f"[{idx}/{len(files_to_process)}] ⏭️ Unverändert übersprungen: {rel_path}\n"
+                yield status_log
+                continue
+
+            status_log += f"[{idx}/{len(files_to_process)}] Verarbeite: {rel_path}\n"
             yield status_log
 
+            # LLM-Analyse & Aufbereitung
             prompt = f"""
             Du bist ein Ingestion-Agent für ein EDA/PCB-RAG-System.
-            Analysiere den folgenden Inhalt (Datei: {filename}) und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+            Analysiere den folgenden Inhalt (z.B. Python-Code, KiCad-Symbol/Footprint, Doku) und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
 
+            DATEIPFAD: {rel_path}
             INHALT:
             {raw_text[:6000]}
 
             REGELN:
-            1. Generiere in der ERSTEN Zeile ein exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: SKIDL_API], [TAG: KICAD_SYMBOL], [TAG: KICAD_FOOTPRINT], [TAG: KICAD_PCBNEW], [TAG: SPICE_SIM].
-            2. Fasse den Zweck/Inhalt kurz zusammen.
-            3. Extrahiere oder erstelle ein lauffähiges Codebeispiel, eine Symbol-Spezifikation oder eine Konfigurationsanleitung.
+            1. Generiere in der ERSTEN Zeile ein exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: SKIDL_API], [TAG: KICAD_SYM], [TAG: KICAD_FOOTPRINT], [TAG: KICAD_PCBNEW], [TAG: SPICE_SIM].
+            2. Fasse den Zweck kurz zusammen.
+            3. Extrahiere oder erstelle ein lauffähiges Codebeispiel, eine Symbol-/Footprint-Beschreibung oder Konfiguration.
             """
 
             response = ollama_client.chat(
@@ -156,17 +189,18 @@ def process_and_ingest(files, github_url):
             )
             processed_md = response['message']['content']
 
-            # Tag extrahieren
             tag_match = re.search(r'\[TAG:\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
             category_tag = tag_match.group(1).upper() if tag_match else "GENERAL_EDA"
 
-            # Vektorisierung mit bge-m3
+            # Vektorisierung via bge-m3
             embed_res = ollama_client.embeddings(model=EMBED_MODEL, prompt=processed_md)
             vector = embed_res['embedding']
 
-            # Qdrant Ingest
             ensure_qdrant_collection(len(vector))
-            point_id = str(uuid.uuid4())
+
+            # Eindeutige ID basierend auf dem relativen Pfad
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, rel_path))
+
             qdrant_client.upsert(
                 collection_name=COLLECTION_NAME,
                 points=[
@@ -174,7 +208,9 @@ def process_and_ingest(files, github_url):
                         id=point_id,
                         vector=vector,
                         payload={
-                            "filename": filename,
+                            "filename": os.path.basename(rel_path),
+                            "file_path": rel_path,
+                            "content_hash": content_hash,
                             "category_tag": category_tag,
                             "content": processed_md
                         }
@@ -182,42 +218,40 @@ def process_and_ingest(files, github_url):
                 ]
             )
 
-            status_log += f"   ✅ Erfasst in '{COLLECTION_NAME}' | **Schlagwort: #{category_tag}**\n\n"
+            status_log += f"   ✅ In Qdrant indiziert | **Tag: #{category_tag}**\n\n"
             yield status_log
 
-        status_log += "🎉 Ingestion vollständig abgeschlossen! Die Daten stehen im Wissensspeicher bereit."
+        status_log += "🎉 Ingestion & Crawling vollständig abgeschlossen!"
         yield status_log
 
     finally:
-        # Aufräumen temporärer Ordner (Git Clones / Unzipped Folder)
-        for t_dir in temp_dirs_to_clean:
-            shutil.rmtree(t_dir, ignore_errors=True)
+        if os.path.exists(temp_work_dir):
+            shutil.rmtree(temp_work_dir, ignore_errors=True)
 
 # UI Definition
-with gr.Blocks(title="Universal RAG Knowledge Ingest") as demo:
-    gr.Markdown("# 📥 Universal PCB/EDA Knowledge Ingest")
-    gr.Markdown("Unterstützt Einzeldateien, `.zip`-Archive, KiCad 8 S-Expressions (`.kicad_sym`, `.kicad_mod`, `.kicad_sch`, `.kicad_pcb`), SPICE-Dateien sowie direkte **GitHub Repository URLs**.")
+with gr.Blocks(title="Universal RAG Ingest") as demo:
+    gr.Markdown("# 📥 Universal RAG Knowledge Ingestion")
+    gr.Markdown("Lade Quelldateien, **ZIP-Archive** oder ein **GitHub-Repository** hoch. Mit automatischer Hash-Deduplizierung & KiCad-Unterstützung.")
 
     with gr.Row():
         with gr.Column(scale=1):
-            github_input = gr.Textbox(
-                label="GitHub Repository URL (optional)",
-                placeholder="https://github.com/xesscorp/skidl",
-                lines=1
-            )
             file_input = gr.File(
-                label="Dateien & ZIP-Archive hochladen",
+                label="Dateien / ZIP-Archive hochladen",
                 file_count="multiple",
                 file_types=[
-                    ".pdf", ".py", ".md", ".txt", ".json", ".zip",
+                    ".zip", ".pdf", ".py", ".md", ".txt", ".json",
                     ".kicad_sym", ".kicad_mod", ".kicad_pcb", ".kicad_sch",
-                    ".cir", ".lib", ".c", ".cpp", ".h"
+                    ".sch", ".net", ".cir", ".c", ".h"
                 ]
             )
-            start_btn = gr.Button("🚀 Ingestion Starte", variant="primary")
+            github_input = gr.Textbox(
+                label="Oder GitHub Repository URL crawlen",
+                placeholder="https://github.com/xesscorp/skidl"
+            )
+            start_btn = gr.Button("🚀 Ingestion & Crawling Starten", variant="primary")
 
         with gr.Column(scale=1):
-            status_output = gr.Textbox(label="Prozess-Protokoll & Tags", interactive=False, lines=20)
+            status_output = gr.Textbox(label="Ingestion-Protokoll", interactive=False, lines=20)
 
     start_btn.click(
         fn=process_and_ingest,
