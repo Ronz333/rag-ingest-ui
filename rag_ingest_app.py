@@ -17,19 +17,16 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:32b")
 EMBED_MODEL = "bge-m3"
 
-# Umfassende Whitelist aller relevanten EDA-, Code- und Dokumentenformate
+# Whitelist aller unterstützten Formate
 TEXT_EXTENSIONS = {
-    # EDA & Hardware (KiCad, SPICE, SKiDL, Eagle)
     ".kicad_sym", ".kicad_mod", ".kicad_pcb", ".kicad_sch", ".kicad_prj", ".kicad_dru",
     ".sch", ".net", ".cir", ".lib", ".mod", ".sym", ".spice", ".sub", ".mcb", ".dxf",
-    # Code & Konfiguration
     ".py", ".md", ".txt", ".json", ".yaml", ".yml", ".c", ".h", ".cpp", ".hpp",
     ".js", ".ts", ".html", ".css", ".rst", ".csv", ".ini", ".conf", ".sh",
-    # Dokumente
     ".pdf"
 }
 
-# Vordefinierte Wissens-Kategorien & System-Prompts
+# Wissens-Kategorien & Prompts
 CATEGORIES = {
     "⚡ PCB & Hardware Design": {
         "collection": "pcb_knowledge_base",
@@ -79,7 +76,7 @@ ollama_client = ollama.Client(host=OLLAMA_HOST)
 qdrant_client = QdrantClient(url=QDRANT_HOST)
 
 def get_ollama_models():
-    """Lädt verfügbare Modelle von Ollama und kennzeichnet Cloud-/Lokal-Betrieb."""
+    """Lädt Ollama-Modelle und unterscheidet zwischen Lokal und Cloud."""
     try:
         res = ollama_client.list()
         models_data = res.get('models', []) if isinstance(res, dict) else getattr(res, 'models', [])
@@ -143,7 +140,6 @@ def extract_text_from_file(file_path: str) -> str:
             return ""
 
 def collect_files_from_dir(directory: str, target_subfolder: str = ""):
-    """Durchsucht Verzeichnisse gezielt nach allen erlaubten Erweiterungen."""
     collected = []
     base_search_path = os.path.join(directory, target_subfolder) if target_subfolder else directory
 
@@ -161,10 +157,23 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
                 collected.append((rel_path, full_path))
     return collected
 
+def handle_folder_selection(selected):
+    """Entfernt automatisch die Gesamtauswahl, sobald ein Unterordner angeklickt wird."""
+    if not selected:
+        return []
+    if "ALL_REPO" in selected and len(selected) > 1:
+        return [item for item in selected if item != "ALL_REPO"]
+    return selected
+
 def scan_github_repository(github_url):
-    """Klagt ein Repository vorab in ein Temp-Verzeichnis und listet alle Unterordner auf."""
+    """Klont das Repository vorab, baut eine Ordner-Baumstruktur und erkennt Dateiformate."""
     if not github_url or not github_url.strip():
-        return gr.update(choices=[], value=[], visible=False), "", "❌ Bitte valide Repository URL angeben."
+        return (
+            gr.update(choices=[], value=[], visible=False),
+            gr.update(choices=[], value=[], visible=False),
+            "",
+            "❌ Bitte valide Repository URL angeben."
+        )
 
     session_id = str(uuid.uuid4())[:8]
     repo_dir = os.path.join("/tmp", f"scan_repo_{session_id}")
@@ -175,28 +184,65 @@ def scan_github_repository(github_url):
     )
 
     if res.returncode != 0:
-        return gr.update(choices=[], value=[], visible=False), "", f"❌ Git-Clone fehlgeschlagen:\n{res.stderr[:300]}"
+        return (
+            gr.update(choices=[], value=[], visible=False),
+            gr.update(choices=[], value=[], visible=False),
+            "",
+            f"❌ Git-Clone fehlgeschlagen:\n{res.stderr[:300]}"
+        )
 
-    # Unterordner identifizieren
-    subfolders = ["/ (Gesamtes Repository)"]
-    for root, dirs, _ in os.walk(repo_dir):
+    # 1. Verzeichnisse mit Baumstruktur-Indentation analysieren
+    valid_dirs = set()
+    ext_counts = {}
+
+    for root, _, files in os.walk(repo_dir):
         if ".git" in root:
             continue
-        for d in dirs:
-            if d == ".git":
-                continue
-            full_sub_path = os.path.join(root, d)
-            rel_sub_path = os.path.relpath(full_sub_path, repo_dir)
-            subfolders.append(rel_sub_path)
+        has_valid = False
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in TEXT_EXTENSIONS:
+                has_valid = True
+                ext_counts[ext] = ext_counts.get(ext, 0) + 1
 
-    subfolders.sort()
-    log_msg = f"✅ Repository erfolgreich analysiert! {len(subfolders)-1} Unterordner gefunden. Bitte wähle unten die Zielordner aus."
+        if has_valid:
+            rel = os.path.relpath(root, repo_dir)
+            if rel == ".":
+                valid_dirs.add("")
+            else:
+                parts = rel.split(os.sep)
+                for i in range(1, len(parts) + 1):
+                    valid_dirs.add(os.path.sep.join(parts[:i]))
 
-    return gr.update(choices=subfolders, value=["/ (Gesamtes Repository)"], visible=True), repo_dir, log_msg
+    sorted_dirs = sorted(list(valid_dirs))
+    folder_choices = [("📁 / (Gesamtes Repository)", "ALL_REPO")]
 
-def process_and_ingest(files, scanned_repo_path, selected_folders, category_key, selected_model):
+    for d in sorted_dirs:
+        if d == "":
+            continue
+        parts = d.split(os.sep)
+        depth = len(parts) - 1
+        indent = "│   " * depth + "├── "
+        label = f"{indent}📁 {parts[-1]}"
+        folder_choices.append((label, d))
+
+    ext_choices = [
+        (f"{ext} ({count} Dateie{'n' if count > 1 else ''})", ext)
+        for ext, count in sorted(ext_counts.items(), key=lambda x: x[0])
+    ]
+
+    log_msg = f"✅ Repository gescannt! {len(folder_choices)-1} Ordner und {len(ext_choices)} Dateiformate erkannt."
+
+    return (
+        gr.update(choices=folder_choices, value=["ALL_REPO"], visible=True),
+        gr.update(choices=ext_choices, value=[e[1] for e in ext_choices], visible=True),
+        repo_dir,
+        log_msg
+    )
+
+def process_and_ingest(files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model):
     if not files and not (scanned_repo_path and selected_folders):
-        yield "❌ Bitte entweder Dateien/ZIPs hochladen oder ein Repository scannen und auswählen."
+        yield "❌ Bitte entweder Dateien hochladen oder ein Repository scannen und auswählen."
         return
 
     category_info = CATEGORIES.get(category_key, CATEGORIES["📚 Allgemeines Wissen & Dokumente"])
@@ -215,57 +261,67 @@ def process_and_ingest(files, scanned_repo_path, selected_folders, category_key,
     files_to_process = []
 
     try:
-        # 1. Dateiuploads & ZIP-Dateien
+        # 1. Uploads & ZIPs
         if files:
             for file_obj in files:
                 fname = os.path.basename(file_obj.name)
                 ext = os.path.splitext(fname)[1].lower()
 
                 if ext == ".zip":
-                    status_log += f"📦 Entpacke ZIP-Archiv: {fname}...\n"
+                    status_log += f"📦 Entpacke ZIP: {fname}...\n"
                     yield status_log
                     zip_extract_dir = os.path.join(temp_work_dir, f"zip_{uuid.uuid4()[:4]}")
                     with zipfile.ZipFile(file_obj.name, 'r') as zip_ref:
                         zip_ref.extractall(zip_extract_dir)
                     extracted = collect_files_from_dir(zip_extract_dir)
                     files_to_process.extend(extracted)
-                    status_log += f"   ↳ {len(extracted)} relevante Datei(en) im ZIP gefunden.\n"
+                    status_log += f"   ↳ {len(extracted)} Datei(en) im ZIP entpackt.\n"
                     yield status_log
                 elif ext in TEXT_EXTENSIONS:
                     files_to_process.append((fname, file_obj.name))
 
-        # 2. Ausgewählte Ordner aus gescanntem Repository
+        # 2. Ausgewählte Git-Ordner
         if scanned_repo_path and os.path.exists(scanned_repo_path) and selected_folders:
-            status_log += f"🌐 Verarbeite gewählte Ordner aus Git-Repository...\n"
+            status_log += f"🌐 Erfassung ausgewählter Git-Ordner...\n"
             yield status_log
 
-            if "/ (Gesamtes Repository)" in selected_folders:
+            if "ALL_REPO" in selected_folders:
                 repo_files = collect_files_from_dir(scanned_repo_path)
-                files_to_process.extend(repo_files)
             else:
+                repo_files = []
                 for subfolder in selected_folders:
-                    repo_files = collect_files_from_dir(scanned_repo_path, target_subfolder=subfolder)
-                    files_to_process.extend(repo_files)
+                    repo_files.extend(collect_files_from_dir(scanned_repo_path, target_subfolder=subfolder))
 
-            status_log += f"   ↳ {len(files_to_process)} relevante Datei(en) aus Git-Auswahl erfasst.\n"
-            yield status_log
+            files_to_process.extend(repo_files)
 
         if not files_to_process:
-            status_log += "\n❌ Keine unterstützen Dateien in der Auswahl gefunden."
+            status_log += "\n❌ Keine Dateien erfasst."
             yield status_log
             return
 
-        # Duplikate in der lokalen Warteschlange filtern
+        # 3. Filterung nach ausgewählten Dateiendungen
+        if selected_exts:
+            files_to_process = [
+                (rel_p, full_p) for rel_p, full_p in files_to_process
+                if os.path.splitext(rel_p)[1].lower() in selected_exts
+            ]
+
+        # Duplikate entfernen
         files_to_process = list({rel_p: full_p for rel_p, full_p in files_to_process}.items())
 
-        status_log += f"\n📊 Gesamt: {len(files_to_process)} eindeutige Datei(en) zur Indizierung bereit.\n\n"
+        if not files_to_process:
+            status_log += "\n❌ Keine Dateien entsprechen den ausgewählten Dateiformat-Filtern."
+            yield status_log
+            return
+
+        status_log += f"📊 Gesamt: {len(files_to_process)} eindeutige Datei(en) zur Indizierung bereit.\n\n"
         yield status_log
 
-        # 3. Indizierung & Deduplizierung via Hash
+        # 4. Indizierung & Deduplizierung via Hash
         for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
             raw_text = extract_text_from_file(file_path)
             if not raw_text.strip():
-                status_log += f"[{idx}/{len(files_to_process)}] ⚠️ Datei leer oder ungültig: {rel_path}\n"
+                status_log += f"[{idx}/{len(files_to_process)}] ⚠️ Datei leer/ungültig: {rel_path}\n"
                 yield status_log
                 continue
 
@@ -337,7 +393,7 @@ with gr.Blocks(title="Universal RAG Knowledge Ingest") as demo:
     repo_state = gr.State("")
 
     gr.Markdown("# 📥 Universal RAG Knowledge Ingestion Pipeline")
-    gr.Markdown("Multilinguale Vektorisierung (`bge-m3`), Hash-Deduplizierung und Unterstützung für alle EDA- & Code-Formate.")
+    gr.Markdown("Multilinguale Vektorisierung (`bge-m3`), Hash-Deduplizierung und erweiterte Repository-Filterung.")
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -359,7 +415,7 @@ with gr.Blocks(title="Universal RAG Knowledge Ingest") as demo:
             )
 
             file_input = gr.File(
-                label="Dateien / ZIP-Archive hochladen (Keine Format-Einschränkungen)",
+                label="Dateien / ZIP-Archive hochladen",
                 file_count="multiple"
             )
 
@@ -371,16 +427,31 @@ with gr.Blocks(title="Universal RAG Knowledge Ingest") as demo:
                 scan_repo_btn = gr.Button("🔍 Repository scannen", variant="secondary")
 
                 folder_checkboxes = gr.CheckboxGroup(
-                    label="Ausgewählte Ordner im Repository",
+                    label="Ordnerstruktur im Repository",
                     choices=[],
                     visible=False,
                     interactive=True
                 )
 
-            start_btn = gr.Button("🚀 Ingestion Starte", variant="primary")
+                ext_checkboxes = gr.CheckboxGroup(
+                    label="Erkannte Dateiformate filtern",
+                    choices=[],
+                    visible=False,
+                    interactive=True
+                )
+
+            with gr.Row():
+                start_btn = gr.Button("🚀 Ingestion Starten", variant="primary", scale=3)
+                stop_btn = gr.Button("🛑 Ingestion Abbrechen", variant="stop", scale=2)
 
         with gr.Column(scale=1):
-            status_output = gr.Textbox(label="Ingestion-Protokoll", interactive=False, lines=24)
+            # autoscroll=True sorgt für automatisches Mitscrollen beim Yielding
+            status_output = gr.Textbox(
+                label="Ingestion-Protokoll",
+                interactive=False,
+                lines=25,
+                autoscroll=True
+            )
 
     refresh_models_btn.click(
         fn=lambda: gr.Dropdown(choices=get_ollama_models()),
@@ -390,13 +461,26 @@ with gr.Blocks(title="Universal RAG Knowledge Ingest") as demo:
     scan_repo_btn.click(
         fn=scan_github_repository,
         inputs=[github_input],
-        outputs=[folder_checkboxes, repo_state, status_output]
+        outputs=[folder_checkboxes, ext_checkboxes, repo_state, status_output]
     )
 
-    start_btn.click(
+    folder_checkboxes.change(
+        fn=handle_folder_selection,
+        inputs=[folder_checkboxes],
+        outputs=[folder_checkboxes]
+    )
+
+    start_event = start_btn.click(
         fn=process_and_ingest,
-        inputs=[file_input, repo_state, folder_checkboxes, category_dropdown, model_dropdown],
+        inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown],
         outputs=[status_output]
+    )
+
+    stop_btn.click(
+        fn=lambda log: log + "\n\n🛑 Ingestion durch Benutzer abgebrochen.",
+        inputs=[status_output],
+        outputs=[status_output],
+        cancels=[start_event]
     )
 
 if __name__ == "__main__":
