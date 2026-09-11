@@ -26,48 +26,55 @@ TEXT_EXTENSIONS = {
     ".pdf"
 }
 
-# Wissens-Kategorien & Prompts
+# Wissens-Kategorien & verschärfte System-Prompts gegen Halluzinationen
 CATEGORIES = {
     "⚡ PCB & Hardware Design": {
         "collection": "pcb_knowledge_base",
         "system_prompt": """Du bist ein Ingestion-Agent für ein EDA/PCB-RAG-System.
 Analysiere den Inhalt (z.B. Python-Code, KiCad-Symbol/Footprint, SPICE, Doku) und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
-REGELN:
-1. ERSTE Zeile: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: SKIDL_API], [TAG: KICAD_SYM], [TAG: KICAD_FOOTPRINT], [TAG: KICAD_PCBNEW], [TAG: SPICE_SIM].
-2. Fasse den Zweck kurz zusammen.
-3. Extrahiere oder erstelle ein lauffähiges Codebeispiel, eine Symbol-/Footprint-Beschreibung oder Konfiguration."""
+
+STRIKTE REGELN:
+1. ERSTE ZEILE: Zwingend ein exaktes Kategorie-Schlagwort in eckigen Klammern, z.B.:
+   [TAG: KICAD_FOOTPRINT], [TAG: KICAD_SYM], [TAG: KICAD_PCBNEW], [TAG: SKIDL_API] oder [TAG: SPICE_SIM].
+2. ABSOLUTES HALLUZINATIONSVERBOT: Verarbeite den DATEINAMEN und den INHALT strikt faktengetreu. Erfinde NIEMALS abweichende Bauteilabmessungen (z.B. kein 0603 ausgeben, wenn die Datei einen 10x12.5mm Kondensator beschreibt) oder falsche Pin-Belegungen!
+3. CODE-INTEGRITÄT: Bette bei KiCad-Dateien (.kicad_mod, .kicad_sym) und SPICE-Netzlisten (.cir) den bereitgestellten ORIGINAL-CODE 1:1 unverändert im Markdown-Codeblock ein.
+4. Zusammenfassung: Fasse Zweck, Parameter und Pinbelegung sachlich zusammen."""
     },
     "💻 Programmiersprachen & Software": {
         "collection": "programming_knowledge_base",
         "system_prompt": """Du bist ein Ingestion-Agent für Software-Dokumentation und Source Code.
 Analysiere den Quellcode oder die API-Dokumentation und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+
 REGELN:
-1. ERSTE Zeile: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: PYTHON_API], [TAG: ALGORITHM], [TAG: DOCKER], [TAG: REST_API].
+1. ERSTE ZEILE: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: PYTHON_API], [TAG: ALGORITHM], [TAG: DOCKER], [TAG: REST_API].
 2. Fasse Architektur und Verwendungszweck prägnant zusammen.
-3. Extrahiere sauberen, kommentierten Code."""
+3. Bette den originalen, kommentierten Code sauber ein."""
     },
     "🔬 Wissenschaft & Forschung": {
         "collection": "science_knowledge_base",
         "system_prompt": """Du bist ein Ingestion-Agent für wissenschaftliche Arbeiten und Forschungsdokumente.
 Analysiere das Dokument und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+
 REGELN:
-1. ERSTE Zeile: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: METHODOLOGY], [TAG: FORMULA], [TAG: EXPERIMENT].
+1. ERSTE ZEILE: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: METHODOLOGY], [TAG: FORMULA], [TAG: EXPERIMENT].
 2. Fasse Abstract, Methodik und Kernergebnisse zusammen."""
     },
     "🩺 Gesundheit & Medizin": {
         "collection": "health_knowledge_base",
         "system_prompt": """Du bist ein Ingestion-Agent für medizinische und gesundheitswissenschaftliche Dokumente.
 Analysiere den Text und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+
 REGELN:
-1. ERSTE Zeile: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: ANATOMY], [TAG: PHARMA], [TAG: CLINICAL_STUDY].
+1. ERSTE ZEILE: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: ANATOMY], [TAG: PHARMA], [TAG: CLINICAL_STUDY].
 2. Fasse Fachbegriffe und Wirkungsweisen sachlich zusammen."""
     },
     "📚 Allgemeines Wissen & Dokumente": {
         "collection": "general_knowledge_base",
         "system_prompt": """Du bist ein allgemeiner Dokumenten-Ingestion-Agent.
 Analysiere den Text und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+
 REGELN:
-1. ERSTE Zeile: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: SUMMARY], [TAG: GUIDE], [TAG: NOTES].
+1. ERSTE ZEILE: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: SUMMARY], [TAG: GUIDE], [TAG: NOTES].
 2. Erstelle eine verständliche Gliederung mit Kernaussagen."""
     }
 }
@@ -191,7 +198,6 @@ def scan_github_repository(github_url):
             f"❌ Git-Clone fehlgeschlagen:\n{res.stderr[:300]}"
         )
 
-    # 1. Verzeichnisse mit Baumstruktur-Indentation analysieren
     valid_dirs = set()
     ext_counts = {}
 
@@ -321,7 +327,7 @@ def process_and_ingest(files, scanned_repo_path, selected_folders, selected_exts
         for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
             raw_text = extract_text_from_file(file_path)
             if not raw_text.strip():
-                status_log += f"[{idx}/{len(files_to_process)}] ⚠️ Datei leer/ungültig: {rel_path}\n"
+                status_log += f"[{idx}/{len(files_to_process)}] ⚠️ Datei leer oder ungültig: {rel_path}\n"
                 yield status_log
                 continue
 
@@ -335,7 +341,17 @@ def process_and_ingest(files, scanned_repo_path, selected_folders, selected_exts
             status_log += f"[{idx}/{len(files_to_process)}] Verarbeite: {rel_path}\n"
             yield status_log
 
-            full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}"
+            # Strikter Prompt-Zusatz für strukturierte EDA-Dateien zur Vermeidung von Halluzinationen
+            ext = os.path.splitext(rel_path)[1].lower()
+            eda_prompt_guard = ""
+            if ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".cir", ".net"}:
+                eda_prompt_guard = (
+                    "\n\nSTRIKTE ANWEISUNG FÜR NATIVE EDA-DATEIEN:\n"
+                    "- Bette den bereitgestellten ORIGINALTEXT zwingend 1:1 im Markdown-Codeblock ein.\n"
+                    "- Erfinde keine Geometrien, Pin-Anzahlen oder Maße, die nicht im Originaltext stehen!\n"
+                )
+
+            full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}{eda_prompt_guard}"
 
             response = ollama_client.chat(
                 model=active_model,
@@ -346,7 +362,8 @@ def process_and_ingest(files, scanned_repo_path, selected_folders, selected_exts
             )
             processed_md = response['message']['content']
 
-            tag_match = re.search(r'\[TAG:\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
+            # Erweiterte Tag-Extraktion (fängt [TAG: ...], [PAGE: ...] und [CATEGORY: ...] ab)
+            tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
             category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
 
             embed_res = ollama_client.embeddings(model=EMBED_MODEL, prompt=processed_md)
@@ -445,7 +462,6 @@ with gr.Blocks(title="Universal RAG Knowledge Ingest") as demo:
                 stop_btn = gr.Button("🛑 Ingestion Abbrechen", variant="stop", scale=2)
 
         with gr.Column(scale=1):
-            # autoscroll=True sorgt für automatisches Mitscrollen beim Yielding
             status_output = gr.Textbox(
                 label="Ingestion-Protokoll",
                 interactive=False,
