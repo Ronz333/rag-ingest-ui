@@ -461,7 +461,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     repo_state = gr.State("")
 
     # Timer zum automatischen Synchronisieren des Status (alle 2 Sekunden)
-    status_timer = gr.Timer(every=2.0)
+    status_timer = gr.Timer(value=2.0)
 
     gr.Markdown("# 🏢 Universal RAG Ingestion Control Center")
     gr.Markdown("Entkoppelter Hintergrund-Ingest. Starte Jobs vom PC, schließe den Browser und verfolge den Status live von jedem Gerät.")
