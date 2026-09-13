@@ -105,6 +105,37 @@ def save_config(data: dict):
     except Exception as e:
         print(f"Fehler beim Speichern der Konfiguration: {e}")
 
+# --- BATCH-LOAD HASHE HILFSFUNKTION (RASTERDEDUPLIZIERUNG IM RAM) ---
+def get_indexed_hashes_set(collection_name: str) -> set:
+    """Lädt alle (file_path, content_hash) Paare einer Collection in einem Rutsch in den Speicher."""
+    indexed_set = set()
+    try:
+        collections = [c.name for c in qdrant_client.get_collections().collections]
+        if collection_name not in collections:
+            return indexed_set
+
+        offset = None
+        while True:
+            records, next_offset = qdrant_client.scroll(
+                collection_name=collection_name,
+                limit=500,
+                offset=offset,
+                with_payload=["file_path", "content_hash"],
+                with_vectors=False
+            )
+            for r in records:
+                if r.payload:
+                    fp = r.payload.get("file_path")
+                    ch = r.payload.get("content_hash")
+                    if fp and ch:
+                        indexed_set.add((fp, ch))
+            if next_offset is None or len(records) == 0:
+                break
+            offset = next_offset
+    except Exception as e:
+        print(f"Fehler beim Batch-Laden der Qdrant-Hashes: {e}")
+    return indexed_set
+
 # --- FAST PARSER FÜR KICAD EDA FORMATE (OHNE LLM) ---
 def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
     ext = os.path.splitext(rel_path)[1].lower()
@@ -214,15 +245,13 @@ class IngestTaskManager:
         with self.lock:
             if self.is_running:
                 self.cancel_event.set()
-                self.append_log("\n🛑 Abbruch-Signal empfangen. Aktuelle Datei wird zu Ende verarbeitet...")
+                self.append_log("\n🛑 Abbruch-Signal empfangen. Aktuelle Datei wird noch zu Ende indiziert...")
                 self.status_header = "🟡 Status: WIRD ABGEBROCHEN..."
             return f"### {self.status_header}"
 
     def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model):
         with self.lock:
             if self.is_running:
-                if self.cancel_event.is_set():
-                    return "### 🟡 Status: ABBRUCH LÄUFT... Bitte einen Moment warten."
                 return "### ⚠️ Status: JOB LÄUFT BEREITS"
 
             self.is_running = True
@@ -308,7 +337,12 @@ class IngestTaskManager:
                 return
 
             self.total_files = len(files_to_process)
-            self.append_log(f"📊 Gesamt: {self.total_files} eindeutige Datei(en) bereit zur Indizierung.\n")
+            self.append_log(f"📊 Gesamt: {self.total_files} eindeutige Datei(en) bereit zur Indizierung.")
+
+            # Batch-Laden der Hashes aus Qdrant (Blitzschneller RAM-Check)
+            self.append_log(f"🔍 Prüfe bereits indizierte Dateien in '{target_collection}'...")
+            existing_hashes = get_indexed_hashes_set(target_collection)
+            self.append_log(f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) geladen.\n")
 
             # 4. Haupt-Schleife
             for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
@@ -327,7 +361,8 @@ class IngestTaskManager:
 
                 content_hash = calculate_sha256(raw_text)
 
-                if is_file_indexed(target_collection, rel_path, content_hash):
+                # In-Memory Fast Check (< 0.001 ms pro Datei)
+                if (rel_path, content_hash) in existing_hashes:
                     self.append_log(f"[{idx}/{self.total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
                     continue
 
@@ -452,25 +487,14 @@ def ensure_qdrant_collection(collection_name: str, vector_size: int):
             collection_name=collection_name,
             vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
         )
+        try:
+            qdrant_client.create_payload_index(collection_name=collection_name, field_name="file_path", field_schema="keyword")
+            qdrant_client.create_payload_index(collection_name=collection_name, field_name="content_hash", field_schema="keyword")
+        except Exception:
+            pass
 
 def calculate_sha256(text: str) -> str:
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
-
-def is_file_indexed(collection_name: str, rel_path: str, content_hash: str) -> bool:
-    try:
-        results, _ = qdrant_client.scroll(
-            collection_name=collection_name,
-            scroll_filter=Filter(
-                must=[
-                    FieldCondition(key="file_path", match=MatchValue(value=rel_path)),
-                    FieldCondition(key="content_hash", match=MatchValue(value=content_hash))
-                ]
-            ),
-            limit=1
-        )
-        return len(results) > 0
-    except Exception:
-        return False
 
 def extract_text_from_file(file_path: str) -> str:
     ext = os.path.splitext(file_path)[1].lower()
@@ -522,15 +546,23 @@ def scan_github_repository(github_url, old_scanned_repo):
         shutil.rmtree(old_scanned_repo, ignore_errors=True)
 
     if not github_url or not github_url.strip():
-        return (
+        yield (
             gr.update(choices=[], value=[], visible=False),
             gr.update(choices=[], value=[], visible=False),
             "",
             "❌ Bitte valide Repository URL angeben."
         )
+        return
 
     task_manager.set_status("🟡 Status: SCANNE REPOSITORY...")
     task_manager.append_log(f"🌐 Starte Scan für Repository: {github_url.strip()} ... Bitte warten.")
+
+    yield (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        "",
+        f"🌐 Klone Repository {github_url.strip()} im Hintergrund..."
+    )
 
     session_id = str(uuid.uuid4())[:8]
     repo_dir = os.path.join("/tmp", f"scan_repo_{session_id}")
@@ -543,12 +575,13 @@ def scan_github_repository(github_url, old_scanned_repo):
     if res.returncode != 0:
         task_manager.set_status("🔴 Status: SCAN FEHLGESCHLAGEN")
         task_manager.append_log(f"❌ Git-Clone fehlgeschlagen: {res.stderr[:200]}")
-        return (
+        yield (
             gr.update(choices=[], value=[], visible=False),
             gr.update(choices=[], value=[], visible=False),
             "",
             f"❌ Git-Clone fehlgeschlagen:\n{res.stderr[:300]}"
         )
+        return
 
     valid_dirs = set()
     ext_counts = {}
@@ -593,7 +626,7 @@ def scan_github_repository(github_url, old_scanned_repo):
     task_manager.append_log(log_msg)
     task_manager.set_status("⚪ Status: Inaktiv (Scan bereit)")
 
-    return (
+    yield (
         gr.update(choices=folder_choices, value=["ALL_REPO"], visible=True),
         gr.update(choices=ext_choices, value=[e[1] for e in ext_choices], visible=True),
         repo_dir,
@@ -743,7 +776,8 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
 
     status_timer.tick(
         fn=task_manager.get_ui_snapshot,
-        outputs=[status_output, status_banner]
+        outputs=[status_output, status_banner],
+        show_progress="hidden"
     )
 
     model_dropdown.change(
