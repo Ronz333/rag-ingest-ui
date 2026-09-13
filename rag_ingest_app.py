@@ -19,6 +19,7 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:32b")
 EMBED_MODEL = "bge-m3"
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
+DEFAULT_NUM_CTX = 8192  # Erhöhtes Kontextfenster für Token-dichte EDA-Formate
 
 # Whitelist aller unterstützten Formate
 TEXT_EXTENSIONS = {
@@ -104,6 +105,17 @@ def save_config(data: dict):
     except Exception as e:
         print(f"Fehler beim Speichern der Konfiguration: {e}")
 
+def clean_eda_content(raw_text: str, ext: str) -> str:
+    """Filtert redundante Zeichenlinien (fp_line etc.) aus KiCad S-Expressions zur Vermeidung von Token-Explosionen."""
+    if ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch"}:
+        lines = raw_text.splitlines()
+        filtered = [
+            line for line in lines
+            if not re.match(r'^\s*\((?:fp_line|fp_arc|fp_circle|fp_rect|fp_poly)\b', line)
+        ]
+        return "\n".join(filtered)
+    return raw_text
+
 # --- THREAD-SICHERER BACKGROUND TASK MANAGER ---
 class IngestTaskManager:
     def __init__(self):
@@ -143,7 +155,6 @@ class IngestTaskManager:
             if self.is_running:
                 return f"### ⚠️ Status: JOB LÄUFT BEREITS"
 
-            # Speichere Modell- und Kategorie-Präferenz
             save_config({"last_model": selected_model, "last_category": category_key})
 
             self.is_running = True
@@ -217,7 +228,6 @@ class IngestTaskManager:
                     if os.path.splitext(rel_p)[1].lower() in selected_exts
                 ]
 
-            # Duplikate filtern
             files_to_process = list({rel_p: full_p for rel_p, full_p in files_to_process}.items())
 
             if not files_to_process:
@@ -228,7 +238,7 @@ class IngestTaskManager:
             self.total_files = len(files_to_process)
             self.append_log(f"\n📊 Gesamt: {self.total_files} eindeutige Datei(en) bereit zur Indizierung.\n")
 
-            # 4. Haupt-Schleife mit transparenter Abbruch-Quittierung
+            # 4. Haupt-Schleife
             for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
                 if self.cancel_event.is_set():
                     self.append_log("🛑 Ingestion vorzeitig abgebrochen.")
@@ -249,9 +259,12 @@ class IngestTaskManager:
                     self.append_log(f"[{idx}/{self.total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
                     continue
 
+                ext = os.path.splitext(rel_path)[1].lower()
+                # Bereinige KiCad S-Expressions vor der Tokenisierung
+                cleaned_text = clean_eda_content(raw_text, ext)
+
                 self.append_log(f"[{idx}/{self.total_files}] Verarbeite via LLM: {rel_path}")
 
-                ext = os.path.splitext(rel_path)[1].lower()
                 eda_guard = ""
                 if ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".cir", ".net"}:
                     eda_guard = (
@@ -260,7 +273,7 @@ class IngestTaskManager:
                         "- Erfinde keine Geometrien, Pin-Anzahlen oder Maße, die nicht im Originaltext stehen!\n"
                     )
 
-                full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}{eda_guard}"
+                full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{cleaned_text[:12000]}{eda_guard}"
 
                 try:
                     response = ollama_client.chat(
@@ -268,14 +281,19 @@ class IngestTaskManager:
                         messages=[
                             {'role': 'system', 'content': system_prompt},
                             {'role': 'user', 'content': full_user_prompt}
-                        ]
+                        ],
+                        options={"num_ctx": DEFAULT_NUM_CTX}
                     )
                     processed_md = response['message']['content']
 
                     tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
                     category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
 
-                    embed_res = ollama_client.embeddings(model=EMBED_MODEL, prompt=processed_md)
+                    embed_res = ollama_client.embeddings(
+                        model=EMBED_MODEL,
+                        prompt=processed_md,
+                        options={"num_ctx": DEFAULT_NUM_CTX}
+                    )
                     vector = embed_res['embedding']
 
                     ensure_qdrant_collection(target_collection, len(vector))
@@ -299,13 +317,11 @@ class IngestTaskManager:
                         ]
                     )
 
-                    # Quittierung erfolgt IMMER nach erfolgreichem Einpflegen in Qdrant
                     self.append_log(f"   ✅ Indiziert in '{target_collection}' | **Tag: #{category_tag}**\n")
 
                 except Exception as e:
                     self.append_log(f"   ❌ Fehler bei Verarbeitung: {str(e)}\n")
 
-                # Prüfe Abbruch direkt nach Quittierung des aktuellen Dokuments
                 if self.cancel_event.is_set():
                     self.append_log("🛑 Letzte Datei erfolgreich quittiert. Ingestion jetzt beendet.")
                     self.set_status(f"🔴 Status: ABGEBROCHEN ({idx}/{self.total_files})")
@@ -502,7 +518,7 @@ def scan_github_repository(github_url):
         log_msg
     )
 
-# --- GRADIO CONTROL CENTER (OPTIMIERTES DASHBOARD-LAYOUT) ---
+# --- GRADIO CONTROL CENTER ---
 initial_model_choices, initial_default_model = get_ollama_models()
 saved_cfg = load_config()
 initial_default_category = saved_cfg.get("last_category", list(CATEGORIES.keys())[0])
@@ -510,13 +526,11 @@ initial_default_category = saved_cfg.get("last_category", list(CATEGORIES.keys()
 with gr.Blocks(title="Universal RAG Control Center", css="footer {visibility: hidden}") as demo:
     repo_state = gr.State("")
 
-    # Auto-Polling Timer
     status_timer = gr.Timer(value=2.0)
 
     gr.Markdown("# 🏢 Universal RAG Ingestion Control Center")
 
     with gr.Row():
-        # LINKS: Steuerung & Quellen (50% Breite)
         with gr.Column(scale=1):
             status_banner = gr.Markdown("### ⚪ Status: Inaktiv")
 
@@ -537,7 +551,6 @@ with gr.Blocks(title="Universal RAG Control Center", css="footer {visibility: hi
                     scale=3
                 )
 
-            # Quellen in Tabs unterteilt -> Extrem platzsparend!
             with gr.Tabs():
                 with gr.Tab("📁 Dateiupload / ZIP"):
                     file_input = gr.File(
@@ -574,7 +587,6 @@ with gr.Blocks(title="Universal RAG Control Center", css="footer {visibility: hi
                 start_btn = gr.Button("🚀 Ingest Starten", variant="primary", scale=3)
                 stop_btn = gr.Button("🛑 Abbrechen", variant="stop", scale=2)
 
-        # RECHTS: Live Protokoll (50% Breite)
         with gr.Column(scale=1):
             status_output = gr.Textbox(
                 label="Server Live-Protokoll",
@@ -583,7 +595,6 @@ with gr.Blocks(title="Universal RAG Control Center", css="footer {visibility: hi
                 autoscroll=True
             )
 
-    # Event Bindings
     status_timer.tick(
         fn=task_manager.get_ui_snapshot,
         outputs=[status_output, status_banner]
