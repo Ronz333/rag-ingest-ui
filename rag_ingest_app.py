@@ -107,7 +107,6 @@ def save_config(data: dict):
 
 # --- FAST PARSER FÜR KICAD EDA FORMATE (OHNE LLM) ---
 def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
-    """Extrahiert strukturierte Metadaten aus KiCad S-Expressions in Millisekunden."""
     ext = os.path.splitext(rel_path)[1].lower()
     filename = os.path.basename(rel_path)
 
@@ -332,7 +331,6 @@ class IngestTaskManager:
                 ext = os.path.splitext(rel_path)[1].lower()
 
                 try:
-                    # WEICHE: Fast-Pass für native KiCad Formate vs. LLM-Analyse für unstrukturierte Texte
                     if ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch"}:
                         self.append_log(f"[{idx}/{self.total_files}] Fast-Pass Parsing (ohne LLM): {rel_path}")
                         category_tag, processed_md = fast_parse_kicad(rel_path, raw_text)
@@ -353,7 +351,6 @@ class IngestTaskManager:
                         tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
                         category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
 
-                    # Multilinguales Embedding erzeugen
                     embed_res = ollama_client.embeddings(
                         model=EMBED_MODEL,
                         prompt=processed_md,
@@ -398,10 +395,9 @@ class IngestTaskManager:
         finally:
             with self.lock:
                 self.is_running = False
+            # Behalte scanned_repo_path intakt, damit Neustarts ohne Re-Scan funktionieren!
             if os.path.exists(temp_work_dir):
                 shutil.rmtree(temp_work_dir, ignore_errors=True)
-            if scanned_repo_path and os.path.exists(scanned_repo_path):
-                shutil.rmtree(scanned_repo_path, ignore_errors=True)
 
 # Instanziierung
 task_manager = IngestTaskManager()
@@ -510,7 +506,11 @@ def update_model_preference(model_name):
 def update_category_preference(cat_name):
     save_config({"last_category": cat_name})
 
-def scan_github_repository(github_url):
+def scan_github_repository(github_url, old_scanned_repo):
+    # Vorheriges gescanntes Repo aufräumen, bevor neues geclont wird
+    if old_scanned_repo and os.path.exists(old_scanned_repo):
+        shutil.rmtree(old_scanned_repo, ignore_errors=True)
+
     if not github_url or not github_url.strip():
         return (
             gr.update(choices=[], value=[], visible=False),
@@ -583,17 +583,21 @@ def scan_github_repository(github_url):
         log_msg
     )
 
-# --- CUSTOM CSS & JS FÜR ALIGNMENT UND AUTOMATISCHES SCROLLEN ---
+# --- CUSTOM CSS & JS FÜR SKALIERUNG UND SMARTE AUTOSCROLL-LOGIK ---
 custom_css = """
 footer { visibility: hidden; }
-.row-align-end {
-    align-items: flex-end !important;
+.row-stretch {
+    align-items: stretch !important;
 }
-.equal-height-btn {
-    height: 42px !important;
-    min-height: 42px !important;
-    max-height: 42px !important;
-    margin-bottom: 0px !important;
+.full-height-btn {
+    height: 100% !important;
+    min-height: 100% !important;
+    display: flex !important;
+}
+.full-height-btn button {
+    height: 100% !important;
+    min-height: 100% !important;
+    flex: 1 !important;
 }
 #log-textbox textarea {
     font-family: monospace;
@@ -604,16 +608,31 @@ footer { visibility: hidden; }
 
 autoscroll_js = """
 function() {
-    const observer = new MutationObserver(() => {
+    let isAtBottom = true;
+
+    const initObserver = () => {
         const textarea = document.querySelector('#log-textbox textarea');
-        if (textarea) {
-            textarea.scrollTop = textarea.scrollHeight;
-        }
-    });
+        if (!textarea) return;
+
+        // Prüfe bei jedem Scrollen des Benutzers, ob er ganz unten steht
+        textarea.addEventListener('scroll', () => {
+            const threshold = 50;
+            isAtBottom = (textarea.scrollHeight - textarea.scrollTop - textarea.clientHeight) <= threshold;
+        });
+
+        // Autoscroll NUR ausführen, wenn isAtBottom true ist
+        const observer = new MutationObserver(() => {
+            if (isAtBottom) {
+                textarea.scrollTop = textarea.scrollHeight;
+            }
+        });
+
+        observer.observe(textarea, { childList: true, subtree: true, characterData: true });
+    };
+
     const interval = setInterval(() => {
-        const target = document.querySelector('#log-textbox');
-        if (target) {
-            observer.observe(target, { childList: true, subtree: true, characterData: true });
+        if (document.querySelector('#log-textbox textarea')) {
+            initObserver();
             clearInterval(interval);
         }
     }, 500);
@@ -633,10 +652,11 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     gr.Markdown("# 🏢 Universal RAG Ingestion Control Center")
 
     with gr.Row():
+        # LINKS: Eingabeformulare & Quellen
         with gr.Column(scale=1):
             status_banner = gr.Markdown("### ⚪ Status: Inaktiv")
 
-            with gr.Row(elem_classes=["row-align-end"]):
+            with gr.Row(elem_classes=["row-stretch"]):
                 model_dropdown = gr.Dropdown(
                     choices=initial_model_choices,
                     value=initial_default_model,
@@ -648,7 +668,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     "🔄",
                     variant="secondary",
                     scale=1,
-                    elem_classes=["equal-height-btn"]
+                    elem_classes=["full-height-btn"]
                 )
 
             category_dropdown = gr.Dropdown(
@@ -666,7 +686,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     )
 
                 with gr.Tab("🌐 Git Repository Crawler"):
-                    with gr.Row(elem_classes=["row-align-end"]):
+                    with gr.Row(elem_classes=["row-stretch"]):
                         github_input = gr.Textbox(
                             label="Repository URL",
                             placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
@@ -676,7 +696,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                             "🔍 Scannen",
                             variant="secondary",
                             scale=1,
-                            elem_classes=["equal-height-btn"]
+                            elem_classes=["full-height-btn"]
                         )
 
                     with gr.Row():
@@ -695,18 +715,18 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                             scale=1
                         )
 
-            with gr.Row():
-                start_btn = gr.Button("🚀 Ingest Starten", variant="primary", scale=3)
-                stop_btn = gr.Button("🛑 Abbrechen", variant="stop", scale=2)
-
+        # RECHTS: Live-Protokoll & Steuerungs-Buttons
         with gr.Column(scale=1):
             status_output = gr.Textbox(
                 label="Server Live-Protokoll",
                 interactive=False,
                 lines=24,
-                autoscroll=True,
                 elem_id="log-textbox"
             )
+
+            with gr.Row():
+                start_btn = gr.Button("🚀 Ingest Starten", variant="primary", scale=3)
+                stop_btn = gr.Button("🛑 Abbrechen", variant="stop", scale=2)
 
     status_timer.tick(
         fn=task_manager.get_ui_snapshot,
@@ -730,7 +750,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
 
     scan_repo_btn.click(
         fn=scan_github_repository,
-        inputs=[github_input],
+        inputs=[github_input, repo_state],
         outputs=[folder_checkboxes, ext_checkboxes, repo_state, status_output]
     )
 
