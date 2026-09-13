@@ -583,12 +583,46 @@ def scan_github_repository(github_url):
         log_msg
     )
 
+# --- CUSTOM CSS & JARS SCRIPT FÜR HEIGHT-ALIGNMENT UND AUTOMATISCHES SCROLLEN ---
+custom_css = """
+footer { visibility: hidden; }
+.equal-height-btn {
+    height: 42px !important;
+    min-height: 42px !important;
+    max-height: 42px !important;
+    margin: 0 !important;
+}
+#log-textbox textarea {
+    font-family: monospace;
+    font-size: 0.85rem;
+    scroll-behavior: smooth;
+}
+"""
+
+autoscroll_js = """
+function() {
+    const observer = new MutationObserver(() => {
+        const textarea = document.querySelector('#log-textbox textarea');
+        if (textarea) {
+            textarea.scrollTop = textarea.scrollHeight;
+        }
+    });
+    const interval = setInterval(() => {
+        const target = document.querySelector('#log-textbox');
+        if (target) {
+            observer.observe(target, { childList: true, subtree: true, characterData: true });
+            clearInterval(interval);
+        }
+    }, 500);
+}
+"""
+
 # --- GRADIO CONTROL CENTER ---
 initial_model_choices, initial_default_model = get_ollama_models()
 saved_cfg = load_config()
 initial_default_category = saved_cfg.get("last_category", list(CATEGORIES.keys())[0])
 
-with gr.Blocks(title="Universal RAG Control Center", css="footer {visibility: hidden}") as demo:
+with gr.Blocks(title="Universal RAG Control Center", css=custom_css, js=autoscroll_js) as demo:
     repo_state = gr.State("")
 
     status_timer = gr.Timer(value=2.0)
@@ -599,22 +633,27 @@ with gr.Blocks(title="Universal RAG Control Center", css="footer {visibility: hi
         with gr.Column(scale=1):
             status_banner = gr.Markdown("### ⚪ Status: Inaktiv")
 
-            with gr.Row():
+            with gr.Row(align_items="end"):
                 model_dropdown = gr.Dropdown(
                     choices=initial_model_choices,
                     value=initial_default_model,
                     label="LLM Modell (Gespeichert)",
                     interactive=True,
-                    scale=3
+                    scale=4
                 )
-                refresh_models_btn = gr.Button("🔄", variant="secondary", scale=1)
-                category_dropdown = gr.Dropdown(
-                    choices=list(CATEGORIES.keys()),
-                    value=initial_default_category,
-                    label="Knowledge Collection",
-                    interactive=True,
-                    scale=3
+                refresh_models_btn = gr.Button(
+                    "🔄",
+                    variant="secondary",
+                    scale=1,
+                    elem_classes=["equal-height-btn"]
                 )
+
+            category_dropdown = gr.Dropdown(
+                choices=list(CATEGORIES.keys()),
+                value=initial_default_category,
+                label="Knowledge Collection",
+                interactive=True
+            )
 
             with gr.Tabs():
                 with gr.Tab("📁 Dateiupload / ZIP"):
@@ -624,13 +663,18 @@ with gr.Blocks(title="Universal RAG Control Center", css="footer {visibility: hi
                     )
 
                 with gr.Tab("🌐 Git Repository Crawler"):
-                    with gr.Row():
+                    with gr.Row(align_items="end"):
                         github_input = gr.Textbox(
                             label="Repository URL",
                             placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
                             scale=4
                         )
-                        scan_repo_btn = gr.Button("🔍 Scannen", variant="secondary", scale=1)
+                        scan_repo_btn = gr.Button(
+                            "🔍 Scannen",
+                            variant="secondary",
+                            scale=1,
+                            elem_classes=["equal-height-btn"]
+                        )
 
                     with gr.Row():
                         folder_checkboxes = gr.CheckboxGroup(
@@ -657,7 +701,8 @@ with gr.Blocks(title="Universal RAG Control Center", css="footer {visibility: hi
                 label="Server Live-Protokoll",
                 interactive=False,
                 lines=24,
-                autoscroll=True
+                autoscroll=True,
+                elem_id="log-textbox"
             )
 
     status_timer.tick(
