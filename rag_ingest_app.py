@@ -242,37 +242,38 @@ class IngestTaskManager:
             return f"### {self.status_header}"
 
     def _run_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model):
-        category_info = CATEGORIES.get(category_key, CATEGORIES["📚 Allgemeines Wissen & Dokumente"])
-        target_collection = category_info["collection"]
-        system_prompt = category_info["system_prompt"]
-        active_model = selected_model if selected_model else DEFAULT_MODEL
-
-        session_id = str(uuid.uuid4())[:8]
-        temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
-        os.makedirs(temp_work_dir, exist_ok=True)
-
-        self.append_log(f"🚀 Starte entkoppelten Hintergrund-Ingest (Session: {session_id})")
-        self.append_log(f"Modell: {active_model} | Collection: '{target_collection}' | Embedding: {EMBED_MODEL}\n")
-
-        files_to_process = []
-
         try:
-            # 1. Uploads & ZIPs
+            category_info = CATEGORIES.get(category_key, CATEGORIES["📚 Allgemeines Wissen & Dokumente"])
+            target_collection = category_info["collection"]
+            system_prompt = category_info["system_prompt"]
+            active_model = selected_model if selected_model else DEFAULT_MODEL
+
+            session_id = str(uuid.uuid4())[:8]
+            temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
+            os.makedirs(temp_work_dir, exist_ok=True)
+
+            self.append_log(f"🚀 Starte Hintergrund-Ingest (Session: {session_id})")
+            self.append_log(f"Modell: {active_model} | Collection: '{target_collection}' | Embedding: {EMBED_MODEL}\n")
+
+            files_to_process = []
+
+            # 1. Uploads & ZIPs verarbeiten (Typensicher)
             if files:
-                for file_obj in files:
-                    fname = os.path.basename(file_obj.name)
+                for file_item in files:
+                    fpath = file_item.name if hasattr(file_item, 'name') else (file_item.get('name') if isinstance(file_item, dict) else str(file_item))
+                    fname = os.path.basename(fpath)
                     ext = os.path.splitext(fname)[1].lower()
 
                     if ext == ".zip":
                         self.append_log(f"📦 Entpacke ZIP: {fname}...")
                         zip_extract_dir = os.path.join(temp_work_dir, f"zip_{uuid.uuid4()[:4]}")
-                        with zipfile.ZipFile(file_obj.name, 'r') as zip_ref:
+                        with zipfile.ZipFile(fpath, 'r') as zip_ref:
                             zip_ref.extractall(zip_extract_dir)
                         extracted = collect_files_from_dir(zip_extract_dir)
                         files_to_process.extend(extracted)
                         self.append_log(f"   ↳ {len(extracted)} Datei(en) im ZIP entpackt.")
                     elif ext in TEXT_EXTENSIONS:
-                        files_to_process.append((fname, file_obj.name))
+                        files_to_process.append((fname, fpath))
 
             # 2. Ausgewählte Git-Ordner
             if scanned_repo_path and os.path.exists(scanned_repo_path) and selected_folders:
@@ -286,7 +287,7 @@ class IngestTaskManager:
                 files_to_process.extend(repo_files)
 
             if not files_to_process:
-                self.append_log("\n❌ Keine Dateien zur Verarbeitung gefunden.")
+                self.append_log("❌ Keine Dateien zur Verarbeitung gefunden. Bitte Uploads oder Git-Ordner prüfen.")
                 self.set_status("🔴 Status: BEENDET (Keine Dateien)")
                 return
 
@@ -300,12 +301,12 @@ class IngestTaskManager:
             files_to_process = list({rel_p: full_p for rel_p, full_p in files_to_process}.items())
 
             if not files_to_process:
-                self.append_log("\n❌ Keine Dateien entsprechen den Dateiformat-Filtern.")
+                self.append_log("❌ Keine Dateien entsprechen den gewählten Dateiformat-Filtern.")
                 self.set_status("🔴 Status: BEENDET (Keine Übereinstimmung)")
                 return
 
             self.total_files = len(files_to_process)
-            self.append_log(f"\n📊 Gesamt: {self.total_files} eindeutige Datei(en) bereit zur Indizierung.\n")
+            self.append_log(f"📊 Gesamt: {self.total_files} eindeutige Datei(en) bereit zur Indizierung.\n")
 
             # 4. Haupt-Schleife
             for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
@@ -392,10 +393,13 @@ class IngestTaskManager:
             self.append_log(f"\n🎉 Ingestion vollständig abgeschlossen! Alle Daten sind in Collection '{target_collection}' verfügbar.")
             self.set_status(f"✅ Status: ABGESCHLOSSEN ({self.total_files}/{self.total_files})")
 
+        except Exception as top_e:
+            self.append_log(f"\n❌ Unerwarteter Systemfehler: {str(top_e)}")
+            self.set_status("🔴 Status: FEHLER")
         finally:
             with self.lock:
                 self.is_running = False
-            # Behalte scanned_repo_path intakt, damit Neustarts ohne Re-Scan funktionieren!
+                self.cancel_event.clear()
             if os.path.exists(temp_work_dir):
                 shutil.rmtree(temp_work_dir, ignore_errors=True)
 
@@ -507,7 +511,6 @@ def update_category_preference(cat_name):
     save_config({"last_category": cat_name})
 
 def scan_github_repository(github_url, old_scanned_repo):
-    # Vorheriges gescanntes Repo aufräumen, bevor neues geclont wird
     if old_scanned_repo and os.path.exists(old_scanned_repo):
         shutil.rmtree(old_scanned_repo, ignore_errors=True)
 
@@ -583,7 +586,7 @@ def scan_github_repository(github_url, old_scanned_repo):
         log_msg
     )
 
-# --- CUSTOM CSS & JS FÜR SKALIERUNG UND SMARTE AUTOSCROLL-LOGIK ---
+# --- CUSTOM CSS & JS FÜR VOLLSTÄNDIGE SKALIERUNG UND INTELLIGENTES AUTOSCROLLEN ---
 custom_css = """
 footer { visibility: hidden; }
 .row-stretch {
@@ -593,11 +596,12 @@ footer { visibility: hidden; }
     height: 100% !important;
     min-height: 100% !important;
     display: flex !important;
+    align-items: stretch !important;
 }
 .full-height-btn button {
     height: 100% !important;
     min-height: 100% !important;
-    flex: 1 !important;
+    margin-top: 0px !important;
 }
 #log-textbox textarea {
     font-family: monospace;
@@ -608,32 +612,30 @@ footer { visibility: hidden; }
 
 autoscroll_js = """
 function() {
-    let isAtBottom = true;
+    let userIsScrolledUp = false;
 
-    const initObserver = () => {
+    const initScrollListener = () => {
         const textarea = document.querySelector('#log-textbox textarea');
         if (!textarea) return;
 
-        // Prüfe bei jedem Scrollen des Benutzers, ob er ganz unten steht
         textarea.addEventListener('scroll', () => {
-            const threshold = 50;
-            isAtBottom = (textarea.scrollHeight - textarea.scrollTop - textarea.clientHeight) <= threshold;
+            const distanceToBottom = textarea.scrollHeight - textarea.scrollTop - textarea.clientHeight;
+            userIsScrolledUp = distanceToBottom > 40;
         });
 
-        // Autoscroll NUR ausführen, wenn isAtBottom true ist
         const observer = new MutationObserver(() => {
-            if (isAtBottom) {
+            if (!userIsScrolledUp) {
                 textarea.scrollTop = textarea.scrollHeight;
             }
         });
 
-        observer.observe(textarea, { childList: true, subtree: true, characterData: true });
+        observer.observe(textarea, { childList: true, subtree: true, characterData: true, value: true });
     };
 
-    const interval = setInterval(() => {
+    const checkInterval = setInterval(() => {
         if (document.querySelector('#log-textbox textarea')) {
-            initObserver();
-            clearInterval(interval);
+            initScrollListener();
+            clearInterval(checkInterval);
         }
     }, 500);
 }
@@ -715,12 +717,13 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                             scale=1
                         )
 
-        # RECHTS: Live-Protokoll & Steuerungs-Buttons
+        # RECHTS: Live-Protokoll & Steuerungs-Buttons darunter
         with gr.Column(scale=1):
             status_output = gr.Textbox(
                 label="Server Live-Protokoll",
                 interactive=False,
                 lines=24,
+                autoscroll=False,
                 elem_id="log-textbox"
             )
 
