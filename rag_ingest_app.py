@@ -583,14 +583,17 @@ def scan_github_repository(github_url):
         log_msg
     )
 
-# --- CUSTOM CSS & JARS SCRIPT FÜR HEIGHT-ALIGNMENT UND AUTOMATISCHES SCROLLEN ---
+# --- CUSTOM CSS & JS FÜR ALIGNMENT UND AUTOMATISCHES SCROLLEN ---
 custom_css = """
 footer { visibility: hidden; }
+.row-align-end {
+    align-items: flex-end !important;
+}
 .equal-height-btn {
     height: 42px !important;
     min-height: 42px !important;
     max-height: 42px !important;
-    margin: 0 !important;
+    margin-bottom: 0px !important;
 }
 #log-textbox textarea {
     font-family: monospace;
@@ -622,7 +625,7 @@ initial_model_choices, initial_default_model = get_ollama_models()
 saved_cfg = load_config()
 initial_default_category = saved_cfg.get("last_category", list(CATEGORIES.keys())[0])
 
-with gr.Blocks(title="Universal RAG Control Center", css=custom_css, js=autoscroll_js) as demo:
+with gr.Blocks(title="Universal RAG Control Center") as demo:
     repo_state = gr.State("")
 
     status_timer = gr.Timer(value=2.0)
@@ -633,7 +636,7 @@ with gr.Blocks(title="Universal RAG Control Center", css=custom_css, js=autoscro
         with gr.Column(scale=1):
             status_banner = gr.Markdown("### ⚪ Status: Inaktiv")
 
-            with gr.Row(align_items="end"):
+            with gr.Row(elem_classes=["row-align-end"]):
                 model_dropdown = gr.Dropdown(
                     choices=initial_model_choices,
                     value=initial_default_model,
@@ -663,7 +666,7 @@ with gr.Blocks(title="Universal RAG Control Center", css=custom_css, js=autoscro
                     )
 
                 with gr.Tab("🌐 Git Repository Crawler"):
-                    with gr.Row(align_items="end"):
+                    with gr.Row(elem_classes=["row-align-end"]):
                         github_input = gr.Textbox(
                             label="Repository URL",
                             placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
@@ -749,4 +752,9 @@ with gr.Blocks(title="Universal RAG Control Center", css=custom_css, js=autoscro
     )
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7861)
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7861,
+        css=custom_css,
+        js=autoscroll_js
+    )
