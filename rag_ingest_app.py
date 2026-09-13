@@ -5,6 +5,7 @@ import shutil
 import zipfile
 import hashlib
 import json
+import time
 import threading
 import subprocess
 import gradio as gr
@@ -221,17 +222,26 @@ class IngestTaskManager:
 
     def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model):
         with self.lock:
-            if self.is_running:
-                return f"### ⚠️ Status: JOB LÄUFT BEREITS"
+            # Überprüfe, ob der alte Thread noch lebt
+            if self.current_thread and self.current_thread.is_alive():
+                if self.cancel_event.is_set():
+                    # Falls abgebrochen wurde, dem Thread bis zu 3 Sek Zeit geben, den laufenden Schritt zu beenden
+                    self.lock.release()
+                    self.current_thread.join(timeout=3.0)
+                    self.lock.acquire()
 
-            save_config({"last_model": selected_model, "last_category": category_key})
+                if self.current_thread.is_alive():
+                    return "### ⚠️ Bitte kurz warten: Der vorherige Job wird noch beendet..."
 
+            # Zustand sicher für neuen Start zurücksetzen
             self.is_running = True
             self.cancel_event.clear()
             self.log_messages = []
             self.processed_files = 0
             self.total_files = 0
             self.status_header = "🟢 Status: WIRD GESTARTET..."
+
+            save_config({"last_model": selected_model, "last_category": category_key})
 
             self.current_thread = threading.Thread(
                 target=self._run_job,
@@ -242,6 +252,7 @@ class IngestTaskManager:
             return f"### {self.status_header}"
 
     def _run_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model):
+        temp_work_dir = None
         try:
             category_info = CATEGORIES.get(category_key, CATEGORIES["📚 Allgemeines Wissen & Dokumente"])
             target_collection = category_info["collection"]
@@ -400,7 +411,7 @@ class IngestTaskManager:
             with self.lock:
                 self.is_running = False
                 self.cancel_event.clear()
-            if os.path.exists(temp_work_dir):
+            if temp_work_dir and os.path.exists(temp_work_dir):
                 shutil.rmtree(temp_work_dir, ignore_errors=True)
 
 # Instanziierung
@@ -522,6 +533,10 @@ def scan_github_repository(github_url, old_scanned_repo):
             "❌ Bitte valide Repository URL angeben."
         )
 
+    # Sofortige Rückmeldung im Task-Manager
+    task_manager.set_status("🟡 Status: SCANNE REPOSITORY...")
+    task_manager.append_log(f"🌐 Starte Scan für Repository: {github_url.strip()} ... Bitte warten.")
+
     session_id = str(uuid.uuid4())[:8]
     repo_dir = os.path.join("/tmp", f"scan_repo_{session_id}")
 
@@ -531,6 +546,8 @@ def scan_github_repository(github_url, old_scanned_repo):
     )
 
     if res.returncode != 0:
+        task_manager.set_status("🔴 Status: SCAN FEHLGESCHLAGEN")
+        task_manager.append_log(f"❌ Git-Clone fehlgeschlagen: {res.stderr[:200]}")
         return (
             gr.update(choices=[], value=[], visible=False),
             gr.update(choices=[], value=[], visible=False),
@@ -578,6 +595,8 @@ def scan_github_repository(github_url, old_scanned_repo):
     ]
 
     log_msg = f"✅ Repository gescannt! {len(folder_choices)-1} Ordner und {len(ext_choices)} Dateiformate erkannt."
+    task_manager.append_log(log_msg)
+    task_manager.set_status("⚪ Status: Inaktiv (Scan bereit)")
 
     return (
         gr.update(choices=folder_choices, value=["ALL_REPO"], visible=True),
@@ -586,22 +605,24 @@ def scan_github_repository(github_url, old_scanned_repo):
         log_msg
     )
 
-# --- CUSTOM CSS & JS FÜR VOLLSTÄNDIGE SKALIERUNG UND INTELLIGENTES AUTOSCROLLEN ---
+# --- CUSTOM CSS & JS FÜR SKALIERUNG UND SMARTE AUTOSCROLL-LOGIK ---
 custom_css = """
 footer { visibility: hidden; }
 .row-stretch {
+    display: flex !important;
     align-items: stretch !important;
 }
 .full-height-btn {
     height: 100% !important;
     min-height: 100% !important;
     display: flex !important;
-    align-items: stretch !important;
+    flex-direction: column !important;
+    justify-content: flex-end !important;
 }
 .full-height-btn button {
     height: 100% !important;
     min-height: 100% !important;
-    margin-top: 0px !important;
+    margin: 0 !important;
 }
 #log-textbox textarea {
     font-family: monospace;
@@ -612,32 +633,26 @@ footer { visibility: hidden; }
 
 autoscroll_js = """
 function() {
-    let userIsScrolledUp = false;
+    window.ragUserScrolledUp = false;
 
-    const initScrollListener = () => {
+    const checkAndScroll = () => {
         const textarea = document.querySelector('#log-textbox textarea');
         if (!textarea) return;
 
-        textarea.addEventListener('scroll', () => {
-            const distanceToBottom = textarea.scrollHeight - textarea.scrollTop - textarea.clientHeight;
-            userIsScrolledUp = distanceToBottom > 40;
-        });
+        if (!textarea.dataset.scrollBound) {
+            textarea.dataset.scrollBound = "true";
+            textarea.addEventListener('scroll', () => {
+                const distance = textarea.scrollHeight - textarea.scrollTop - textarea.clientHeight;
+                window.ragUserScrolledUp = (distance > 50);
+            });
+        }
 
-        const observer = new MutationObserver(() => {
-            if (!userIsScrolledUp) {
-                textarea.scrollTop = textarea.scrollHeight;
-            }
-        });
-
-        observer.observe(textarea, { childList: true, subtree: true, characterData: true, value: true });
+        if (!window.ragUserScrolledUp) {
+            textarea.scrollTop = textarea.scrollHeight;
+        }
     };
 
-    const checkInterval = setInterval(() => {
-        if (document.querySelector('#log-textbox textarea')) {
-            initScrollListener();
-            clearInterval(checkInterval);
-        }
-    }, 500);
+    setInterval(checkAndScroll, 300);
 }
 """
 
