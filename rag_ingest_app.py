@@ -4,6 +4,7 @@ import uuid
 import shutil
 import zipfile
 import hashlib
+import threading
 import subprocess
 import gradio as gr
 import ollama
@@ -26,7 +27,7 @@ TEXT_EXTENSIONS = {
     ".pdf"
 }
 
-# Wissens-Kategorien & verschärfte System-Prompts gegen Halluzinationen
+# Wissens-Kategorien & Prompts
 CATEGORIES = {
     "⚡ PCB & Hardware Design": {
         "collection": "pcb_knowledge_base",
@@ -36,7 +37,7 @@ Analysiere den Inhalt (z.B. Python-Code, KiCad-Symbol/Footprint, SPICE, Doku) un
 STRIKTE REGELN:
 1. ERSTE ZEILE: Zwingend ein exaktes Kategorie-Schlagwort in eckigen Klammern, z.B.:
    [TAG: KICAD_FOOTPRINT], [TAG: KICAD_SYM], [TAG: KICAD_PCBNEW], [TAG: SKIDL_API] oder [TAG: SPICE_SIM].
-2. ABSOLUTES HALLUZINATIONSVERBOT: Verarbeite den DATEINAMEN und den INHALT strikt faktengetreu. Erfinde NIEMALS abweichende Bauteilabmessungen (z.B. kein 0603 ausgeben, wenn die Datei einen 10x12.5mm Kondensator beschreibt) oder falsche Pin-Belegungen!
+2. ABSOLUTES HALLUZINATIONSVERBOT: Verarbeite den DATEINAMEN und den INHALT strikt faktengetreu. Erfinde NIEMALS abweichende Bauteilabmessungen oder falsche Pin-Belegungen!
 3. CODE-INTEGRITÄT: Bette bei KiCad-Dateien (.kicad_mod, .kicad_sym) und SPICE-Netzlisten (.cir) den bereitgestellten ORIGINAL-CODE 1:1 unverändert im Markdown-Codeblock ein.
 4. Zusammenfassung: Fasse Zweck, Parameter und Pinbelegung sachlich zusammen."""
     },
@@ -82,8 +83,217 @@ REGELN:
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 qdrant_client = QdrantClient(url=QDRANT_HOST)
 
+# --- THREAD-SICHERER BACKGROUND TASK MANAGER ---
+class IngestTaskManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.is_running = False
+        self.cancel_event = threading.Event()
+        self.log_messages = ["Inaktiv. Bereit für neuen Ingestion-Job."]
+        self.status_header = "⚪ Status: Inaktiv"
+        self.total_files = 0
+        self.processed_files = 0
+        self.current_thread = None
+
+    def append_log(self, text: str):
+        with self.lock:
+            self.log_messages.append(text)
+
+    def set_status(self, header: str):
+        with self.lock:
+            self.status_header = header
+
+    def get_ui_snapshot(self):
+        with self.lock:
+            full_log = "\n".join(self.log_messages)
+            return full_log, self.status_header
+
+    def request_cancel(self):
+        with self.lock:
+            if self.is_running:
+                self.cancel_event.set()
+                self.append_log("\n🛑 Abbruch-Signal gesendet! Warte auf Beendigung des aktuellen Datei-Schritts...")
+                self.status_header = "🟡 Status: WIRD ABGEBROCHEN..."
+                return "Abbruch angefordert."
+            return "Kein aktiver Job vorhanden."
+
+    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model):
+        with self.lock:
+            if self.is_running:
+                return "❌ Es läuft bereits ein Ingestion-Job im Hintergrund!"
+
+            self.is_running = True
+            self.cancel_event.clear()
+            self.log_messages = []
+            self.processed_files = 0
+            self.total_files = 0
+            self.status_header = "🟢 Status: WIRD GESTARTET..."
+
+            self.current_thread = threading.Thread(
+                target=self._run_job,
+                args=(files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model),
+                daemon=True
+            )
+            self.current_thread.start()
+            return "🚀 Hintergrund-Job gestartet!"
+
+    def _run_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model):
+        category_info = CATEGORIES.get(category_key, CATEGORIES["📚 Allgemeines Wissen & Dokumente"])
+        target_collection = category_info["collection"]
+        system_prompt = category_info["system_prompt"]
+        active_model = selected_model if selected_model else DEFAULT_MODEL
+
+        session_id = str(uuid.uuid4())[:8]
+        temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
+        os.makedirs(temp_work_dir, exist_ok=True)
+
+        self.append_log(f"🚀 Starte entkoppelten Hintergrund-Ingest (Session: {session_id})")
+        self.append_log(f"Modell: {active_model} | Collection: '{target_collection}' | Embedding: {EMBED_MODEL}\n")
+
+        files_to_process = []
+
+        try:
+            # 1. Uploads & ZIPs
+            if files:
+                for file_obj in files:
+                    fname = os.path.basename(file_obj.name)
+                    ext = os.path.splitext(fname)[1].lower()
+
+                    if ext == ".zip":
+                        self.append_log(f"📦 Entpacke ZIP: {fname}...")
+                        zip_extract_dir = os.path.join(temp_work_dir, f"zip_{uuid.uuid4()[:4]}")
+                        with zipfile.ZipFile(file_obj.name, 'r') as zip_ref:
+                            zip_ref.extractall(zip_extract_dir)
+                        extracted = collect_files_from_dir(zip_extract_dir)
+                        files_to_process.extend(extracted)
+                        self.append_log(f"   ↳ {len(extracted)} Datei(en) im ZIP entpackt.")
+                    elif ext in TEXT_EXTENSIONS:
+                        files_to_process.append((fname, file_obj.name))
+
+            # 2. Ausgewählte Git-Ordner
+            if scanned_repo_path and os.path.exists(scanned_repo_path) and selected_folders:
+                self.append_log("🌐 Erfassung ausgewählter Git-Ordner...")
+                if "ALL_REPO" in selected_folders:
+                    repo_files = collect_files_from_dir(scanned_repo_path)
+                else:
+                    repo_files = []
+                    for subfolder in selected_folders:
+                        repo_files.extend(collect_files_from_dir(scanned_repo_path, target_subfolder=subfolder))
+                files_to_process.extend(repo_files)
+
+            if not files_to_process:
+                self.append_log("\n❌ Keine Dateien zur Verarbeitung gefunden.")
+                self.set_status("🔴 Status: BEENDET (Keine Dateien)")
+                return
+
+            # 3. Filterung nach Dateiendungen
+            if selected_exts:
+                files_to_process = [
+                    (rel_p, full_p) for rel_p, full_p in files_to_process
+                    if os.path.splitext(rel_p)[1].lower() in selected_exts
+                ]
+
+            # Duplikate filtern
+            files_to_process = list({rel_p: full_p for rel_p, full_p in files_to_process}.items())
+
+            if not files_to_process:
+                self.append_log("\n❌ Keine Dateien entsprechen den Dateiformat-Filtern.")
+                self.set_status("🔴 Status: BEENDET (Keine Übereinstimmung)")
+                return
+
+            self.total_files = len(files_to_process)
+            self.append_log(f"\n📊 Gesamt: {self.total_files} eindeutige Datei(en) bereit zur Indizierung.\n")
+
+            # 4. Haupt-Schleife mit Abbrechbarkeit
+            for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
+                if self.cancel_event.is_set():
+                    self.append_log("\n🛑 Ingestion wurde vom Benutzer vorzeitig abgebrochen.")
+                    self.set_status(f"🔴 Status: ABGEBROCHEN ({self.processed_files}/{self.total_files})")
+                    return
+
+                self.processed_files = idx
+                self.set_status(f"🟢 Status: LÄUFT ({idx}/{self.total_files} - {os.path.basename(rel_path)})")
+
+                raw_text = extract_text_from_file(file_path)
+                if not raw_text.strip():
+                    self.append_log(f"[{idx}/{self.total_files}] ⚠️ Datei leer oder ungültig: {rel_path}")
+                    continue
+
+                content_hash = calculate_sha256(raw_text)
+
+                if is_file_indexed(target_collection, rel_path, content_hash):
+                    self.append_log(f"[{idx}/{self.total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
+                    continue
+
+                self.append_log(f"[{idx}/{self.total_files}] Verarbeite via LLM: {rel_path}")
+
+                ext = os.path.splitext(rel_path)[1].lower()
+                eda_guard = ""
+                if ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".cir", ".net"}:
+                    eda_guard = (
+                        "\n\nSTRIKTE ANWEISUNG FÜR NATIVE EDA-DATEIEN:\n"
+                        "- Bette den bereitgestellten ORIGINALTEXT zwingend 1:1 im Markdown-Codeblock ein.\n"
+                        "- Erfinde keine Geometrien, Pin-Anzahlen oder Maße, die nicht im Originaltext stehen!\n"
+                    )
+
+                full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}{eda_guard}"
+
+                try:
+                    response = ollama_client.chat(
+                        model=active_model,
+                        messages=[
+                            {'role': 'system', 'content': system_prompt},
+                            {'role': 'user', 'content': full_user_prompt}
+                        ]
+                    )
+                    processed_md = response['message']['content']
+
+                    tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
+                    category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
+
+                    embed_res = ollama_client.embeddings(model=EMBED_MODEL, prompt=processed_md)
+                    vector = embed_res['embedding']
+
+                    ensure_qdrant_collection(target_collection, len(vector))
+
+                    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{rel_path}"))
+
+                    qdrant_client.upsert(
+                        collection_name=target_collection,
+                        points=[
+                            PointStruct(
+                                id=point_id,
+                                vector=vector,
+                                payload={
+                                    "filename": os.path.basename(rel_path),
+                                    "file_path": rel_path,
+                                    "content_hash": content_hash,
+                                    "category_tag": category_tag,
+                                    "content": processed_md
+                                }
+                            )
+                        ]
+                    )
+                    self.append_log(f"   ✅ Indiziert in '{target_collection}' | **Tag: #{category_tag}**\n")
+                except Exception as e:
+                    self.append_log(f"   ❌ Fehler bei Verarbeitung: {str(e)}\n")
+
+            self.append_log(f"\n🎉 Ingestion vollständig abgeschlossen! Alle Daten sind in Collection '{target_collection}' verfügbar.")
+            self.set_status(f"✅ Status: ABGESCHLOSSEN ({self.total_files}/{self.total_files})")
+
+        finally:
+            with self.lock:
+                self.is_running = False
+            if os.path.exists(temp_work_dir):
+                shutil.rmtree(temp_work_dir, ignore_errors=True)
+            if scanned_repo_path and os.path.exists(scanned_repo_path):
+                shutil.rmtree(scanned_repo_path, ignore_errors=True)
+
+# Instanziierung des Managers
+task_manager = IngestTaskManager()
+
+# --- HILFSFUNKTIONEN ---
 def get_ollama_models():
-    """Lädt Ollama-Modelle und unterscheidet zwischen Lokal und Cloud."""
     try:
         res = ollama_client.list()
         models_data = res.get('models', []) if isinstance(res, dict) else getattr(res, 'models', [])
@@ -149,7 +359,6 @@ def extract_text_from_file(file_path: str) -> str:
 def collect_files_from_dir(directory: str, target_subfolder: str = ""):
     collected = []
     base_search_path = os.path.join(directory, target_subfolder) if target_subfolder else directory
-
     if not os.path.exists(base_search_path):
         return collected
 
@@ -165,7 +374,6 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
     return collected
 
 def handle_folder_selection(selected):
-    """Entfernt automatisch die Gesamtauswahl, sobald ein Unterordner angeklickt wird."""
     if not selected:
         return []
     if "ALL_REPO" in selected and len(selected) > 1:
@@ -173,7 +381,6 @@ def handle_folder_selection(selected):
     return selected
 
 def scan_github_repository(github_url):
-    """Klont das Repository vorab, baut eine Ordner-Baumstruktur und erkennt Dateiformate."""
     if not github_url or not github_url.strip():
         return (
             gr.update(choices=[], value=[], visible=False),
@@ -246,174 +453,23 @@ def scan_github_repository(github_url):
         log_msg
     )
 
-def process_and_ingest(files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model):
-    if not files and not (scanned_repo_path and selected_folders):
-        yield "❌ Bitte entweder Dateien hochladen oder ein Repository scannen und auswählen."
-        return
-
-    category_info = CATEGORIES.get(category_key, CATEGORIES["📚 Allgemeines Wissen & Dokumente"])
-    target_collection = category_info["collection"]
-    system_prompt = category_info["system_prompt"]
-    active_model = selected_model if selected_model else DEFAULT_MODEL
-
-    session_id = str(uuid.uuid4())[:8]
-    temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
-    os.makedirs(temp_work_dir, exist_ok=True)
-
-    status_log = f"🚀 Starte Ingestion-Prozess (Session: {session_id})\n"
-    status_log += f"Modell: {active_model} | Collection: '{target_collection}' | Embedding: {EMBED_MODEL}\n\n"
-    yield status_log
-
-    files_to_process = []
-
-    try:
-        # 1. Uploads & ZIPs
-        if files:
-            for file_obj in files:
-                fname = os.path.basename(file_obj.name)
-                ext = os.path.splitext(fname)[1].lower()
-
-                if ext == ".zip":
-                    status_log += f"📦 Entpacke ZIP: {fname}...\n"
-                    yield status_log
-                    zip_extract_dir = os.path.join(temp_work_dir, f"zip_{uuid.uuid4()[:4]}")
-                    with zipfile.ZipFile(file_obj.name, 'r') as zip_ref:
-                        zip_ref.extractall(zip_extract_dir)
-                    extracted = collect_files_from_dir(zip_extract_dir)
-                    files_to_process.extend(extracted)
-                    status_log += f"   ↳ {len(extracted)} Datei(en) im ZIP entpackt.\n"
-                    yield status_log
-                elif ext in TEXT_EXTENSIONS:
-                    files_to_process.append((fname, file_obj.name))
-
-        # 2. Ausgewählte Git-Ordner
-        if scanned_repo_path and os.path.exists(scanned_repo_path) and selected_folders:
-            status_log += f"🌐 Erfassung ausgewählter Git-Ordner...\n"
-            yield status_log
-
-            if "ALL_REPO" in selected_folders:
-                repo_files = collect_files_from_dir(scanned_repo_path)
-            else:
-                repo_files = []
-                for subfolder in selected_folders:
-                    repo_files.extend(collect_files_from_dir(scanned_repo_path, target_subfolder=subfolder))
-
-            files_to_process.extend(repo_files)
-
-        if not files_to_process:
-            status_log += "\n❌ Keine Dateien erfasst."
-            yield status_log
-            return
-
-        # 3. Filterung nach ausgewählten Dateiendungen
-        if selected_exts:
-            files_to_process = [
-                (rel_p, full_p) for rel_p, full_p in files_to_process
-                if os.path.splitext(rel_p)[1].lower() in selected_exts
-            ]
-
-        # Duplikate entfernen
-        files_to_process = list({rel_p: full_p for rel_p, full_p in files_to_process}.items())
-
-        if not files_to_process:
-            status_log += "\n❌ Keine Dateien entsprechen den ausgewählten Dateiformat-Filtern."
-            yield status_log
-            return
-
-        status_log += f"📊 Gesamt: {len(files_to_process)} eindeutige Datei(en) zur Indizierung bereit.\n\n"
-        yield status_log
-
-        # 4. Indizierung & Deduplizierung via Hash
-        for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
-            raw_text = extract_text_from_file(file_path)
-            if not raw_text.strip():
-                status_log += f"[{idx}/{len(files_to_process)}] ⚠️ Datei leer oder ungültig: {rel_path}\n"
-                yield status_log
-                continue
-
-            content_hash = calculate_sha256(raw_text)
-
-            if is_file_indexed(target_collection, rel_path, content_hash):
-                status_log += f"[{idx}/{len(files_to_process)}] ⏭️ Unverändert übersprungen: {rel_path}\n"
-                yield status_log
-                continue
-
-            status_log += f"[{idx}/{len(files_to_process)}] Verarbeite: {rel_path}\n"
-            yield status_log
-
-            # Strikter Prompt-Zusatz für strukturierte EDA-Dateien zur Vermeidung von Halluzinationen
-            ext = os.path.splitext(rel_path)[1].lower()
-            eda_prompt_guard = ""
-            if ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".cir", ".net"}:
-                eda_prompt_guard = (
-                    "\n\nSTRIKTE ANWEISUNG FÜR NATIVE EDA-DATEIEN:\n"
-                    "- Bette den bereitgestellten ORIGINALTEXT zwingend 1:1 im Markdown-Codeblock ein.\n"
-                    "- Erfinde keine Geometrien, Pin-Anzahlen oder Maße, die nicht im Originaltext stehen!\n"
-                )
-
-            full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}{eda_prompt_guard}"
-
-            response = ollama_client.chat(
-                model=active_model,
-                messages=[
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': full_user_prompt}
-                ]
-            )
-            processed_md = response['message']['content']
-
-            # Erweiterte Tag-Extraktion (fängt [TAG: ...], [PAGE: ...] und [CATEGORY: ...] ab)
-            tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
-            category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
-
-            embed_res = ollama_client.embeddings(model=EMBED_MODEL, prompt=processed_md)
-            vector = embed_res['embedding']
-
-            ensure_qdrant_collection(target_collection, len(vector))
-
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{rel_path}"))
-
-            qdrant_client.upsert(
-                collection_name=target_collection,
-                points=[
-                    PointStruct(
-                        id=point_id,
-                        vector=vector,
-                        payload={
-                            "filename": os.path.basename(rel_path),
-                            "file_path": rel_path,
-                            "content_hash": content_hash,
-                            "category_tag": category_tag,
-                            "content": processed_md
-                        }
-                    )
-                ]
-            )
-
-            status_log += f"   ✅ Indiziert in '{target_collection}' | **Tag: #{category_tag}**\n\n"
-            yield status_log
-
-        status_log += f"🎉 Ingestion abgeschlossen! Dokumente sind in Collection '{target_collection}' verfügbar."
-        yield status_log
-
-    finally:
-        if os.path.exists(temp_work_dir):
-            shutil.rmtree(temp_work_dir, ignore_errors=True)
-        if scanned_repo_path and os.path.exists(scanned_repo_path):
-            shutil.rmtree(scanned_repo_path, ignore_errors=True)
-
-# Gradio Interface
+# --- GRADIO WEB INTERFACE ---
 initial_models = get_ollama_models()
 default_model_value = initial_models[0][1] if initial_models else DEFAULT_MODEL
 
-with gr.Blocks(title="Universal RAG Knowledge Ingest") as demo:
+with gr.Blocks(title="Universal RAG Control Center") as demo:
     repo_state = gr.State("")
 
-    gr.Markdown("# 📥 Universal RAG Knowledge Ingestion Pipeline")
-    gr.Markdown("Multilinguale Vektorisierung (`bge-m3`), Hash-Deduplizierung und erweiterte Repository-Filterung.")
+    # Timer zum automatischen Synchronisieren des Status (alle 2 Sekunden)
+    status_timer = gr.Timer(every=2.0)
+
+    gr.Markdown("# 🏢 Universal RAG Ingestion Control Center")
+    gr.Markdown("Entkoppelter Hintergrund-Ingest. Starte Jobs vom PC, schließe den Browser und verfolge den Status live von jedem Gerät.")
 
     with gr.Row():
         with gr.Column(scale=1):
+            status_banner = gr.Markdown("⚪ Status: Inaktiv")
+
             with gr.Row():
                 model_dropdown = gr.Dropdown(
                     choices=initial_models,
@@ -458,16 +514,22 @@ with gr.Blocks(title="Universal RAG Knowledge Ingest") as demo:
                 )
 
             with gr.Row():
-                start_btn = gr.Button("🚀 Ingestion Starten", variant="primary", scale=3)
+                start_btn = gr.Button("🚀 Ingestion Im Hintergrund Starten", variant="primary", scale=3)
                 stop_btn = gr.Button("🛑 Ingestion Abbrechen", variant="stop", scale=2)
 
         with gr.Column(scale=1):
             status_output = gr.Textbox(
-                label="Ingestion-Protokoll",
+                label="Server Live-Protokoll",
                 interactive=False,
-                lines=25,
+                lines=26,
                 autoscroll=True
             )
+
+    # Polling Event für Timer (Aktualisiert das UI ununterbrochen von jedem verbundenen Gerät)
+    status_timer.tick(
+        fn=task_manager.get_ui_snapshot,
+        outputs=[status_output, status_banner]
+    )
 
     refresh_models_btn.click(
         fn=lambda: gr.Dropdown(choices=get_ollama_models()),
@@ -486,17 +548,15 @@ with gr.Blocks(title="Universal RAG Knowledge Ingest") as demo:
         outputs=[folder_checkboxes]
     )
 
-    start_event = start_btn.click(
-        fn=process_and_ingest,
+    start_btn.click(
+        fn=task_manager.start_background_job,
         inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown],
-        outputs=[status_output]
+        outputs=[status_banner]
     )
 
     stop_btn.click(
-        fn=lambda log: log + "\n\n🛑 Ingestion durch Benutzer abgebrochen.",
-        inputs=[status_output],
-        outputs=[status_output],
-        cancels=[start_event]
+        fn=task_manager.request_cancel,
+        outputs=[status_banner]
     )
 
 if __name__ == "__main__":
