@@ -5,7 +5,6 @@ import shutil
 import zipfile
 import hashlib
 import json
-import time
 import threading
 import subprocess
 import gradio as gr
@@ -215,25 +214,17 @@ class IngestTaskManager:
         with self.lock:
             if self.is_running:
                 self.cancel_event.set()
-                self.append_log("\n🛑 Abbruch-Signal empfangen. Aktuelle Datei wird noch zu Ende indiziert...")
+                self.append_log("\n🛑 Abbruch-Signal empfangen. Aktuelle Datei wird zu Ende verarbeitet...")
                 self.status_header = "🟡 Status: WIRD ABGEBROCHEN..."
-                return f"### {self.status_header}"
             return f"### {self.status_header}"
 
     def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model):
         with self.lock:
-            # Überprüfe, ob der alte Thread noch lebt
-            if self.current_thread and self.current_thread.is_alive():
+            if self.is_running:
                 if self.cancel_event.is_set():
-                    # Falls abgebrochen wurde, dem Thread bis zu 3 Sek Zeit geben, den laufenden Schritt zu beenden
-                    self.lock.release()
-                    self.current_thread.join(timeout=3.0)
-                    self.lock.acquire()
+                    return "### 🟡 Status: ABBRUCH LÄUFT... Bitte einen Moment warten."
+                return "### ⚠️ Status: JOB LÄUFT BEREITS"
 
-                if self.current_thread.is_alive():
-                    return "### ⚠️ Bitte kurz warten: Der vorherige Job wird noch beendet..."
-
-            # Zustand sicher für neuen Start zurücksetzen
             self.is_running = True
             self.cancel_event.clear()
             self.log_messages = []
@@ -362,6 +353,11 @@ class IngestTaskManager:
 
                         tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
                         category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
+
+                    if self.cancel_event.is_set():
+                        self.append_log("🛑 Ingestion vorzeitig abgebrochen.")
+                        self.set_status(f"🔴 Status: ABGEBROCHEN ({idx}/{self.total_files})")
+                        return
 
                     embed_res = ollama_client.embeddings(
                         model=EMBED_MODEL,
@@ -533,7 +529,6 @@ def scan_github_repository(github_url, old_scanned_repo):
             "❌ Bitte valide Repository URL angeben."
         )
 
-    # Sofortige Rückmeldung im Task-Manager
     task_manager.set_status("🟡 Status: SCANNE REPOSITORY...")
     task_manager.append_log(f"🌐 Starte Scan für Repository: {github_url.strip()} ... Bitte warten.")
 
