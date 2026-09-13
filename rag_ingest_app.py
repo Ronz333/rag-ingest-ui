@@ -19,7 +19,7 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:32b")
 EMBED_MODEL = "bge-m3"
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
-DEFAULT_NUM_CTX = 8192  # Erhöhtes Kontextfenster für Token-dichte EDA-Formate
+DEFAULT_NUM_CTX = 8192
 
 # Whitelist aller unterstützten Formate
 TEXT_EXTENSIONS = {
@@ -30,19 +30,19 @@ TEXT_EXTENSIONS = {
     ".pdf"
 }
 
-# Wissens-Kategorien & Prompts
+# Wissens-Kategorien & Prompts für unstrukturierte Formate
 CATEGORIES = {
     "⚡ PCB & Hardware Design": {
         "collection": "pcb_knowledge_base",
         "system_prompt": """Du bist ein Ingestion-Agent für ein EDA/PCB-RAG-System.
-Analysiere den Inhalt (z.B. Python-Code, KiCad-Symbol/Footprint, SPICE, Doku) und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+Analysiere den Inhalt (z.B. Python/SKiDL-Code, SPICE-Netzlisten, Doku) und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
 
 STRIKTE REGELN:
 1. ERSTE ZEILE: Zwingend ein exaktes Kategorie-Schlagwort in eckigen Klammern, z.B.:
-   [TAG: KICAD_FOOTPRINT], [TAG: KICAD_SYM], [TAG: KICAD_PCBNEW], [TAG: SKIDL_API] oder [TAG: SPICE_SIM].
-2. ABSOLUTES HALLUZINATIONSVERBOT: Verarbeite den DATEINAMEN und den INHALT strikt faktengetreu. Erfinde NIEMALS abweichende Bauteilabmessungen oder falsche Pin-Belegungen!
-3. CODE-INTEGRITÄT: Bette bei KiCad-Dateien (.kicad_mod, .kicad_sym) und SPICE-Netzlisten (.cir) den bereitgestellten ORIGINAL-CODE 1:1 unverändert im Markdown-Codeblock ein.
-4. Zusammenfassung: Fasse Zweck, Parameter und Pinbelegung sachlich zusammen."""
+   [TAG: SKIDL_API], [TAG: KICAD_PCBNEW], [TAG: SPICE_SIM] oder [TAG: EDA_GUIDE].
+2. ABSOLUTES HALLUZINATIONSVERBOT: Verarbeite den DATEINAMEN und den INHALT strikt faktengetreu.
+3. CODE-INTEGRITÄT: Bette bereitgestellten Quellcode 1:1 im Markdown-Codeblock ein.
+4. Zusammenfassung: Fasse Zweck, Parameter und Schnittstellen sachlich zusammen."""
     },
     "💻 Programmiersprachen & Software": {
         "collection": "programming_knowledge_base",
@@ -105,16 +105,86 @@ def save_config(data: dict):
     except Exception as e:
         print(f"Fehler beim Speichern der Konfiguration: {e}")
 
-def clean_eda_content(raw_text: str, ext: str) -> str:
-    """Filtert redundante Zeichenlinien (fp_line etc.) aus KiCad S-Expressions zur Vermeidung von Token-Explosionen."""
-    if ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch"}:
-        lines = raw_text.splitlines()
-        filtered = [
-            line for line in lines
-            if not re.match(r'^\s*\((?:fp_line|fp_arc|fp_circle|fp_rect|fp_poly)\b', line)
-        ]
-        return "\n".join(filtered)
-    return raw_text
+# --- FAST PARSER FÜR KICAD EDA FORMATE (OHNE LLM) ---
+def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
+    """Extrahiert strukturierte Metadaten aus KiCad S-Expressions in Millisekunden."""
+    ext = os.path.splitext(rel_path)[1].lower()
+    filename = os.path.basename(rel_path)
+
+    if ext == ".kicad_mod":
+        category_tag = "KICAD_FOOTPRINT"
+        fp_match = re.search(r'\(footprint\s+"?([^"\s)]+)"?', raw_text)
+        fp_name = fp_match.group(1) if fp_match else filename
+
+        descr_match = re.search(r'\(descr\s+"([^"]+)"\)', raw_text)
+        descr = descr_match.group(1) if descr_match else "Keine Beschreibung angegeben"
+
+        tags_match = re.search(r'\(tags\s+"([^"]+)"\)', raw_text)
+        tags = tags_match.group(1) if tags_match else "-"
+
+        pads = re.findall(r'\(pad\s+"([^"]+)"\s+([^\s]+)\s+([^\s]+)', raw_text)
+        if pads:
+            pad_info = f"Gesamt: {len(pads)} Pads (" + ", ".join([f"Pad {p[0]} [{p[1]}]" for p in pads[:6]]) + ")"
+        else:
+            pad_info = "Keine Pads vorhanden"
+
+        markdown_content = f"""[TAG: KICAD_FOOTPRINT]
+
+# KiCad Footprint: {fp_name}
+
+- **Dateipfad:** `{rel_path}`
+- **Bauteil-Name:** `{fp_name}`
+- **Beschreibung:** {descr}
+- **Schlagwörter:** `{tags}`
+- **Anschlüsse / Pads:** {pad_info}
+
+## Verwendung für PCB-Layout (`pcbnew`)
+Dieser Footprint wird in `pcbnew` über den Footprint-Bezeichner `{fp_name}` adressiert.
+"""
+        return category_tag, markdown_content
+
+    elif ext == ".kicad_sym":
+        category_tag = "KICAD_SYM"
+        sym_matches = re.findall(r'\(symbol\s+"([^"]+)"', raw_text)
+        main_sym = sym_matches[0] if sym_matches else filename
+
+        descr_match = re.search(r'\(property\s+"Description"\s+"([^"]+)"', raw_text)
+        descr = descr_match.group(1) if descr_match else "Keine Beschreibung"
+
+        fp_ref_match = re.search(r'\(property\s+"Footprint"\s+"([^"]+)"', raw_text)
+        fp_ref = fp_ref_match.group(1) if fp_ref_match else "-"
+
+        pins = re.findall(r'\(pin\s+([^\s]+)\s+([^\s]+)', raw_text)
+        pin_summary = f"{len(pins)} Pins vorhanden" if pins else "Keine expliziten Pins"
+
+        markdown_content = f"""[TAG: KICAD_SYM]
+
+# KiCad Schaltplan-Symbol: {main_sym}
+
+- **Dateipfad:** `{rel_path}`
+- **Symbol-Name:** `{main_sym}`
+- **Beschreibung:** {descr}
+- **Zugeordneter Footprint:** `{fp_ref}`
+- **Pin-Konfiguration:** {pin_summary}
+
+## Verwendung für SKiDL / Schaltungssynthese
+Dieses Symbol steht für die Netzlistenerzeugung via SKiDL unter dem Bauteilnamen `{main_sym}` bereit.
+"""
+        return category_tag, markdown_content
+
+    else:
+        category_tag = "KICAD_EDA"
+        markdown_content = f"""[TAG: KICAD_EDA]
+
+# KiCad Datei: {filename}
+
+- **Dateipfad:** `{rel_path}`
+- **Format:** `{ext}`
+
+## Inhaltssynthese
+Native KiCad S-Expression Datei zur Verarbeitung in der PCB-Pipeline.
+"""
+        return category_tag, markdown_content
 
 # --- THREAD-SICHERER BACKGROUND TASK MANAGER ---
 class IngestTaskManager:
@@ -260,35 +330,30 @@ class IngestTaskManager:
                     continue
 
                 ext = os.path.splitext(rel_path)[1].lower()
-                # Bereinige KiCad S-Expressions vor der Tokenisierung
-                cleaned_text = clean_eda_content(raw_text, ext)
-
-                self.append_log(f"[{idx}/{self.total_files}] Verarbeite via LLM: {rel_path}")
-
-                eda_guard = ""
-                if ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".cir", ".net"}:
-                    eda_guard = (
-                        "\n\nSTRIKTE ANWEISUNG FÜR NATIVE EDA-DATEIEN:\n"
-                        "- Bette den bereitgestellten ORIGINALTEXT zwingend 1:1 im Markdown-Codeblock ein.\n"
-                        "- Erfinde keine Geometrien, Pin-Anzahlen oder Maße, die nicht im Originaltext stehen!\n"
-                    )
-
-                full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{cleaned_text[:12000]}{eda_guard}"
 
                 try:
-                    response = ollama_client.chat(
-                        model=active_model,
-                        messages=[
-                            {'role': 'system', 'content': system_prompt},
-                            {'role': 'user', 'content': full_user_prompt}
-                        ],
-                        options={"num_ctx": DEFAULT_NUM_CTX}
-                    )
-                    processed_md = response['message']['content']
+                    # WEICHE: Fast-Pass für native KiCad Formate vs. LLM-Analyse für unstrukturierte Texte
+                    if ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch"}:
+                        self.append_log(f"[{idx}/{self.total_files}] Fast-Pass Parsing (ohne LLM): {rel_path}")
+                        category_tag, processed_md = fast_parse_kicad(rel_path, raw_text)
+                    else:
+                        self.append_log(f"[{idx}/{self.total_files}] Verarbeite via LLM ({active_model}): {rel_path}")
+                        full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}"
 
-                    tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
-                    category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
+                        response = ollama_client.chat(
+                            model=active_model,
+                            messages=[
+                                {'role': 'system', 'content': system_prompt},
+                                {'role': 'user', 'content': full_user_prompt}
+                            ],
+                            options={"num_ctx": DEFAULT_NUM_CTX}
+                        )
+                        processed_md = response['message']['content']
 
+                        tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
+                        category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
+
+                    # Multilinguales Embedding erzeugen
                     embed_res = ollama_client.embeddings(
                         model=EMBED_MODEL,
                         prompt=processed_md,
