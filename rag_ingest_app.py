@@ -1,15 +1,11 @@
 import os
 
-# --- PROXY SANITIZATION ---
-for env_key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]:
+# --- ABSOLUTE PROXY SANITIZATION (Löscht defekte Docker-Proxy-Variablen vor Modul-Imports) ---
+for env_key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"]:
     if env_key in os.environ:
-        val = os.environ[env_key]
+        val = str(os.environ[env_key])
         if val.startswith("[") or "unknown" in val or not val.startswith("http"):
-            cleaned = val.strip("[]'\" ")
-            if cleaned.startswith("http://") or cleaned.startswith("https://"):
-                os.environ[env_key] = cleaned
-            else:
-                os.environ.pop(env_key, None)
+            os.environ.pop(env_key, None)
 
 import re
 import uuid
@@ -134,11 +130,11 @@ def get_indexed_hashes_set(collection_name: str) -> set:
         print(f"Fehler beim Batch-Laden der Qdrant-Hashes: {e}")
     return indexed_set
 
-# --- MULTI-BACKEND HTTP FETCHER (cURL -> Requests -> urllib) ---
+# --- GEPRÜFTE MULTI-BACKEND HTTP-ENGINE ---
 def fetch_url(url: str, headers: dict) -> str:
     clean_url = url.strip()
 
-    # 1. cURL via Subprocess (Umgeht Python-Container SSL Fehler)
+    # 1. cURL Subprocess (Ignoriert fehlerhafte Python-Netzwerk-Adapter komplett)
     try:
         cmd = ["curl", "-sSL"]
         for k, v in headers.items():
@@ -148,24 +144,31 @@ def fetch_url(url: str, headers: dict) -> str:
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout
     except Exception as e:
-        print(f"cURL Fetch Warning: {e}")
+        print(f"cURL Fetch Fehler: {e}")
 
-    # 2. Requests Fallback
+    # 2. Requests ohne Umgebungsproxies
     if HAS_REQUESTS:
         try:
             session = requests.Session()
             session.trust_env = False
             res = session.get(clean_url, headers=headers, timeout=20, proxies={"http": None, "https": None})
-            return res.text
+            if res.status_code == 200:
+                return res.text
         except Exception as e:
-            print(f"Requests Fetch Warning: {e}")
+            print(f"Requests Fetch Fehler: {e}")
 
-    # 3. urllib Fallback
+    # 3. urllib mit expliziter Deaktivierung des Proxy-Handlers
     req = urllib.request.Request(clean_url, headers=headers)
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(req, context=ssl_ctx, timeout=20) as resp:
+
+    # Durch ProxyHandler({}) wird getproxies() und damit der urlopen-Fehler umgangen
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=ssl_ctx)
+    )
+    with opener.open(req, timeout=20) as resp:
         return resp.read().decode("utf-8", errors="ignore")
 
 # --- PARSER-FUNKTIONEN ---
