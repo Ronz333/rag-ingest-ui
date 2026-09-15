@@ -1,4 +1,16 @@
 import os
+
+# --- PROXY SANITIZATION (Behebt fehlerhafte Docker/System-Umgebungsvariablen) ---
+for env_key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]:
+    if env_key in os.environ:
+        val = os.environ[env_key]
+        if val.startswith("[") or "unknown" in val or not val.startswith("http"):
+            cleaned = val.strip("[]'\" ")
+            if cleaned.startswith("http://") or cleaned.startswith("https://"):
+                os.environ[env_key] = cleaned
+            else:
+                os.environ.pop(env_key, None)
+
 import re
 import uuid
 import shutil
@@ -17,7 +29,6 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 from pypdf import PdfReader
 
-# Versuche requests zu importieren, ansonsten Fallback auf urllib
 try:
     import requests
     HAS_REQUESTS = True
@@ -245,21 +256,20 @@ Verändere den Code NICHT."""
 """
     return category_tag, markdown_content
 
-# --- ROBUSter HTTP-GETTER (Proxy & SSL Safe) ---
-def fetch_url(url: str, headers: dict):
-    """Führt einen HTTP GET-Request aus und umgeht systemseitig fehlerhafte Proxy-Variablen."""
+# --- ABSOLUT ISOLIERTER HTTP-FETCHER ---
+def fetch_url(url: str, headers: dict) -> str:
+    """Führt HTTP-GET ohne System-Proxies durch, um Klammerfehler im Proxy-String zu vermeiden."""
+    clean_url = url.strip()
     if HAS_REQUESTS:
-        # Deaktiviere Environment-Proxies explizit in requests
         session = requests.Session()
         session.trust_env = False
-        res = session.get(url, headers=headers, timeout=15)
+        res = session.get(clean_url, headers=headers, timeout=15, proxies={"http": None, "https": None})
         res.raise_for_status()
         return res.text
     else:
-        # Fallback auf urllib ohne Proxy-Handler
-        req = urllib.request.Request(url, headers=headers)
-        no_proxy_handler = urllib.request.ProxyHandler({})
-        opener = urllib.request.build_opener(no_proxy_handler)
+        req = urllib.request.Request(clean_url, headers=headers)
+        no_proxy = urllib.request.ProxyHandler({})
+        opener = urllib.request.build_opener(no_proxy)
         ssl_ctx = ssl.create_default_context()
         with opener.open(req, context=ssl_ctx, timeout=15) as resp:
             return resp.read().decode("utf-8", errors="ignore")
@@ -338,7 +348,7 @@ class IngestTaskManager:
                 self.append_log(f"⛏️ Starte GitHub Code Mining für Query: '{github_query}' (Max: {github_max})")
                 headers = {
                     "Accept": "application/vnd.github.v3+json",
-                    "User-Agent": "Mozilla/5.0 (RAG-Ingest-App)"
+                    "User-Agent": "RAG-Ingest-Agent/1.0"
                 }
                 if github_token and github_token.strip():
                     headers["Authorization"] = f"token {github_token.strip()}"
