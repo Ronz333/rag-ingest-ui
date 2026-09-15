@@ -23,6 +23,9 @@ CONFIG_FILE = "/tmp/rag_ingest_config.json"
 DEFAULT_NUM_CTX = 8192
 TB = "```"
 
+IGNORED_FILENAMES = {"setup.py", "conftest.py", "__init__.py"}
+IGNORED_PATH_PARTS = ["/docs/", "/tests/", "/build/", "/dist/", "/examples/"]
+
 TEXT_EXTENSIONS = {
     ".kicad_sym", ".kicad_mod", ".kicad_pcb", ".kicad_sch", ".kicad_prj", ".kicad_dru",
     ".sch", ".net", ".cir", ".lib", ".mod", ".sym", ".spice", ".sub", ".mcb", ".dxf",
@@ -65,9 +68,8 @@ STRIKTE REGELN:
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 qdrant_client = QdrantClient(url=QDRANT_HOST)
 
-# --- URL SANITIZATION HELPER ---
+# --- SANITIZATION & CONFIG HELPERS ---
 def sanitize_url(raw_url: str) -> str:
-    """Extrahiert eine reine HTTPS-URL aus Markdown-Links oder Klammern."""
     if not raw_url:
         return ""
     md_match = re.search(r'\((https?://[^\)]+)\)', raw_url)
@@ -78,7 +80,6 @@ def sanitize_url(raw_url: str) -> str:
         return url_match.group(0).strip()
     return raw_url.strip("[]()'\" ")
 
-# --- CONFIG & QDRANT HELPERS ---
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -189,9 +190,38 @@ Dieses Symbol steht für die Netzlistenerzeugung via SKiDL unter dem Bauteilname
         return category_tag, markdown_content
 
 def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str) -> tuple[str, str] | tuple[None, None]:
+    filename = os.path.basename(rel_path)
+    rel_lower = rel_path.lower()
+
+    # 1. Dateinamen & Pfad-Filter (Build-/Doku-Skripte verwerfen)
+    if filename in IGNORED_FILENAMES or any(p in rel_lower for p in IGNORED_PATH_PARTS):
+        return None, None
+
+    # 2. Größen-Limit: Dateien über 50 KB (~1000 Zeilen) sind keine überschaubaren "Golden Examples"
+    if len(raw_code) > 50000:
+        return None, None
+
+    # 3. Syntax-Prüfung via AST
     try:
         tree = ast.parse(raw_code)
     except SyntaxError:
+        return None, None
+
+    # 4. AST-Check: Prüft auf explizite SKiDL Komponentenerzeugung (Part, Net, Bus, generate_netlist)
+    has_skidl_instantiation = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func_name = ""
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                func_name = node.func.attr
+
+            if func_name in ["Part", "Net", "Bus", "generate_netlist", "generate_pcb"]:
+                has_skidl_instantiation = True
+                break
+
+    if not has_skidl_instantiation:
         return None, None
 
     docstring = ast.get_docstring(tree) or "Kein Modul-Docstring vorhanden"
@@ -203,11 +233,6 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str) -> tup
         elif isinstance(node, ast.ImportFrom):
             if node.module:
                 imports.append(node.module)
-
-    code_lower = raw_code.lower()
-    is_eda_python = any(term in code_lower for term in ["skidl", "pcbnew", "freerouting", "generate_netlist", "part(", "net("])
-    if not is_eda_python:
-        return None, None
 
     enrichment_prompt = f"""Analysiere diesen funktionierenden EDA/SKiDL Python-Code:
 
@@ -231,6 +256,8 @@ Verändere den Code NICHT."""
         enrichment_text = f"**Zweck:** SKiDL Python Modul ({rel_path})\n**Docstring:** {docstring}"
 
     category_tag = "SKIDL_GOLDEN_EXAMPLE"
+    code_snippet = raw_code[:10000] + ("\n# ... [Code gekürzt wegen Dateigröße]" if len(raw_code) > 10000 else "")
+
     markdown_content = f"""[TAG: SKIDL_GOLDEN_EXAMPLE]
 
 # Golden Example: {os.path.basename(rel_path)}
@@ -243,7 +270,7 @@ Verändere den Code NICHT."""
 
 ## Validierter Original-Code (Python / SKiDL)
 {TB}python
-{raw_code}
+{code_snippet}
 {TB}
 """
     return category_tag, markdown_content
@@ -317,7 +344,7 @@ class IngestTaskManager:
 
             files_to_process = []
 
-            # MODUS: REPOSITORY MINING VIA SANITIZED GIT CLONE
+            # REPOSITORY MINING MODUS VIA GIT CLONE
             if mode == "repo_mining":
                 clean_repo_url = sanitize_url(mining_repo_url)
                 if not clean_repo_url:
@@ -349,7 +376,7 @@ class IngestTaskManager:
                             repo_base_name = os.path.basename(clean_repo_url.rstrip("/"))
                             files_to_process.append((f"{repo_base_name}/{rel_p}", full_p))
 
-            # MODUS: STANDARD DATEI & GIT CRAWLER
+            # STANDARD DATEI & GIT CRAWLER MODUS
             else:
                 if files:
                     for file_item in files:
@@ -420,7 +447,7 @@ class IngestTaskManager:
                         self.append_log(f"[{idx}/{self.total_files}] Hybrid AST-LLM Parse: {rel_path}")
                         category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model)
                         if not processed_md:
-                            self.append_log(f"   ⚠️ AST/Relevanz-Check fehlgeschlagen (Kein SKiDL/EDA Code oder Syntaxfehler): {rel_path}")
+                            self.append_log(f"   ⚠️ AST/Filter übersprungen (kein SKiDL-Code oder Build/Doku): {rel_path}")
                             continue
 
                     elif ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch"}:
@@ -445,11 +472,22 @@ class IngestTaskManager:
                     if self.cancel_event.is_set():
                         return
 
-                    embed_res = ollama_client.embeddings(
-                        model=EMBED_MODEL,
-                        prompt=processed_md,
-                        options={"num_ctx": DEFAULT_NUM_CTX}
-                    )
+                    # Abgesicherter Embedding-Aufruf mit Fallback bei Überlänge
+                    embed_prompt = processed_md[:7500]
+                    try:
+                        embed_res = ollama_client.embeddings(
+                            model=EMBED_MODEL,
+                            prompt=embed_prompt,
+                            options={"num_ctx": DEFAULT_NUM_CTX}
+                        )
+                    except Exception as embed_err:
+                        self.append_log(f"   ⚠️ Token-Limit erreicht ({embed_err}). Kürze Embedding-Input für {rel_path}...")
+                        embed_res = ollama_client.embeddings(
+                            model=EMBED_MODEL,
+                            prompt=processed_md[:3000],
+                            options={"num_ctx": DEFAULT_NUM_CTX}
+                        )
+
                     vector = embed_res['embedding']
 
                     ensure_qdrant_collection(target_collection, len(vector))
