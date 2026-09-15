@@ -6,7 +6,6 @@ import zipfile
 import hashlib
 import json
 import ast
-import ssl
 import threading
 import subprocess
 import urllib.request
@@ -24,7 +23,7 @@ DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:32b")
 EMBED_MODEL = "bge-m3"
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
 DEFAULT_NUM_CTX = 8192
-TB = "```"
+TB = "```"  # Helper für Markdown Codeblocks in String-Templates
 
 TEXT_EXTENSIONS = {
     ".kicad_sym", ".kicad_mod", ".kicad_pcb", ".kicad_sch", ".kicad_prj", ".kicad_dru",
@@ -307,24 +306,20 @@ class IngestTaskManager:
 
             files_to_process = []
 
-            # GITHUB MINING MODUS (REIN NATIVE URLLIB REQUESTS MIT SSL)
+            # GITHUB MINING MODUS
             if mode == "github_mining":
                 self.append_log(f"⛏️ Starte GitHub Code Mining für Query: '{github_query}' (Max: {github_max})")
-                headers = {
-                    "Accept": "application/vnd.github.v3+json",
-                    "User-Agent": "Mozilla/5.0 (RAG-Ingest-App)"
-                }
+                headers = {"Accept": "application/vnd.github.v3+json"}
                 if github_token and github_token.strip():
                     headers["Authorization"] = f"token {github_token.strip()}"
 
-                params = urllib.parse.urlencode({"q": github_query, "per_page": min(github_max, 50)})
-                search_url = f"[https://api.github.com/search/code](https://api.github.com/search/code)?{params}"
-                ssl_ctx = ssl.create_default_context()
+                encoded_query = urllib.parse.quote(github_query)
+                search_url = f"[https://api.github.com/search/code?q=](https://api.github.com/search/code?q=){encoded_query}&per_page={min(github_max, 50)}"
 
                 try:
                     req = urllib.request.Request(search_url, headers=headers)
-                    with urllib.request.urlopen(req, context=ssl_ctx, timeout=15) as response:
-                        res_data = json.loads(response.read().decode('utf-8'))
+                    with urllib.request.urlopen(req) as response:
+                        res_data = json.loads(response.read().decode())
                         items = res_data.get("items", [])
                         self.append_log(f"   ↳ {len(items)} Treffer auf GitHub gefunden. Lade Quellcode herunter...")
 
@@ -336,7 +331,7 @@ class IngestTaskManager:
                             if raw_url:
                                 try:
                                     raw_req = urllib.request.Request(raw_url, headers=headers)
-                                    with urllib.request.urlopen(raw_req, context=ssl_ctx, timeout=15) as raw_resp:
+                                    with urllib.request.urlopen(raw_req) as raw_resp:
                                         code_content = raw_resp.read().decode("utf-8", errors="ignore")
                                         local_fpath = os.path.join(temp_work_dir, f"{uuid.uuid4()[:6]}_{os.path.basename(path_name)}")
                                         with open(local_fpath, "w", encoding="utf-8") as f:

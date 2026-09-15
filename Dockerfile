@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Git installieren für Repositories & PIP Pakete
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir gradio ollama qdrant-client pypdf
+RUN pip install --no-cache-dir gradio ollama qdrant-client pypdf requests
 
 COPY rag_ingest_app.py /app/rag_ingest_app.py
 
