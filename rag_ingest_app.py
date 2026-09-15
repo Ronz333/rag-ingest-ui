@@ -1,12 +1,4 @@
 import os
-
-# --- ABSOLUTE PROXY SANITIZATION (Löscht defekte Docker-Proxy-Variablen vor Modul-Imports) ---
-for env_key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"]:
-    if env_key in os.environ:
-        val = str(os.environ[env_key])
-        if val.startswith("[") or "unknown" in val or not val.startswith("http"):
-            os.environ.pop(env_key, None)
-
 import re
 import uuid
 import shutil
@@ -14,22 +6,13 @@ import zipfile
 import hashlib
 import json
 import ast
-import ssl
 import threading
 import subprocess
-import urllib.request
-import urllib.parse
 import gradio as gr
 import ollama
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+from qdrant_client.models import Distance, VectorParams, PointStruct
 from pypdf import PdfReader
-
-try:
-    import requests
-    HAS_REQUESTS = True
-except ImportError:
-    HAS_REQUESTS = False
 
 # --- KONFIGURATION & KONSTANTEN ---
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
@@ -129,47 +112,6 @@ def get_indexed_hashes_set(collection_name: str) -> set:
     except Exception as e:
         print(f"Fehler beim Batch-Laden der Qdrant-Hashes: {e}")
     return indexed_set
-
-# --- GEPRÜFTE MULTI-BACKEND HTTP-ENGINE ---
-def fetch_url(url: str, headers: dict) -> str:
-    clean_url = url.strip()
-
-    # 1. cURL Subprocess (Ignoriert fehlerhafte Python-Netzwerk-Adapter komplett)
-    try:
-        cmd = ["curl", "-sSL"]
-        for k, v in headers.items():
-            cmd.extend(["-H", f"{k}: {v}"])
-        cmd.append(clean_url)
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if res.returncode == 0 and res.stdout.strip():
-            return res.stdout
-    except Exception as e:
-        print(f"cURL Fetch Fehler: {e}")
-
-    # 2. Requests ohne Umgebungsproxies
-    if HAS_REQUESTS:
-        try:
-            session = requests.Session()
-            session.trust_env = False
-            res = session.get(clean_url, headers=headers, timeout=20, proxies={"http": None, "https": None})
-            if res.status_code == 200:
-                return res.text
-        except Exception as e:
-            print(f"Requests Fetch Fehler: {e}")
-
-    # 3. urllib mit expliziter Deaktivierung des Proxy-Handlers
-    req = urllib.request.Request(clean_url, headers=headers)
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-
-    # Durch ProxyHandler({}) wird getproxies() und damit der urlopen-Fehler umgangen
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}),
-        urllib.request.HTTPSHandler(context=ssl_ctx)
-    )
-    with opener.open(req, timeout=20) as resp:
-        return resp.read().decode("utf-8", errors="ignore")
 
 # --- PARSER-FUNKTIONEN ---
 def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
@@ -326,7 +268,7 @@ class IngestTaskManager:
                 self.status_header = "🟡 Status: WIRD ABGEBROCHEN..."
             return f"### {self.status_header}"
 
-    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", github_query="", github_max=10, github_token=""):
+    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url=""):
         with self.lock:
             if self.is_running:
                 return "### ⚠️ Status: JOB LÄUFT BEREITS"
@@ -338,17 +280,17 @@ class IngestTaskManager:
             self.total_files = 0
             self.status_header = "🟢 Status: WIRD GESTARTET..."
 
-            save_config({"last_model": selected_model, "last_category": category_key, "last_token": github_token})
+            save_config({"last_model": selected_model, "last_category": category_key})
 
             self.current_thread = threading.Thread(
                 target=self._run_job,
-                args=(files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, github_query, github_max, github_token),
+                args=(files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url),
                 daemon=True
             )
             self.current_thread.start()
             return f"### {self.status_header}"
 
-    def _run_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, github_query, github_max, github_token):
+    def _run_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url):
         temp_work_dir = None
         try:
             category_info = CATEGORIES.get(category_key, CATEGORIES["⚡ PCB & Hardware Design"])
@@ -362,51 +304,38 @@ class IngestTaskManager:
 
             files_to_process = []
 
-            # GITHUB MINING MODUS
-            if mode == "github_mining":
-                self.append_log(f"⛏️ Starte GitHub Code Mining für Query: '{github_query}' (Max: {github_max})")
-                headers = {
-                    "Accept": "application/vnd.github.v3+json",
-                    "User-Agent": "RAG-Ingest-Agent/1.0"
-                }
-                if github_token and github_token.strip():
-                    headers["Authorization"] = f"token {github_token.strip()}"
-
-                params = urllib.parse.urlencode({"q": github_query, "per_page": min(github_max, 50)})
-                search_url = f"[https://api.github.com/search/code](https://api.github.com/search/code)?{params}"
-
-                try:
-                    raw_json = fetch_url(search_url, headers=headers)
-                    res_data = json.loads(raw_json)
-
-                    if "message" in res_data and "items" not in res_data:
-                        self.append_log(f"❌ GitHub API Hinweis: {res_data.get('message')} (Ggf. GitHub Token eingeben)")
-                        self.set_status("🔴 Status: GITHUB API RATE LIMIT / FEHLER")
-                        return
-
-                    items = res_data.get("items", [])
-                    self.append_log(f"   ↳ {len(items)} Treffer auf GitHub gefunden. Lade Quellcode herunter...")
-
-                    for item in items:
-                        raw_url = item.get("html_url", "").replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-                        path_name = item.get("path", "script.py")
-                        repo_name = item.get("repository", {}).get("full_name", "unknown/repo")
-
-                        if raw_url:
-                            try:
-                                code_content = fetch_url(raw_url, headers=headers)
-                                local_fpath = os.path.join(temp_work_dir, f"{uuid.uuid4()[:6]}_{os.path.basename(path_name)}")
-                                with open(local_fpath, "w", encoding="utf-8") as f:
-                                    f.write(code_content)
-                                files_to_process.append((f"{repo_name}/{path_name}", local_fpath))
-                            except Exception as dl_err:
-                                self.append_log(f"   ⚠️ Fehler beim Download von {path_name}: {dl_err}")
-                except Exception as api_err:
-                    self.append_log(f"❌ GitHub API Fehler: {api_err}")
-                    self.set_status("🔴 Status: GITHUB FEHLER")
+            # MODUS: REPOSITORY MINING (ANSTATT INFRASTRUKTUR-ANFÄLLIGER HTTP-SEARCH-API)
+            if mode == "repo_mining":
+                repo_url = mining_repo_url.strip()
+                if not repo_url:
+                    self.append_log("❌ Keine Repository-URL für das Mining angegeben.")
+                    self.set_status("🔴 Status: BEENDET (Keine URL)")
                     return
 
-            # STANDARD DATEI & GIT CRAWLER MODUS
+                self.append_log(f"⛏️ Starte Git-Mining via `git clone`: {repo_url}")
+                mined_repo_dir = os.path.join(temp_work_dir, "mined_repo")
+
+                res = subprocess.run(
+                    ["git", "clone", "--depth", "1", repo_url, mined_repo_dir],
+                    capture_output=True, text=True
+                )
+
+                if res.returncode != 0:
+                    self.append_log(f"❌ Git-Clone fehlgeschlagen: {res.stderr[:300]}")
+                    self.set_status("🔴 Status: GIT CLONE FEHLER")
+                    return
+
+                self.append_log("   ↳ Repository erfolgreich geklont. Scanne alle Python-Dateien...")
+                for root, _, filenames in os.walk(mined_repo_dir):
+                    if ".git" in root:
+                        continue
+                    for f in filenames:
+                        if f.endswith(".py"):
+                            full_p = os.path.join(root, f)
+                            rel_p = os.path.relpath(full_p, mined_repo_dir)
+                            files_to_process.append((f"{os.path.basename(repo_url)}/{rel_p}", full_p))
+
+            # MODUS: STANDARD DATEI & GIT CRAWLER
             else:
                 if files:
                     for file_item in files:
@@ -473,7 +402,7 @@ class IngestTaskManager:
                 ext = os.path.splitext(rel_path)[1].lower()
 
                 try:
-                    if mode == "github_mining" or ext == ".py":
+                    if mode == "repo_mining" or ext == ".py":
                         self.append_log(f"[{idx}/{self.total_files}] Hybrid AST-LLM Parse: {rel_path}")
                         category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model)
                         if not processed_md:
@@ -785,7 +714,6 @@ function() {
 initial_model_choices, initial_default_model = get_ollama_models()
 saved_cfg = load_config()
 initial_default_category = saved_cfg.get("last_category", list(CATEGORIES.keys())[0])
-saved_token = saved_cfg.get("last_token", "")
 
 with gr.Blocks(title="Universal RAG Control Center") as demo:
     repo_state = gr.State("")
@@ -834,21 +762,19 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                         folder_checkboxes = gr.CheckboxGroup(label="Ordnerstruktur", choices=[], visible=False, interactive=True, scale=1)
                         ext_checkboxes = gr.CheckboxGroup(label="Dateiformate Filter", choices=[], visible=False, interactive=True, scale=1)
 
-                with gr.Tab("⭐ GitHub Mining ('Golden Examples')"):
-                    github_query_input = gr.Textbox(
-                        label="Code-Suchbegriff (GitHub Query)",
-                        value='path:*.py "from skidl import *"',
-                        placeholder='path:*.py "from skidl import *"'
+                with gr.Tab("⭐ Golden Examples Mining"):
+                    mining_repo_input = gr.Dropdown(
+                        choices=[
+                            ("SKiDL Haupt-Repository (Offiziell)", "[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)"),
+                            ("KiCad Python Action Plugins", "[https://github.com/KiCad/kicad-python](https://github.com/KiCad/kicad-python)"),
+                            ("Freerouting Java / Config Core", "[https://github.com/freerouting/freerouting](https://github.com/freerouting/freerouting)")
+                        ],
+                        value="[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)",
+                        label="Ziel-Repository für Golden Examples Mining",
+                        allow_custom_value=True,
+                        interactive=True
                     )
-                    with gr.Row():
-                        github_max_slider = gr.Slider(minimum=1, maximum=50, value=15, step=1, label="Max. Dateien crawlen")
-                        github_token_input = gr.Textbox(
-                            label="GitHub Token (PAT - Empfohlen)",
-                            value=saved_token,
-                            placeholder="ghp_...",
-                            type="password"
-                        )
-                    start_mining_btn = gr.Button("⛏️ Mining & Hybrid Ingestion Starten", variant="primary")
+                    start_mining_btn = gr.Button("⛏️ Git-Mining & Hybrid Ingestion Starten", variant="primary")
 
         with gr.Column(scale=1):
             status_output = gr.Textbox(
@@ -890,10 +816,10 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     )
 
     start_mining_btn.click(
-        fn=lambda cat, mod, q, m_val, tok: task_manager.start_background_job(
-            None, None, None, None, cat, mod, mode="github_mining", github_query=q, github_max=m_val, github_token=tok
+        fn=lambda cat, mod, url: task_manager.start_background_job(
+            None, None, None, None, cat, mod, mode="repo_mining", mining_repo_url=url
         ),
-        inputs=[category_dropdown, model_dropdown, github_query_input, github_max_slider, github_token_input],
+        inputs=[category_dropdown, model_dropdown, mining_repo_input],
         outputs=[status_banner]
     )
 
