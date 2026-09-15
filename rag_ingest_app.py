@@ -65,6 +65,19 @@ STRIKTE REGELN:
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 qdrant_client = QdrantClient(url=QDRANT_HOST)
 
+# --- URL SANITIZATION HELPER ---
+def sanitize_url(raw_url: str) -> str:
+    """Extrahiert eine reine HTTPS-URL aus Markdown-Links oder Klammern."""
+    if not raw_url:
+        return ""
+    md_match = re.search(r'\((https?://[^\)]+)\)', raw_url)
+    if md_match:
+        return md_match.group(1).strip()
+    url_match = re.search(r'https?://[^\s>\]\)]+', raw_url)
+    if url_match:
+        return url_match.group(0).strip()
+    return raw_url.strip("[]()'\" ")
+
 # --- CONFIG & QDRANT HELPERS ---
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -304,19 +317,19 @@ class IngestTaskManager:
 
             files_to_process = []
 
-            # MODUS: REPOSITORY MINING (ANSTATT INFRASTRUKTUR-ANFÄLLIGER HTTP-SEARCH-API)
+            # MODUS: REPOSITORY MINING VIA SANITIZED GIT CLONE
             if mode == "repo_mining":
-                repo_url = mining_repo_url.strip()
-                if not repo_url:
-                    self.append_log("❌ Keine Repository-URL für das Mining angegeben.")
-                    self.set_status("🔴 Status: BEENDET (Keine URL)")
+                clean_repo_url = sanitize_url(mining_repo_url)
+                if not clean_repo_url:
+                    self.append_log("❌ Keine valide Repository-URL für das Mining angegeben.")
+                    self.set_status("🔴 Status: BEENDET (Ungültige URL)")
                     return
 
-                self.append_log(f"⛏️ Starte Git-Mining via `git clone`: {repo_url}")
+                self.append_log(f"⛏️ Starte Git-Mining via `git clone`: {clean_repo_url}")
                 mined_repo_dir = os.path.join(temp_work_dir, "mined_repo")
 
                 res = subprocess.run(
-                    ["git", "clone", "--depth", "1", repo_url, mined_repo_dir],
+                    ["git", "clone", "--depth", "1", clean_repo_url, mined_repo_dir],
                     capture_output=True, text=True
                 )
 
@@ -333,7 +346,8 @@ class IngestTaskManager:
                         if f.endswith(".py"):
                             full_p = os.path.join(root, f)
                             rel_p = os.path.relpath(full_p, mined_repo_dir)
-                            files_to_process.append((f"{os.path.basename(repo_url)}/{rel_p}", full_p))
+                            repo_base_name = os.path.basename(clean_repo_url.rstrip("/"))
+                            files_to_process.append((f"{repo_base_name}/{rel_p}", full_p))
 
             # MODUS: STANDARD DATEI & GIT CRAWLER
             else:
@@ -571,7 +585,8 @@ def scan_github_repository(github_url, old_scanned_repo):
     if old_scanned_repo and os.path.exists(old_scanned_repo):
         shutil.rmtree(old_scanned_repo, ignore_errors=True)
 
-    if not github_url or not github_url.strip():
+    clean_url = sanitize_url(github_url)
+    if not clean_url:
         yield (
             gr.update(choices=[], value=[], visible=False),
             gr.update(choices=[], value=[], visible=False),
@@ -581,20 +596,20 @@ def scan_github_repository(github_url, old_scanned_repo):
         return
 
     task_manager.set_status("🟡 Status: SCANNE REPOSITORY...")
-    task_manager.append_log(f"🌐 Starte Scan für Repository: {github_url.strip()} ... Bitte warten.")
+    task_manager.append_log(f"🌐 Starte Scan für Repository: {clean_url} ... Bitte warten.")
 
     yield (
         gr.update(visible=False),
         gr.update(visible=False),
         "",
-        f"🌐 Klone Repository {github_url.strip()} im Hintergrund..."
+        f"🌐 Klone Repository {clean_url} im Hintergrund..."
     )
 
     session_id = str(uuid.uuid4())[:8]
     repo_dir = os.path.join("/tmp", f"scan_repo_{session_id}")
 
     res = subprocess.run(
-        ["git", "clone", "--depth", "1", github_url.strip(), repo_dir],
+        ["git", "clone", "--depth", "1", clean_url, repo_dir],
         capture_output=True, text=True
     )
 
