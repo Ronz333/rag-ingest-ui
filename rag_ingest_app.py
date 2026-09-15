@@ -1,6 +1,6 @@
 import os
 
-# --- PROXY SANITIZATION (Behebt fehlerhafte Docker/System-Umgebungsvariablen) ---
+# --- PROXY SANITIZATION ---
 for env_key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]:
     if env_key in os.environ:
         val = os.environ[env_key]
@@ -134,6 +134,40 @@ def get_indexed_hashes_set(collection_name: str) -> set:
         print(f"Fehler beim Batch-Laden der Qdrant-Hashes: {e}")
     return indexed_set
 
+# --- MULTI-BACKEND HTTP FETCHER (cURL -> Requests -> urllib) ---
+def fetch_url(url: str, headers: dict) -> str:
+    clean_url = url.strip()
+
+    # 1. cURL via Subprocess (Umgeht Python-Container SSL Fehler)
+    try:
+        cmd = ["curl", "-sSL"]
+        for k, v in headers.items():
+            cmd.extend(["-H", f"{k}: {v}"])
+        cmd.append(clean_url)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout
+    except Exception as e:
+        print(f"cURL Fetch Warning: {e}")
+
+    # 2. Requests Fallback
+    if HAS_REQUESTS:
+        try:
+            session = requests.Session()
+            session.trust_env = False
+            res = session.get(clean_url, headers=headers, timeout=20, proxies={"http": None, "https": None})
+            return res.text
+        except Exception as e:
+            print(f"Requests Fetch Warning: {e}")
+
+    # 3. urllib Fallback
+    req = urllib.request.Request(clean_url, headers=headers)
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, context=ssl_ctx, timeout=20) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
 # --- PARSER-FUNKTIONEN ---
 def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
     ext = os.path.splitext(rel_path)[1].lower()
@@ -256,24 +290,6 @@ Verändere den Code NICHT."""
 """
     return category_tag, markdown_content
 
-# --- ABSOLUT ISOLIERTER HTTP-FETCHER ---
-def fetch_url(url: str, headers: dict) -> str:
-    """Führt HTTP-GET ohne System-Proxies durch, um Klammerfehler im Proxy-String zu vermeiden."""
-    clean_url = url.strip()
-    if HAS_REQUESTS:
-        session = requests.Session()
-        session.trust_env = False
-        res = session.get(clean_url, headers=headers, timeout=15, proxies={"http": None, "https": None})
-        res.raise_for_status()
-        return res.text
-    else:
-        req = urllib.request.Request(clean_url, headers=headers)
-        no_proxy = urllib.request.ProxyHandler({})
-        opener = urllib.request.build_opener(no_proxy)
-        ssl_ctx = ssl.create_default_context()
-        with opener.open(req, context=ssl_ctx, timeout=15) as resp:
-            return resp.read().decode("utf-8", errors="ignore")
-
 # --- TASK MANAGER ---
 class IngestTaskManager:
     def __init__(self):
@@ -359,6 +375,12 @@ class IngestTaskManager:
                 try:
                     raw_json = fetch_url(search_url, headers=headers)
                     res_data = json.loads(raw_json)
+
+                    if "message" in res_data and "items" not in res_data:
+                        self.append_log(f"❌ GitHub API Hinweis: {res_data.get('message')} (Ggf. GitHub Token eingeben)")
+                        self.set_status("🔴 Status: GITHUB API RATE LIMIT / FEHLER")
+                        return
+
                     items = res_data.get("items", [])
                     self.append_log(f"   ↳ {len(items)} Treffer auf GitHub gefunden. Lade Quellcode herunter...")
 
@@ -377,8 +399,8 @@ class IngestTaskManager:
                             except Exception as dl_err:
                                 self.append_log(f"   ⚠️ Fehler beim Download von {path_name}: {dl_err}")
                 except Exception as api_err:
-                    self.append_log(f"❌ GitHub API Fehler: {api_err} (Ggf. Token angeben!)")
-                    self.set_status("🔴 Status: GITHUB API FEHLER")
+                    self.append_log(f"❌ GitHub API Fehler: {api_err}")
+                    self.set_status("🔴 Status: GITHUB FEHLER")
                     return
 
             # STANDARD DATEI & GIT CRAWLER MODUS
