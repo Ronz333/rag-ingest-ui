@@ -6,6 +6,7 @@ import zipfile
 import hashlib
 import json
 import ast
+import ssl
 import threading
 import subprocess
 import urllib.request
@@ -16,6 +17,13 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 from pypdf import PdfReader
 
+# Versuche requests zu importieren, ansonsten Fallback auf urllib
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
 # --- KONFIGURATION & KONSTANTEN ---
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
@@ -23,7 +31,7 @@ DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:32b")
 EMBED_MODEL = "bge-m3"
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
 DEFAULT_NUM_CTX = 8192
-TB = "```"  # Helper für Markdown Codeblocks in String-Templates
+TB = "```"
 
 TEXT_EXTENSIONS = {
     ".kicad_sym", ".kicad_mod", ".kicad_pcb", ".kicad_sch", ".kicad_prj", ".kicad_dru",
@@ -237,6 +245,25 @@ Verändere den Code NICHT."""
 """
     return category_tag, markdown_content
 
+# --- ROBUSter HTTP-GETTER (Proxy & SSL Safe) ---
+def fetch_url(url: str, headers: dict):
+    """Führt einen HTTP GET-Request aus und umgeht systemseitig fehlerhafte Proxy-Variablen."""
+    if HAS_REQUESTS:
+        # Deaktiviere Environment-Proxies explizit in requests
+        session = requests.Session()
+        session.trust_env = False
+        res = session.get(url, headers=headers, timeout=15)
+        res.raise_for_status()
+        return res.text
+    else:
+        # Fallback auf urllib ohne Proxy-Handler
+        req = urllib.request.Request(url, headers=headers)
+        no_proxy_handler = urllib.request.ProxyHandler({})
+        opener = urllib.request.build_opener(no_proxy_handler)
+        ssl_ctx = ssl.create_default_context()
+        with opener.open(req, context=ssl_ctx, timeout=15) as resp:
+            return resp.read().decode("utf-8", errors="ignore")
+
 # --- TASK MANAGER ---
 class IngestTaskManager:
     def __init__(self):
@@ -309,36 +336,36 @@ class IngestTaskManager:
             # GITHUB MINING MODUS
             if mode == "github_mining":
                 self.append_log(f"⛏️ Starte GitHub Code Mining für Query: '{github_query}' (Max: {github_max})")
-                headers = {"Accept": "application/vnd.github.v3+json"}
+                headers = {
+                    "Accept": "application/vnd.github.v3+json",
+                    "User-Agent": "Mozilla/5.0 (RAG-Ingest-App)"
+                }
                 if github_token and github_token.strip():
                     headers["Authorization"] = f"token {github_token.strip()}"
 
-                encoded_query = urllib.parse.quote(github_query)
-                search_url = f"[https://api.github.com/search/code?q=](https://api.github.com/search/code?q=){encoded_query}&per_page={min(github_max, 50)}"
+                params = urllib.parse.urlencode({"q": github_query, "per_page": min(github_max, 50)})
+                search_url = f"[https://api.github.com/search/code](https://api.github.com/search/code)?{params}"
 
                 try:
-                    req = urllib.request.Request(search_url, headers=headers)
-                    with urllib.request.urlopen(req) as response:
-                        res_data = json.loads(response.read().decode())
-                        items = res_data.get("items", [])
-                        self.append_log(f"   ↳ {len(items)} Treffer auf GitHub gefunden. Lade Quellcode herunter...")
+                    raw_json = fetch_url(search_url, headers=headers)
+                    res_data = json.loads(raw_json)
+                    items = res_data.get("items", [])
+                    self.append_log(f"   ↳ {len(items)} Treffer auf GitHub gefunden. Lade Quellcode herunter...")
 
-                        for item in items:
-                            raw_url = item.get("html_url", "").replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-                            path_name = item.get("path", "script.py")
-                            repo_name = item.get("repository", {}).get("full_name", "unknown/repo")
+                    for item in items:
+                        raw_url = item.get("html_url", "").replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+                        path_name = item.get("path", "script.py")
+                        repo_name = item.get("repository", {}).get("full_name", "unknown/repo")
 
-                            if raw_url:
-                                try:
-                                    raw_req = urllib.request.Request(raw_url, headers=headers)
-                                    with urllib.request.urlopen(raw_req) as raw_resp:
-                                        code_content = raw_resp.read().decode("utf-8", errors="ignore")
-                                        local_fpath = os.path.join(temp_work_dir, f"{uuid.uuid4()[:6]}_{os.path.basename(path_name)}")
-                                        with open(local_fpath, "w", encoding="utf-8") as f:
-                                            f.write(code_content)
-                                        files_to_process.append((f"{repo_name}/{path_name}", local_fpath))
-                                except Exception as dl_err:
-                                    self.append_log(f"   ⚠️ Fehler beim Download von {path_name}: {dl_err}")
+                        if raw_url:
+                            try:
+                                code_content = fetch_url(raw_url, headers=headers)
+                                local_fpath = os.path.join(temp_work_dir, f"{uuid.uuid4()[:6]}_{os.path.basename(path_name)}")
+                                with open(local_fpath, "w", encoding="utf-8") as f:
+                                    f.write(code_content)
+                                files_to_process.append((f"{repo_name}/{path_name}", local_fpath))
+                            except Exception as dl_err:
+                                self.append_log(f"   ⚠️ Fehler beim Download von {path_name}: {dl_err}")
                 except Exception as api_err:
                     self.append_log(f"❌ GitHub API Fehler: {api_err} (Ggf. Token angeben!)")
                     self.set_status("🔴 Status: GITHUB API FEHLER")
