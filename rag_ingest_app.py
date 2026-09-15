@@ -232,19 +232,22 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str) -> tup
     if filename in IGNORED_FILENAMES or any(p in rel_lower for p in IGNORED_PATH_PARTS):
         return None, None
 
-    # 2. Größen-Limit: Dateien über 50 KB (~1000 Zeilen) überspringen
-    if len(raw_code) > 50000:
+    # 2. Differenzierung: Ist es SKiDL API Internals oder ein echtes Schaltungsbeispiel?
+    is_skidl_api_internal = any(p in rel_lower for p in ["/src/skidl/", "skidl/skidl/", "/skidl/src/"])
+    is_pcbnew_plugin = "pcbnew" in rel_lower or "action_plugin" in rel_lower
+
+    # 3. Dynamisches Größen-Limit:
+    # API- & Plugin-Dateien dürfen bis zu 150 KB groß sein (z.B. circuit.py mit 54 KB),
+    # reine Schaltungsbeispiele bleiben für hohe Relevanz auf 50 KB gedeckelt.
+    max_allowed_size = 150000 if (is_skidl_api_internal or is_pcbnew_plugin) else 50000
+    if len(raw_code) > max_allowed_size:
         return None, None
 
-    # 3. Syntax-Prüfung via AST
+    # 4. Syntax-Prüfung via AST
     try:
         tree = ast.parse(raw_code)
     except SyntaxError:
         return None, None
-
-    # 4. Differenzierung: Ist es SKiDL API Internals oder ein echtes Schaltungsbeispiel?
-    is_skidl_api_internal = any(p in rel_lower for p in ["/src/skidl/", "skidl/skidl/", "/skidl/src/"])
-    is_pcbnew_plugin = "pcbnew" in rel_lower or "action_plugin" in rel_lower
 
     has_skidl_instantiation = False
     for node in ast.walk(tree):
@@ -255,7 +258,7 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str) -> tup
             elif isinstance(node.func, ast.Attribute):
                 func_name = node.func.attr
             
-            if func_name in ["Part", "Net", "Bus", "generate_netlist", "generate_pcb", "subcircuit"]:
+            if func_name in ["Part", "Net", "Bus", "generate_netlist", "generate_pcb", "subcircuit", "Circuit"]:
                 has_skidl_instantiation = True
                 break
 
@@ -286,11 +289,11 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str) -> tup
 
     enrichment_prompt = f"""Analysiere diesen Python-Code für ein EDA/PCB-System:
 
-{raw_code[:4000]}
+{raw_code[:5000]}
 
 ERSTELLE FOLGENDE DREI ABSCHNITTE AUF DEUTSCH:
-1. Zweck: (Zusammenfassung der Funktion oder Schaltung)
-2. Hauptkomponenten / Schnittstellen: (Verwendete Klassen, Bauteile oder Signale)
+1. Zweck: (Zusammenfassung der Funktion, API-Klassen oder Schaltung)
+2. Hauptkomponenten / Schnittstellen: (Verwendete Klassen, Bauteile, Methoden oder Signale)
 3. 3 Anwendungsfragen: (Drei typische Fragen eines Hardware-Entwicklers)
 
 Verändere den Code NICHT."""
@@ -856,7 +859,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     with gr.Row(elem_classes=["row-stretch"]):
                         github_input = gr.Textbox(
                             label="Repository URL",
-                            placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
+                            placeholder="[https://gitlab.com/kicad/libraries/kicad-symbols.git](https://gitlab.com/kicad/libraries/kicad-symbols.git)",
                             scale=4
                         )
                         scan_repo_btn = gr.Button("🔍 Scannen", variant="secondary", scale=1, elem_classes=["full-height-btn"])
@@ -868,11 +871,11 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                 with gr.Tab("⭐ EDA & Rule Mining"):
                     mining_repo_input = gr.Dropdown(
                         choices=[
-                            ("SKiDL Haupt-Repository (Offiziell)", "https://github.com/xesscorp/skidl"),
-                            ("KiCad Python Action Plugins", "https://github.com/KiCad/kicad-python"),
-                            ("Freerouting Java / Config Core", "https://github.com/freerouting/freerouting")
+                            ("SKiDL Haupt-Repository (Offiziell)", "[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)"),
+                            ("KiCad Python Action Plugins", "[https://github.com/KiCad/kicad-python](https://github.com/KiCad/kicad-python)"),
+                            ("Freerouting Java / Config Core", "[https://github.com/freerouting/freerouting](https://github.com/freerouting/freerouting)")
                         ],
-                        value="https://github.com/xesscorp/skidl",
+                        value="[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)",
                         label="Ziel-Repository für EDA Mining",
                         allow_custom_value=True,
                         interactive=True
