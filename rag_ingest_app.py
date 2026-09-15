@@ -6,9 +6,11 @@ import zipfile
 import hashlib
 import json
 import ast
+import ssl
 import threading
 import subprocess
-import requests
+import urllib.request
+import urllib.parse
 import gradio as gr
 import ollama
 from qdrant_client import QdrantClient
@@ -305,53 +307,46 @@ class IngestTaskManager:
 
             files_to_process = []
 
-            # GITHUB MINING MODUS (MIT REQUESTS LIBRARY & USER-AGENT)
+            # GITHUB MINING MODUS (REIN NATIVE URLLIB REQUESTS MIT SSL)
             if mode == "github_mining":
                 self.append_log(f"⛏️ Starte GitHub Code Mining für Query: '{github_query}' (Max: {github_max})")
                 headers = {
                     "Accept": "application/vnd.github.v3+json",
-                    "User-Agent": "RAG-Ingest-App/1.0"
+                    "User-Agent": "Mozilla/5.0 (RAG-Ingest-App)"
                 }
                 if github_token and github_token.strip():
                     headers["Authorization"] = f"token {github_token.strip()}"
 
-                search_url = "[https://api.github.com/search/code](https://api.github.com/search/code)"
-                params = {
-                    "q": github_query,
-                    "per_page": min(github_max, 50)
-                }
+                params = urllib.parse.urlencode({"q": github_query, "per_page": min(github_max, 50)})
+                search_url = f"[https://api.github.com/search/code](https://api.github.com/search/code)?{params}"
+                ssl_ctx = ssl.create_default_context()
 
                 try:
-                    res = requests.get(search_url, headers=headers, params=params, timeout=15)
-                    if res.status_code != 200:
-                        err_msg = res.json().get("message", res.text[:200])
-                        self.append_log(f"❌ GitHub API Fehler ({res.status_code}): {err_msg}")
-                        self.set_status(f"🔴 Status: GITHUB API FEHLER ({res.status_code})")
-                        return
+                    req = urllib.request.Request(search_url, headers=headers)
+                    with urllib.request.urlopen(req, context=ssl_ctx, timeout=15) as response:
+                        res_data = json.loads(response.read().decode('utf-8'))
+                        items = res_data.get("items", [])
+                        self.append_log(f"   ↳ {len(items)} Treffer auf GitHub gefunden. Lade Quellcode herunter...")
 
-                    res_data = res.json()
-                    items = res_data.get("items", [])
-                    self.append_log(f"   ↳ {len(items)} Treffer auf GitHub gefunden. Lade Quellcode herunter...")
+                        for item in items:
+                            raw_url = item.get("html_url", "").replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+                            path_name = item.get("path", "script.py")
+                            repo_name = item.get("repository", {}).get("full_name", "unknown/repo")
 
-                    for item in items:
-                        raw_url = item.get("html_url", "").replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-                        path_name = item.get("path", "script.py")
-                        repo_name = item.get("repository", {}).get("full_name", "unknown/repo")
-
-                        if raw_url:
-                            try:
-                                raw_resp = requests.get(raw_url, headers=headers, timeout=15)
-                                if raw_resp.status_code == 200:
-                                    code_content = raw_resp.text
-                                    local_fpath = os.path.join(temp_work_dir, f"{uuid.uuid4()[:6]}_{os.path.basename(path_name)}")
-                                    with open(local_fpath, "w", encoding="utf-8") as f:
-                                        f.write(code_content)
-                                    files_to_process.append((f"{repo_name}/{path_name}", local_fpath))
-                            except Exception as dl_err:
-                                self.append_log(f"   ⚠️ Fehler beim Download von {path_name}: {dl_err}")
+                            if raw_url:
+                                try:
+                                    raw_req = urllib.request.Request(raw_url, headers=headers)
+                                    with urllib.request.urlopen(raw_req, context=ssl_ctx, timeout=15) as raw_resp:
+                                        code_content = raw_resp.read().decode("utf-8", errors="ignore")
+                                        local_fpath = os.path.join(temp_work_dir, f"{uuid.uuid4()[:6]}_{os.path.basename(path_name)}")
+                                        with open(local_fpath, "w", encoding="utf-8") as f:
+                                            f.write(code_content)
+                                        files_to_process.append((f"{repo_name}/{path_name}", local_fpath))
+                                except Exception as dl_err:
+                                    self.append_log(f"   ⚠️ Fehler beim Download von {path_name}: {dl_err}")
                 except Exception as api_err:
-                    self.append_log(f"❌ GitHub Verbindung Fehler: {api_err}")
-                    self.set_status("🔴 Status: GITHUB VERBINDUNGSFEHLER")
+                    self.append_log(f"❌ GitHub API Fehler: {api_err} (Ggf. Token angeben!)")
+                    self.set_status("🔴 Status: GITHUB API FEHLER")
                     return
 
             # STANDARD DATEI & GIT CRAWLER MODUS
