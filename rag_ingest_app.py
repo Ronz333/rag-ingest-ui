@@ -23,13 +23,14 @@ CONFIG_FILE = "/tmp/rag_ingest_config.json"
 DEFAULT_NUM_CTX = 8192
 TB = "```"
 
-IGNORED_FILENAMES = {"setup.py", "conftest.py", "__init__.py"}
-IGNORED_PATH_PARTS = ["/docs/", "/tests/", "/build/", "/dist/", "/examples/"]
+# Dateien & Pfade, die für Schaltungssynthese/Rules reines Rauschen sind
+IGNORED_FILENAMES = {"setup.py", "conftest.py", "__init__.py", "pyproject.toml", "pom.xml"}
+IGNORED_PATH_PARTS = ["/docs/", "/tests/", "/build/", "/dist/", "/.github/", "/site-packages/"]
 
 TEXT_EXTENSIONS = {
-    ".kicad_sym", ".kicad_mod", ".kicad_pcb", ".kicad_sch", ".kicad_prj", ".kicad_dru",
-    ".sch", ".net", ".cir", ".lib", ".mod", ".sym", ".spice", ".sub", ".mcb", ".dxf",
-    ".py", ".md", ".txt", ".json", ".yaml", ".yml", ".c", ".h", ".cpp", ".hpp",
+    ".kicad_sym", ".kicad_mod", ".kicad_pcb", ".kicad_sch", ".kicad_prj", ".kicad_dru", ".kicad_pro",
+    ".sch", ".net", ".cir", ".lib", ".mod", ".sym", ".spice", ".sub", ".mcb", ".dxf", ".dsn", ".ses", ".rules",
+    ".py", ".md", ".txt", ".json", ".yaml", ".yml", ".c", ".h", ".cpp", ".hpp", ".java",
     ".js", ".ts", ".html", ".css", ".rst", ".csv", ".ini", ".conf", ".sh",
     ".pdf"
 }
@@ -37,15 +38,19 @@ TEXT_EXTENSIONS = {
 CATEGORIES = {
     "⚡ PCB & Hardware Design": {
         "collection": "pcb_knowledge_base",
-        "system_prompt": """Du bist ein Ingestion-Agent für ein EDA/PCB-RAG-System.
-Analysiere den Inhalt (z.B. Python/SKiDL-Code, SPICE-Netzlisten, Doku) und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+        "system_prompt": """Du bist ein Spezial-Ingestion-Agent für ein EDA/PCB RAG-System.
+Deine Aufgabe ist es, Quellcode, KiCad-Dateien, DRC/ERC-Regeln und SKiDL-Skripte präzise zu analysieren und für KI-gestützte Hardware-Entwicklung aufzubereiten.
 
 STRIKTE REGELN:
-1. ERSTE ZEILE: Zwingend ein exaktes Kategorie-Schlagwort in eckigen Klammern, z.B.:
-   [TAG: SKIDL_API], [TAG: SKIDL_GOLDEN_EXAMPLE], [TAG: KICAD_PCBNEW] oder [TAG: SPICE_SIM].
-2. ABSOLUTES HALLUZINATIONSVERBOT: Verarbeite den DATEINAMEN und den INHALT strikt faktengetreu.
-3. CODE-INTEGRITÄT: Bette bereitgestellten Quellcode 1:1 im Markdown-Codeblock ein.
-4. Zusammenfassung: Fasse Zweck, Parameter und Schnittstellen sachlich zusammen."""
+1. ERSTE ZEILE: Verwende ZWINGEND eines der folgenden Kategorie-Tags in eckigen Klammern:
+   - [TAG: SKIDL_GOLDEN_EXAMPLE] (Lauffähiger SKiDL-Schaltplan/Subcircuit)
+   - [TAG: SKIDL_API] (SKIDL Bibliotheks-Internals & SDK API)
+   - [TAG: KICAD_PCBNEW_API] (KiCad Python pcbnew Layout-Steuerung)
+   - [TAG: KICAD_DRC_RULES] (KiCad DRC Custom Rules & ERC Prüfvorschriften)
+   - [TAG: FREEROUTING_RULES] (FreeRouting DSN / Autorouter Konfiguration)
+   - [TAG: KICAD_FOOTPRINT] / [TAG: KICAD_SYM] (Symbol & Footprint Bibs)
+2. FAKTEN-TREUE: Ergänze nur strukturelle Erklärung und Anwendungsfragen. Verändere den Quellcode/Regel-Inhalt NICHT!
+3. CODE-INTEGRITÄT: Bette Quellcode/Regeln exakt in Markdown-Codeblöcken ein."""
     },
     "💻 Programmiersprachen & Software": {
         "collection": "programming_knowledge_base",
@@ -127,11 +132,14 @@ def get_indexed_hashes_set(collection_name: str) -> set:
         print(f"Fehler beim Batch-Laden der Qdrant-Hashes: {e}")
     return indexed_set
 
-# --- PARSER-FUNKTIONEN ---
+# --- DOMÄNENSPEZIFISCHE PARSER ---
+
 def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
+    """Schnell-Parsing ohne LLM-Overhead für hochstrukturierte KiCad S-Expression Dateiformate."""
     ext = os.path.splitext(rel_path)[1].lower()
     filename = os.path.basename(rel_path)
 
+    # 1. KiCad Footprints (.kicad_mod)
     if ext == ".kicad_mod":
         category_tag = "KICAD_FOOTPRINT"
         fp_match = re.search(r'\(footprint\s+"?([^"\s)]+)"?', raw_text)
@@ -154,10 +162,11 @@ def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
 - **Anschlüsse / Pads:** {pad_info}
 
 ## Verwendung für PCB-Layout (`pcbnew`)
-Dieser Footprint wird in `pcbnew` über den Footprint-Bezeichner `{fp_name}` adressiert.
+Dieser Footprint wird in `pcbnew` und SKiDL über den Footprint-Bezeichner `{fp_name}` adressiert.
 """
         return category_tag, markdown_content
 
+    # 2. KiCad Schaltplan-Symbole (.kicad_sym)
     elif ext == ".kicad_sym":
         category_tag = "KICAD_SYM"
         sym_matches = re.findall(r'\(symbol\s+"([^"]+)"', raw_text)
@@ -184,66 +193,123 @@ Dieses Symbol steht für die Netzlistenerzeugung via SKiDL unter dem Bauteilname
 """
         return category_tag, markdown_content
 
+    # 3. KiCad Custom DRC Rules (.kicad_dru)
+    elif ext == ".kicad_dru":
+        category_tag = "KICAD_DRC_RULES"
+        rules_found = re.findall(r'\(rule\s+"([^"]+)"', raw_text)
+        rule_names = ", ".join(rules_found) if rules_found else "Standard-DRC Regelset"
+
+        markdown_content = f"""[TAG: KICAD_DRC_RULES]
+
+# KiCad Custom DRC Rules Definition: {filename}
+
+- **Dateipfad:** `{rel_path}`
+- **Enthaltene Regeln:** `{rule_names}`
+
+## Regel-Syntax & Einschränkungen (KiCad DRC)
+```lisp
+{raw_text[:8000]}
+```
+"""
+        return category_tag, markdown_content
+
     else:
         category_tag = "KICAD_EDA"
         markdown_content = f"[TAG: KICAD_EDA]\n\n# KiCad Datei: {filename}\n- **Dateipfad:** `{rel_path}`"
         return category_tag, markdown_content
 
-def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str) -> tuple[str, str] | tuple[None, None]:
+def smart_eda_parser(rel_path: str, raw_text: str, active_model: str) -> tuple[str, str] | tuple[None, None]:
+    """Intelligenter Hybrid-Parser für SKiDL, KiCad Python (pcbnew), Custom DRC und FreeRouting Code."""
     filename = os.path.basename(rel_path)
     rel_lower = rel_path.lower()
+    ext = os.path.splitext(rel_path)[1].lower()
 
-    # 1. Dateinamen & Pfad-Filter (Build-/Doku-Skripte verwerfen)
+    # 1. Aussortieren von Rauschen (Build-Skripte, Doku, Setup-Dateien)
     if filename in IGNORED_FILENAMES or any(p in rel_lower for p in IGNORED_PATH_PARTS):
         return None, None
 
-    # 2. Größen-Limit: Dateien über 50 KB (~1000 Zeilen) sind keine überschaubaren "Golden Examples"
-    if len(raw_code) > 50000:
+    # Code-Dateien über 60 KB überspringen (oft autogenerierte riesige C++ oder Layout-Dumps)
+    if len(raw_text) > 60000:
         return None, None
 
-    # 3. Syntax-Prüfung via AST
-    try:
-        tree = ast.parse(raw_code)
-    except SyntaxError:
-        return None, None
+    # --- DOMÄNEN-IDENTIFIKATION ---
+    category_tag = None
+    enrichment_instructions = ""
 
-    # 4. AST-Check: Prüft auf explizite SKiDL Komponentenerzeugung (Part, Net, Bus, generate_netlist)
-    has_skidl_instantiation = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func_name = ""
-            if isinstance(node.func, ast.Name):
-                func_name = node.func.id
-            elif isinstance(node.func, ast.Attribute):
-                func_name = node.func.attr
+    # FALL A: KiCad Custom DRC Rules / Python DRC Scripts
+    if ext == ".kicad_dru" or "drc" in rel_lower or "erc" in rel_lower or "check_rule" in raw_text.lower():
+        category_tag = "KICAD_DRC_RULES"
+        enrichment_instructions = """Analysiere diese DRC/ERC Layout-Regeln oder Prüfskript:
+1. Regelzweck: (Welche Abstände, Layer, Vias oder PCB-Fertigungsgrenzen werden geprüft?)
+2. Parameter & Constraints: (Konkrete Werte wie min_clearance, hole_size, track_width etc.)
+3. 3 Entwicklerfragen: (Drei Fragen zu PCB-Designregeln, die dieser Code beantwortet)"""
 
-            if func_name in ["Part", "Net", "Bus", "generate_netlist", "generate_pcb"]:
-                has_skidl_instantiation = True
-                break
+    # FALL B: FreeRouting Rules / DSN Autorouter Config
+    elif ext in {".dsn", ".rules"} or "freerouting" in rel_lower:
+        category_tag = "FREEROUTING_RULES"
+        enrichment_instructions = """Analysiere diese FreeRouting Autorouter Regelkonfiguration:
+1. Zweck: (Welche Netzklassen, Clearance-Matrizen oder Routing-Passes werden definiert?)
+2. Routing-Parameter: (Spurbreiten, Via-Typen, Layer-Richtungen)
+3. 3 Entwicklerfragen: (Drei typische Fragen zur automatischen Entflechtung)"""
 
-    if not has_skidl_instantiation:
-        return None, None
+    # FALL C: Python-Code Differenzierung (SKiDL vs. KiCad pcbnew)
+    elif ext == ".py":
+        try:
+            tree = ast.parse(raw_text)
+        except SyntaxError:
+            return None, None  # Fehlerhaften Code sofort verwerfen
 
-    docstring = ast.get_docstring(tree) or "Kein Modul-Docstring vorhanden"
-    imports = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                imports.append(alias.name)
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imports.append(node.module)
+        code_lower = raw_text.lower()
+        
+        # C1: SKiDL Code Unterscheidung (API / Internals VS. Golden Example Schaltung)
+        if "skidl" in code_lower:
+            # Prüfe, ob es sich um den SKiDL-Bibliotheks-Quellcode selbst handelt (z.B. src/skidl/...)
+            is_internal_api = any(p in rel_lower for p in ["/src/", "skidl/skidl/", "package"])
+            
+            # Prüfe via AST, ob echte Bauteile/Netze erzeugt werden
+            has_circuit_elements = False
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    func_name = ""
+                    if isinstance(node.func, ast.Name):
+                        func_name = node.func.id
+                    elif isinstance(node.func, ast.Attribute):
+                        func_name = node.func.attr
+                    if func_name in ["Part", "Net", "Bus", "generate_netlist", "generate_pcb"]:
+                        has_circuit_elements = True
+                        break
 
-    enrichment_prompt = f"""Analysiere diesen funktionierenden EDA/SKiDL Python-Code:
+            if is_internal_api or not has_circuit_elements:
+                category_tag = "SKIDL_API"
+                enrichment_instructions = """Analysiere dieses SKiDL SDK/API Modul:
+1. Zweck & Klasse: (Welche SKiDL-Kernklasse oder Hilfsfunktion wird bereitgestellt?)
+2. Methoden & Parameter: (Wichtigste Schnittstellen für Entwickler)
+3. 3 Entwicklerfragen: (Fragen zur Erweiterung oder Verwendung der SKiDL API)"""
+            else:
+                category_tag = "SKIDL_GOLDEN_EXAMPLE"
+                enrichment_instructions = """Analysiere diesen funktionsfähigen SKiDL Schaltungs-Code:
+1. Schaltungszweck: (Was baut diese Schaltung z.B. ESP32 Power-Management, USB ESD Schutz?)
+2. Bauteile & Verschaltung: (Verwendete ICs, Transistoren, Widerstände und Busse)
+3. 3 Entwicklerfragen: (Drei konkrete Hardware-Design-Fragen, die dieser Code als Vorlage löst)"""
 
-{raw_code[:4000]}
+        # C2: KiCad PCBNEW Automation / Action Plugin Python Code
+        elif "pcbnew" in code_lower or "board" in code_lower:
+            category_tag = "KICAD_PCBNEW_API"
+            enrichment_instructions = """Analysiere dieses KiCad pcbnew Python-Layout-Skript:
+1. Zweck: (Welche Layout-Automatisierung wird durchgeführt, z.B. Bounding-Box, Via-Stitching, Panelisierung?)
+2. Verwendete pcbnew API Methoden: (z.B. GetBoard(), TRACK(), Add(), FOOTPRINT)
+3. 3 Entwicklerfragen: (Fragen zur Python-Skriptierung in KiCad pcbnew)"""
 
-ERSTELLE FOLGENDE DREI ABSCHNITTE AUF DEUTSCH:
-1. Zweck: (Kurze Zusammenfassung, was die Schaltung/Skript baut)
-2. Hauptkomponenten: (Verwendete Bauteile/Chips)
-3. 3 Anwendungsfragen: (Drei typische Entwickler-Fragen, die dieser Code beantwortet)
+    if not category_tag:
+        return None, None  # Datei passt in keine relevante EDA-Kategorie
 
-Verändere den Code NICHT."""
+    # --- LLM ANREICHERUNG (GENERIERUNG VON METADATEN & QA-PAAREN) ---
+    enrichment_prompt = f"""{enrichment_instructions}
+
+QUELLCODE / REGELN:
+{raw_text[:4500]}
+
+VERÄNDERE DEN CODE NICHT. ANTWORTE AUF DEUTSCH IM MARKDOWN-FORMAT."""
 
     try:
         response = ollama_client.chat(
@@ -253,29 +319,27 @@ Verändere den Code NICHT."""
         )
         enrichment_text = response['message']['content']
     except Exception:
-        enrichment_text = f"**Zweck:** SKiDL Python Modul ({rel_path})\n**Docstring:** {docstring}"
+        enrichment_text = f"**Zweck:** EDA Modul ({rel_path})\n**Kategorie:** {category_tag}"
 
-    category_tag = "SKIDL_GOLDEN_EXAMPLE"
-    code_snippet = raw_code[:10000] + ("\n# ... [Code gekürzt wegen Dateigröße]" if len(raw_code) > 10000 else "")
+    code_snippet = raw_text[:10000] + ("\n# ... [Inhalt gekürzt wegen Dateigröße]" if len(raw_text) > 10000 else "")
 
-    markdown_content = f"""[TAG: SKIDL_GOLDEN_EXAMPLE]
+    markdown_content = f"""[TAG: {category_tag}]
 
-# Golden Example: {os.path.basename(rel_path)}
+# {category_tag}: {os.path.basename(rel_path)}
 
-- **Quelle/Dateipfad:** `{rel_path}`
-- **Erkannte Importe:** `{', '.join(set(imports))}`
+- **Dateipfad / Quelle:** `{rel_path}`
 
-## Schaltungsanalyse & Dokumentation
+## Analyse & Entwickler-Dokumentation
 {enrichment_text}
 
-## Validierter Original-Code (Python / SKiDL)
-{TB}python
+## Original Quellcode / Regel-Spezifikation
+{TB}{ext.replace('.', '')}
 {code_snippet}
 {TB}
 """
     return category_tag, markdown_content
 
-# --- TASK MANAGER ---
+# --- THREAD-SICHERER TASK MANAGER ---
 class IngestTaskManager:
     def __init__(self):
         self.lock = threading.Lock()
@@ -312,14 +376,14 @@ class IngestTaskManager:
         with self.lock:
             if self.is_running:
                 return "### ⚠️ Status: JOB LÄUFT BEREITS"
-
+            
             self.is_running = True
             self.cancel_event.clear()
             self.log_messages = []
             self.processed_files = 0
             self.total_files = 0
             self.status_header = "🟢 Status: WIRD GESTARTET..."
-
+            
             save_config({"last_model": selected_model, "last_category": category_key})
 
             self.current_thread = threading.Thread(
@@ -354,7 +418,7 @@ class IngestTaskManager:
 
                 self.append_log(f"⛏️ Starte Git-Mining via `git clone`: {clean_repo_url}")
                 mined_repo_dir = os.path.join(temp_work_dir, "mined_repo")
-
+                
                 res = subprocess.run(
                     ["git", "clone", "--depth", "1", clean_repo_url, mined_repo_dir],
                     capture_output=True, text=True
@@ -365,12 +429,13 @@ class IngestTaskManager:
                     self.set_status("🔴 Status: GIT CLONE FEHLER")
                     return
 
-                self.append_log("   ↳ Repository erfolgreich geklont. Scanne alle Python-Dateien...")
+                self.append_log("   ↳ Repository erfolgreich geklont. Scanne Dateien...")
                 for root, _, filenames in os.walk(mined_repo_dir):
                     if ".git" in root:
                         continue
                     for f in filenames:
-                        if f.endswith(".py"):
+                        ext = os.path.splitext(f)[1].lower()
+                        if ext in TEXT_EXTENSIONS:
                             full_p = os.path.join(root, f)
                             rel_p = os.path.relpath(full_p, mined_repo_dir)
                             repo_base_name = os.path.basename(clean_repo_url.rstrip("/"))
@@ -443,17 +508,20 @@ class IngestTaskManager:
                 ext = os.path.splitext(rel_path)[1].lower()
 
                 try:
-                    if mode == "repo_mining" or ext == ".py":
-                        self.append_log(f"[{idx}/{self.total_files}] Hybrid AST-LLM Parse: {rel_path}")
-                        category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model)
-                        if not processed_md:
-                            self.append_log(f"   ⚠️ AST/Filter übersprungen (kein SKiDL-Code oder Build/Doku): {rel_path}")
-                            continue
-
-                    elif ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch"}:
-                        self.append_log(f"[{idx}/{self.total_files}] Fast-Pass Parsing (ohne LLM): {rel_path}")
+                    # ROUTE A: KiCad Strukturdaten (Symbole, Footprints, Custom DRC)
+                    if ext in {".kicad_mod", ".kicad_sym", ".kicad_dru"}:
+                        self.append_log(f"[{idx}/{self.total_files}] Fast-Pass S-Expr Parse: {rel_path}")
                         category_tag, processed_md = fast_parse_kicad(rel_path, raw_text)
 
+                    # ROUTE B: Smart EDA Parser (SKiDL, pcbnew, DRC Prüfskripte, FreeRouting)
+                    elif mode == "repo_mining" or ext in {".py", ".dsn", ".rules"}:
+                        self.append_log(f"[{idx}/{self.total_files}] Smart EDA Hybrid Parse: {rel_path}")
+                        category_tag, processed_md = smart_eda_parser(rel_path, raw_text, active_model)
+                        if not processed_md:
+                            self.append_log(f"   ⚠️ Nicht-relevante oder Build-Datei übersprungen: {rel_path}")
+                            continue
+
+                    # ROUTE C: Allgemeines LLM-Parsing
                     else:
                         self.append_log(f"[{idx}/{self.total_files}] Verarbeite via LLM ({active_model}): {rel_path}")
                         full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}"
@@ -472,18 +540,18 @@ class IngestTaskManager:
                     if self.cancel_event.is_set():
                         return
 
-                    # Abgesicherter Embedding-Aufruf mit Fallback bei Überlänge
+                    # Abgesicherter Embedding-Aufruf mit Fallback bei Überlänge (Token-Limit Guardrail)
                     embed_prompt = processed_md[:7500]
                     try:
                         embed_res = ollama_client.embeddings(
-                            model=EMBED_MODEL,
+                            model=EMBED_MODEL, 
                             prompt=embed_prompt,
                             options={"num_ctx": DEFAULT_NUM_CTX}
                         )
                     except Exception as embed_err:
                         self.append_log(f"   ⚠️ Token-Limit erreicht ({embed_err}). Kürze Embedding-Input für {rel_path}...")
                         embed_res = ollama_client.embeddings(
-                            model=EMBED_MODEL,
+                            model=EMBED_MODEL, 
                             prompt=processed_md[:3000],
                             options={"num_ctx": DEFAULT_NUM_CTX}
                         )
@@ -510,7 +578,7 @@ class IngestTaskManager:
                             )
                         ]
                     )
-
+                    
                     self.append_log(f"   ✅ Indiziert in '{target_collection}' | **Tag: #{category_tag}**\n")
 
                 except Exception as e:
@@ -544,8 +612,8 @@ def get_ollama_models():
 
         for m in models_data:
             m_name = (
-                (m.get('model') or m.get('name'))
-                if isinstance(m, dict)
+                (m.get('model') or m.get('name')) 
+                if isinstance(m, dict) 
                 else (getattr(m, 'model', None) or getattr(m, 'name', None))
             )
             if m_name and m_name != EMBED_MODEL:
@@ -554,13 +622,13 @@ def get_ollama_models():
                 is_cloud = any(term in m_name.lower() for term in ["cloud", "gpt", "claude", "gemini", "remote", "openai", "deepseek-v3"])
                 label = f"{m_name} ({'☁️ Cloud' if is_cloud else '💻 Lokal'})"
                 choices.append((label, m_name))
-
+        
         if choices:
             selected_default = saved_model if found_saved else choices[0][1]
             return choices, selected_default
     except Exception as e:
         print(f"Fehler beim Abrufen der Ollama-Modelle: {e}")
-
+    
     return [(f"{DEFAULT_MODEL} (💻 Lokal)", DEFAULT_MODEL)], DEFAULT_MODEL
 
 def ensure_qdrant_collection(collection_name: str, vector_size: int):
@@ -674,7 +742,7 @@ def scan_github_repository(github_url, old_scanned_repo):
             if ext in TEXT_EXTENSIONS:
                 has_valid = True
                 ext_counts[ext] = ext_counts.get(ext, 0) + 1
-
+        
         if has_valid:
             rel = os.path.relpath(root, repo_dir)
             if rel == ".":
@@ -697,7 +765,7 @@ def scan_github_repository(github_url, old_scanned_repo):
         folder_choices.append((label, d))
 
     ext_choices = [
-        (f"{ext} ({count} Dateie{'n' if count > 1 else ''})", ext)
+        (f"{ext} ({count} Dateie{'n' if count > 1 else ''})", ext) 
         for ext, count in sorted(ext_counts.items(), key=lambda x: x[0])
     ]
 
@@ -741,7 +809,7 @@ footer { visibility: hidden; }
 autoscroll_js = """
 function() {
     window.ragUserScrolledUp = false;
-
+    
     const checkAndScroll = () => {
         const textarea = document.querySelector('#log-textbox textarea');
         if (!textarea) return;
@@ -798,7 +866,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
             with gr.Tabs():
                 with gr.Tab("📁 Dateiupload / ZIP"):
                     file_input = gr.File(
-                        label="Dateien oder ZIP-Archiv hochladen",
+                        label="Dateien oder ZIP-Archiv hochladen", 
                         file_count="multiple"
                     )
 
@@ -806,7 +874,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     with gr.Row(elem_classes=["row-stretch"]):
                         github_input = gr.Textbox(
                             label="Repository URL",
-                            placeholder="[https://gitlab.com/kicad/libraries/kicad-symbols.git](https://gitlab.com/kicad/libraries/kicad-symbols.git)",
+                            placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
                             scale=4
                         )
                         scan_repo_btn = gr.Button("🔍 Scannen", variant="secondary", scale=1, elem_classes=["full-height-btn"])
@@ -815,25 +883,27 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                         folder_checkboxes = gr.CheckboxGroup(label="Ordnerstruktur", choices=[], visible=False, interactive=True, scale=1)
                         ext_checkboxes = gr.CheckboxGroup(label="Dateiformate Filter", choices=[], visible=False, interactive=True, scale=1)
 
-                with gr.Tab("⭐ Golden Examples Mining"):
+                with gr.Tab("⭐ EDA & Hardware Mining"):
                     mining_repo_input = gr.Dropdown(
                         choices=[
-                            ("SKiDL Haupt-Repository (Offiziell)", "[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)"),
-                            ("KiCad Python Action Plugins", "[https://github.com/KiCad/kicad-python](https://github.com/KiCad/kicad-python)"),
-                            ("Freerouting Java / Config Core", "[https://github.com/freerouting/freerouting](https://github.com/freerouting/freerouting)")
+                            ("SKiDL Haupt-Repository (Offiziell & Examples)", "https://github.com/xesscorp/skidl"),
+                            ("KiCad Python Action Plugins & Scripts", "https://github.com/KiCad/kicad-python"),
+                            ("KiCad Custom DRC Rules Examples", "https://github.com/KiCad/kicad-custom-rules"),
+                            ("KiCad CLI & ERC/DRC Automation Tools", "https://github.com/maia-hdl/kicad-cli-tools"),
+                            ("Freerouting Java Core & Rules", "https://github.com/freerouting/freerouting")
                         ],
-                        value="[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)",
-                        label="Ziel-Repository für Golden Examples Mining",
+                        value="https://github.com/xesscorp/skidl",
+                        label="Ziel-Repository für Mining (SKiDL, KiCad, DRC/ERC, FreeRouting)",
                         allow_custom_value=True,
                         interactive=True
                     )
-                    start_mining_btn = gr.Button("⛏️ Git-Mining & Hybrid Ingestion Starten", variant="primary")
+                    start_mining_btn = gr.Button("⛏️ EDA Git-Mining & Hybrid Ingestion Starten", variant="primary")
 
         with gr.Column(scale=1):
             status_output = gr.Textbox(
-                label="Server Live-Protokoll",
-                interactive=False,
-                lines=24,
+                label="Server Live-Protokoll", 
+                interactive=False, 
+                lines=24, 
                 autoscroll=False,
                 elem_id="log-textbox"
             )
@@ -880,8 +950,21 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
 
 if __name__ == "__main__":
     demo.launch(
-        server_name="0.0.0.0",
+        server_name="0.0.0.0", 
         server_port=7861,
         css=custom_css,
         js=autoscroll_js
     )
+```eoc
+
+### Key Improvements in this Release:
+
+1. **Intelligent Multi-Domain Classification (`smart_eda_parser`)**:
+   - **`[TAG: SKIDL_GOLDEN_EXAMPLE]`**: Assigned only to scripts that actively instantiate circuit elements (`Part`, `Net`, `Bus`).
+   - **`[TAG: SKIDL_API]`**: Automatically routes internal library core files (e.g., `src/skidl/interface.py`) here, asking the LLM for developer SDK documentation instead of treating it as a circuit.
+   - **`[TAG: KICAD_PCBNEW_API]`**: Handles KiCad Python layout automation and Action Plugins (`pcbnew.GetBoard()`).
+   - **`[TAG: KICAD_DRC_RULES]`**: Parses KiCad custom DRC rule files (`.kicad_dru`) and Python DRC verification scripts.
+   - **`[TAG: FREEROUTING_RULES]`**: Handles FreeRouting `.dsn` files and routing rule definitions.
+
+2. **Expanded Repository Mining Presets**:
+   - Added standard presets for SKiDL, KiCad Python Action Plugins, KiCad Custom DRC Rules, KiCad CLI tools, and FreeRouting Core.
