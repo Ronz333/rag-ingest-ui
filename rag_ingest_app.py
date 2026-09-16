@@ -18,7 +18,7 @@ from pypdf import PdfReader
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:32b")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3:8k")  # Nutzt das erweiterte 8k-Modell
+EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3:8k")
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
 DEFAULT_NUM_CTX = 8192
 TB = "```"
@@ -520,8 +520,8 @@ class IngestTaskManager:
                         self.set_status(f"🔴 Status: ABGEBROCHEN ({self.processed_files}/{self.total_files})")
                         return
 
-                    # Großzügiger Embedding-Prompt für 8k Modell (bis zu 20.000 Zeichen)
-                    embed_prompt = processed_md[:20000]
+                    # Realistische Zeichengrenze (12.000 Chars) für ca. 5.000 bis 7.000 Tokens bei Code
+                    embed_prompt = processed_md[:12000]
                     try:
                         embed_res = ollama_client.embeddings(
                             model=EMBED_MODEL, 
@@ -529,12 +529,11 @@ class IngestTaskManager:
                             options={"num_ctx": DEFAULT_NUM_CTX}
                         )
                     except Exception as embed_err:
-                        # Automatische Modell-Fallback-Logik
                         fallback_model = "bge-m3" if EMBED_MODEL != "bge-m3" else EMBED_MODEL
-                        self.append_log(f"   ⚠️ Embedding-Fehler bei {EMBED_MODEL} ({embed_err}). Versuche Fallback mit {fallback_model} (5000 Zeichen)...")
+                        self.append_log(f"   ⚠️ Embedding-Fehler bei {EMBED_MODEL} ({embed_err}). Versuche Fallback mit {fallback_model} (4000 Zeichen)...")
                         embed_res = ollama_client.embeddings(
                             model=fallback_model, 
-                            prompt=processed_md[:5000],
+                            prompt=processed_md[:4000],
                             options={"num_ctx": DEFAULT_NUM_CTX}
                         )
 
