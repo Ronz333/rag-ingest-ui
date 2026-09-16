@@ -22,7 +22,6 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:32b")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "hf.co/Qwen/Qwen3-Embedding-8B-GGUF:Q5_K_M")
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
-DEFAULT_NUM_CTX = 8192
 TB = "```"
 
 IGNORED_FILENAMES = {"setup.py", "conftest.py", "__init__.py"}
@@ -176,7 +175,7 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
     return collected
 
 # --- SPEZIALPARSER FÜR KICAD, DRC & RULES ---
-def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
+def fast_parse_kicad(rel_path: str, raw_text: str, max_code_len: int) -> tuple[str, str]:
     ext = os.path.splitext(rel_path)[1].lower()
     filename = os.path.basename(rel_path)
 
@@ -193,7 +192,7 @@ def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
 
 ## Regel-Definition (Custom Design Rules)
 {TB}lisp
-{raw_text[:8000]}
+{raw_text[:max_code_len]}
 {TB}
 """
         return category_tag, markdown_content
@@ -208,7 +207,7 @@ def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
 
 ## Routing-Konfiguration (Specctra Rules)
 {TB}lisp
-{raw_text[:8000]}
+{raw_text[:max_code_len]}
 {TB}
 """
         return category_tag, markdown_content
@@ -271,7 +270,7 @@ Dieses Symbol steht für die Netzlistenerzeugung via SKiDL unter dem Bauteilname
         return category_tag, markdown_content
 
 # --- FEINGLIEDRIGER AST & DOMAIN PARSER ---
-def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama_client) -> tuple[str, str] | tuple[None, None]:
+def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama_client, num_ctx: int, max_code_len: int) -> tuple[str, str] | tuple[None, None]:
     filename = os.path.basename(rel_path)
     rel_lower = rel_path.lower()
 
@@ -281,7 +280,7 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
     is_skidl_api_internal = any(p in rel_lower for p in ["/src/skidl/", "skidl/skidl/", "/skidl/src/"])
     is_pcbnew_plugin = "pcbnew" in rel_lower or "action_plugin" in rel_lower
 
-    max_allowed_size = 150000 if (is_skidl_api_internal or is_pcbnew_plugin) else 50000
+    max_allowed_size = 300000 if (is_skidl_api_internal or is_pcbnew_plugin) else 100000
     if len(raw_code) > max_allowed_size:
         return None, None
 
@@ -330,7 +329,7 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
 
     enrichment_prompt = f"""Analysiere diesen Python-Code für ein EDA/PCB-System:
 
-{raw_code[:6000]}
+{raw_code[:10000]}
 
 ERSTELLE FOLGENDE DREI ABSCHNITTE AUF DEUTSCH:
 1. Zweck: (Zusammenfassung der Funktion, API-Klassen oder Schaltung)
@@ -343,13 +342,13 @@ Verändere den Code NICHT."""
         response = ollama_client.chat(
             model=active_model,
             messages=[{'role': 'user', 'content': enrichment_prompt}],
-            options={"num_ctx": DEFAULT_NUM_CTX}
+            options={"num_ctx": num_ctx}
         )
         enrichment_text = response['message']['content']
     except Exception:
         enrichment_text = f"**Zweck:** Python Modul ({rel_path})\n**Docstring:** {docstring}"
 
-    code_snippet = raw_code[:12000] + ("\n# ... [Code gekürzt wegen Dateigröße]" if len(raw_code) > 12000 else "")
+    code_snippet = raw_code[:max_code_len] + ("\n# ... [Code gekürzt wegen Dateigröße]" if len(raw_code) > max_code_len else "")
 
     markdown_content = f"""[TAG: {category_tag}]
 
@@ -369,7 +368,7 @@ Verändere den Code NICHT."""
     return category_tag, markdown_content
 
 # --- PROZESS WORKER (AUFGERUFEN IM EIGENEN OS-PROZESS) ---
-def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url):
+def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars):
     temp_work_dir = None
     try:
         ollama_worker = ollama.Client(host=OLLAMA_HOST)
@@ -459,6 +458,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
         total_files = len(files_to_process)
         log_msg(log_list, f"📊 Gesamt: {total_files} Datei(en) bereit zur Indizierung.")
+        log_msg(log_list, f"⚙️ Konfiguration: Context={num_ctx} Tokens | Embedding Limit={max_embed_chars} Chars")
         existing_hashes = get_indexed_hashes_set(qdrant_worker, target_collection)
         log_msg(log_list, f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
 
@@ -479,36 +479,36 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             try:
                 if mode == "repo_mining" or ext == ".py":
                     log_msg(log_list, f"[{idx}/{total_files}] Hybrid AST-LLM Parse: {rel_path}")
-                    category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model, ollama_worker)
+                    category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model, ollama_worker, num_ctx, max_embed_chars)
                     if not processed_md:
                         log_msg(log_list, f"   ⚠️ AST/Filter übersprungen (Kein SKiDL/API Code oder Build/Doku): {rel_path}")
                         continue
 
                 elif ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".kicad_dru", ".rules"}:
                     log_msg(log_list, f"[{idx}/{total_files}] Fast-Pass Parsing (ohne LLM): {rel_path}")
-                    category_tag, processed_md = fast_parse_kicad(rel_path, raw_text)
+                    category_tag, processed_md = fast_parse_kicad(rel_path, raw_text, max_embed_chars)
 
                 else:
                     log_msg(log_list, f"[{idx}/{total_files}] Verarbeite via LLM ({active_model}): {rel_path}")
-                    full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}"
+                    full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:10000]}"
                     response = ollama_worker.chat(
                         model=active_model,
                         messages=[
                             {'role': 'system', 'content': system_prompt},
                             {'role': 'user', 'content': full_user_prompt}
                         ],
-                        options={"num_ctx": DEFAULT_NUM_CTX}
+                        options={"num_ctx": num_ctx}
                     )
                     processed_md = response['message']['content']
                     tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
                     category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
 
-                embed_prompt = processed_md[:7500]
+                embed_prompt = processed_md[:max_embed_chars]
                 try:
                     embed_res = ollama_worker.embeddings(
                         model=EMBED_MODEL, 
                         prompt=embed_prompt,
-                        options={"num_ctx": DEFAULT_NUM_CTX}
+                        options={"num_ctx": num_ctx}
                     )
                 except Exception as embed_err:
                     fallback_model = "bge-m3" if EMBED_MODEL != "bge-m3" else EMBED_MODEL
@@ -516,7 +516,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     embed_res = ollama_worker.embeddings(
                         model=fallback_model, 
                         prompt=processed_md[:4000],
-                        options={"num_ctx": DEFAULT_NUM_CTX}
+                        options={"num_ctx": num_ctx}
                     )
 
                 vector = embed_res['embedding']
@@ -601,7 +601,7 @@ class IngestProcessManager:
 
         return "\n".join(list(self.log_list)), f"### {self.status_dict['header']}"
 
-    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url=""):
+    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url="", num_ctx=32768, max_embed_chars=50000):
         if self.is_alive():
             log_msg(self.log_list, "⚠️ Ein Ingestion-Job läuft derzeit noch. Bitte erst abbrechen...")
             return f"### {self.status_dict['header']}"
@@ -610,14 +610,19 @@ class IngestProcessManager:
         self.status_dict["header"] = "🟢 Status: WIRD GESTARTET..."
         self.status_dict["running"] = True
         
-        save_config({"last_model": selected_model, "last_category": category_key})
+        save_config({
+            "last_model": selected_model, 
+            "last_category": category_key,
+            "last_num_ctx": num_ctx,
+            "last_max_embed_chars": max_embed_chars
+        })
 
         self.process = multiprocessing.Process(
             target=worker_process_entry,
             args=(
                 self.log_list, self.status_dict, files, scanned_repo_path, 
                 selected_folders, selected_exts, category_key, selected_model, 
-                mode, mining_repo_url
+                mode, mining_repo_url, num_ctx, max_embed_chars
             ),
             daemon=True
         )
@@ -820,6 +825,8 @@ function() {
 initial_model_choices, initial_default_model = get_ollama_models()
 saved_cfg = load_config()
 initial_default_category = saved_cfg.get("last_category", list(CATEGORIES.keys())[0])
+initial_num_ctx = saved_cfg.get("last_num_ctx", 32768)
+initial_max_embed_chars = saved_cfg.get("last_max_embed_chars", 50000)
 
 with gr.Blocks(title="Universal RAG Control Center") as demo:
     repo_state = gr.State("")
@@ -847,6 +854,24 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                 label="Knowledge Collection",
                 interactive=True
             )
+
+            with gr.Accordion("⚙️ Kontext- & Performance-Einstellungen", open=True):
+                num_ctx_slider = gr.Slider(
+                    minimum=4096, 
+                    maximum=32768, 
+                    step=2048, 
+                    value=initial_num_ctx, 
+                    label="Ollama Kontextfenster (num_ctx Tokens)",
+                    info="Erhöht die max. Verarbeitungsmenge für LLM & Embedding (32.768 max für Qwen3)."
+                )
+                embed_chars_slider = gr.Slider(
+                    minimum=4000, 
+                    maximum=80000, 
+                    step=2000, 
+                    value=initial_max_embed_chars, 
+                    label="Max. Embedding Input Zeichen (Chars)",
+                    info="Regelt den Schnitt-Punkt vor der Einreichung beim Vektormodell."
+                )
 
             with gr.Tabs():
                 with gr.Tab("📁 Dateiupload / ZIP"):
@@ -914,18 +939,18 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     folder_checkboxes.change(fn=handle_folder_selection, inputs=[folder_checkboxes], outputs=[folder_checkboxes])
 
     start_btn.click(
-        fn=lambda files, repo, f_cb, e_cb, cat, mod: task_manager.start_background_job(
-            files, repo, f_cb, e_cb, cat, mod, mode="standard"
+        fn=lambda files, repo, f_cb, e_cb, cat, mod, ctx, chars: task_manager.start_background_job(
+            files, repo, f_cb, e_cb, cat, mod, mode="standard", num_ctx=ctx, max_embed_chars=chars
         ),
-        inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown],
+        inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown, num_ctx_slider, embed_chars_slider],
         outputs=[status_banner]
     )
 
     start_mining_btn.click(
-        fn=lambda cat, mod, url: task_manager.start_background_job(
-            None, None, None, None, cat, mod, mode="repo_mining", mining_repo_url=url
+        fn=lambda cat, mod, url, ctx, chars: task_manager.start_background_job(
+            None, None, None, None, cat, mod, mode="repo_mining", mining_repo_url=url, num_ctx=ctx, max_embed_chars=chars
         ),
-        inputs=[category_dropdown, model_dropdown, mining_repo_input],
+        inputs=[category_dropdown, model_dropdown, mining_repo_input, num_ctx_slider, embed_chars_slider],
         outputs=[status_banner]
     )
 
