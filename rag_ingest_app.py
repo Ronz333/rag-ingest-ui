@@ -146,7 +146,7 @@ def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
 
 ## Regel-Definition (Custom Design Rules)
 {TB}lisp
-{raw_text[:12000]}
+{raw_text[:8000]}
 {TB}
 """
         return category_tag, markdown_content
@@ -161,7 +161,7 @@ def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
 
 ## Routing-Konfiguration (Specctra Rules)
 {TB}lisp
-{raw_text[:12000]}
+{raw_text[:8000]}
 {TB}
 """
         return category_tag, markdown_content
@@ -300,7 +300,7 @@ Verändere den Code NICHT."""
     except Exception:
         enrichment_text = f"**Zweck:** Python Modul ({rel_path})\n**Docstring:** {docstring}"
 
-    code_snippet = raw_code[:15000] + ("\n# ... [Code gekürzt wegen Dateigröße]" if len(raw_code) > 15000 else "")
+    code_snippet = raw_code[:12000] + ("\n# ... [Code gekürzt wegen Dateigröße]" if len(raw_code) > 12000 else "")
 
     markdown_content = f"""[TAG: {category_tag}]
 
@@ -520,8 +520,8 @@ class IngestTaskManager:
                         self.set_status(f"🔴 Status: ABGEBROCHEN ({self.processed_files}/{self.total_files})")
                         return
 
-                    # Realistische Zeichengrenze (12.000 Chars) für ca. 5.000 bis 7.000 Tokens bei Code
-                    embed_prompt = processed_md[:12000]
+                    # Optimierte Zeichengrenze (7.500 Chars = ~4.000 bis 5.000 Code-Tokens)
+                    embed_prompt = processed_md[:7500]
                     try:
                         embed_res = ollama_client.embeddings(
                             model=EMBED_MODEL, 
