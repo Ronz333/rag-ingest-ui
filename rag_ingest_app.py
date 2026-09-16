@@ -277,7 +277,12 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
     if filename in IGNORED_FILENAMES or any(p in rel_lower for p in IGNORED_PATH_PARTS):
         return None, None
 
-    is_skidl_api_internal = any(p in rel_lower for p in ["/src/skidl/", "skidl/skidl/", "/skidl/src/"])
+    SKIDL_CORE_FILES = {"circuit.py", "part.py", "net.py", "bus.py", "package.py", "interface.py", "skidl.py", "erc.py", "schlib.py", "proto.py"}
+
+    is_skidl_api_internal = (
+        any(p in rel_lower for p in ["/src/skidl/", "skidl/skidl/", "/skidl/src/"])
+        or filename.lower() in SKIDL_CORE_FILES
+    )
     is_pcbnew_plugin = "pcbnew" in rel_lower or "action_plugin" in rel_lower
 
     max_allowed_size = 300000 if (is_skidl_api_internal or is_pcbnew_plugin) else 100000
@@ -291,8 +296,11 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
     except Exception:
         return None, None
 
-    has_skidl_instantiation = False
+    has_skidl_content = False
     for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name in ["Circuit", "Part", "Net", "Bus", "SubCircuit", "Package"]:
+            has_skidl_content = True
+            break
         if isinstance(node, ast.Call):
             func_name = ""
             if isinstance(node.func, ast.Name):
@@ -301,10 +309,10 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
                 func_name = node.func.attr
             
             if func_name in ["Part", "Net", "Bus", "generate_netlist", "generate_pcb", "subcircuit", "Circuit"]:
-                has_skidl_instantiation = True
+                has_skidl_content = True
                 break
 
-    if not (is_skidl_api_internal or is_pcbnew_plugin or has_skidl_instantiation):
+    if not (is_skidl_api_internal or is_pcbnew_plugin or has_skidl_content):
         return None, None
 
     docstring = ast.get_docstring(tree) or "Kein Modul-Docstring vorhanden"
