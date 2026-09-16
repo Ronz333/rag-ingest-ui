@@ -5,82 +5,87 @@ import shutil
 import zipfile
 import hashlib
 import json
-import ast
 import threading
 import subprocess
 import gradio as gr
 import ollama
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 from pypdf import PdfReader
 
-# --- KONFIGURATION & KONSTANTEN ---
+# Konfiguration
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:32b")
 EMBED_MODEL = "bge-m3"
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
-DEFAULT_NUM_CTX = 8192
-TB = "```"
 
-IGNORED_FILENAMES = {"setup.py", "conftest.py", "__init__.py"}
-IGNORED_PATH_PARTS = ["/docs/", "/tests/", "/build/", "/dist/"]
-
+# Whitelist aller unterstützten Formate
 TEXT_EXTENSIONS = {
     ".kicad_sym", ".kicad_mod", ".kicad_pcb", ".kicad_sch", ".kicad_prj", ".kicad_dru",
     ".sch", ".net", ".cir", ".lib", ".mod", ".sym", ".spice", ".sub", ".mcb", ".dxf",
-    ".rules", ".dsn", ".ses",
     ".py", ".md", ".txt", ".json", ".yaml", ".yml", ".c", ".h", ".cpp", ".hpp",
     ".js", ".ts", ".html", ".css", ".rst", ".csv", ".ini", ".conf", ".sh",
     ".pdf"
 }
 
+# Wissens-Kategorien & Prompts
 CATEGORIES = {
     "⚡ PCB & Hardware Design": {
         "collection": "pcb_knowledge_base",
         "system_prompt": """Du bist ein Ingestion-Agent für ein EDA/PCB-RAG-System.
-Analysiere den Inhalt (z.B. Python/SKiDL-Code, KiCad-Dateien, DRC/ERC Rules) und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+Analysiere den Inhalt (z.B. Python-Code, KiCad-Symbol/Footprint, SPICE, Doku) und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
 
 STRIKTE REGELN:
 1. ERSTE ZEILE: Zwingend ein exaktes Kategorie-Schlagwort in eckigen Klammern, z.B.:
-   [TAG: SKIDL_API], [TAG: SKIDL_GOLDEN_EXAMPLE], [TAG: KICAD_PCBNEW], [TAG: KICAD_DRC_RULES], [TAG: FREEROUTING_RULES] oder [TAG: SPICE_SIM].
-2. ABSOLUTES HALLUZINATIONSVERBOT: Verarbeite den DATEINAMEN und den INHALT strikt faktengetreu.
-3. CODE-INTEGRITÄT: Bette bereitgestellten Quellcode/Regeln 1:1 im Markdown-Codeblock ein.
-4. Zusammenfassung: Fasse Zweck, Parameter, Regeln und Schnittstellen sachlich zusammen."""
+   [TAG: KICAD_FOOTPRINT], [TAG: KICAD_SYM], [TAG: KICAD_PCBNEW], [TAG: SKIDL_API] oder [TAG: SPICE_SIM].
+2. ABSOLUTES HALLUZINATIONSVERBOT: Verarbeite den DATEINAMEN und den INHALT strikt faktengetreu. Erfinde NIEMALS abweichende Bauteilabmessungen oder falsche Pin-Belegungen!
+3. CODE-INTEGRITÄT: Bette bei KiCad-Dateien (.kicad_mod, .kicad_sym) und SPICE-Netzlisten (.cir) den bereitgestellten ORIGINAL-CODE 1:1 unverändert im Markdown-Codeblock ein.
+4. Zusammenfassung: Fasse Zweck, Parameter und Pinbelegung sachlich zusammen."""
     },
     "💻 Programmiersprachen & Software": {
         "collection": "programming_knowledge_base",
-        "system_prompt": """Du bist ein Ingestion-Agent für Software-Dokumentation und Source Code."""
+        "system_prompt": """Du bist ein Ingestion-Agent für Software-Dokumentation und Source Code.
+Analysiere den Quellcode oder die API-Dokumentation und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+
+REGELN:
+1. ERSTE ZEILE: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: PYTHON_API], [TAG: ALGORITHM], [TAG: DOCKER], [TAG: REST_API].
+2. Fasse Architektur und Verwendungszweck prägnant zusammen.
+3. Bette den originalen, kommentierten Code sauber ein."""
     },
     "🔬 Wissenschaft & Forschung": {
         "collection": "science_knowledge_base",
-        "system_prompt": """Du bist ein Ingestion-Agent für wissenschaftliche Arbeiten."""
+        "system_prompt": """Du bist ein Ingestion-Agent für wissenschaftliche Arbeiten und Forschungsdokumente.
+Analysiere das Dokument und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+
+REGELN:
+1. ERSTE ZEILE: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: METHODOLOGY], [TAG: FORMULA], [TAG: EXPERIMENT].
+2. Fasse Abstract, Methodik und Kernergebnisse zusammen."""
     },
     "🩺 Gesundheit & Medizin": {
         "collection": "health_knowledge_base",
-        "system_prompt": """Du bist ein Ingestion-Agent für medizinische Dokumente."""
+        "system_prompt": """Du bist ein Ingestion-Agent für medizinische und gesundheitswissenschaftliche Dokumente.
+Analysiere den Text und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+
+REGELN:
+1. ERSTE ZEILE: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: ANATOMY], [TAG: PHARMA], [TAG: CLINICAL_STUDY].
+2. Fasse Fachbegriffe und Wirkungsweisen sachlich zusammen."""
     },
     "📚 Allgemeines Wissen & Dokumente": {
         "collection": "general_knowledge_base",
-        "system_prompt": """Du bist ein allgemeiner Dokumenten-Ingestion-Agent."""
+        "system_prompt": """Du bist ein allgemeiner Dokumenten-Ingestion-Agent.
+Analysiere den Text und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+
+REGELN:
+1. ERSTE ZEILE: Exaktes Kategorie-Schlagwort in eckigen Klammern, z.B. [TAG: SUMMARY], [TAG: GUIDE], [TAG: NOTES].
+2. Erstelle eine verständliche Gliederung mit Kernaussagen."""
     }
 }
 
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 qdrant_client = QdrantClient(url=QDRANT_HOST)
 
-# --- SANITIZATION & CONFIG HELPERS ---
-def sanitize_url(raw_url: str) -> str:
-    if not raw_url:
-        return ""
-    md_match = re.search(r'\((https?://[^\)]+)\)', raw_url)
-    if md_match:
-        return md_match.group(1).strip()
-    url_match = re.search(r'https?://[^\s>\]\)]+', raw_url)
-    if url_match:
-        return url_match.group(0).strip()
-    return raw_url.strip("[]()'\" ")
-
+# --- CONFIG PERSISTENCE HELPERS ---
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -99,235 +104,7 @@ def save_config(data: dict):
     except Exception as e:
         print(f"Fehler beim Speichern der Konfiguration: {e}")
 
-def get_indexed_hashes_set(collection_name: str) -> set:
-    indexed_set = set()
-    try:
-        collections = [c.name for c in qdrant_client.get_collections().collections]
-        if collection_name not in collections:
-            return indexed_set
-
-        offset = None
-        while True:
-            records, next_offset = qdrant_client.scroll(
-                collection_name=collection_name,
-                limit=500,
-                offset=offset,
-                with_payload=["file_path", "content_hash"],
-                with_vectors=False
-            )
-            for r in records:
-                if r.payload:
-                    fp = r.payload.get("file_path")
-                    ch = r.payload.get("content_hash")
-                    if fp and ch:
-                        indexed_set.add((fp, ch))
-            if next_offset is None or len(records) == 0:
-                break
-            offset = next_offset
-    except Exception as e:
-        print(f"Fehler beim Batch-Laden der Qdrant-Hashes: {e}")
-    return indexed_set
-
-# --- SPEZIALPARSER FÜR KICAD, DRC & RULES ---
-def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
-    ext = os.path.splitext(rel_path)[1].lower()
-    filename = os.path.basename(rel_path)
-
-    if ext == ".kicad_dru":
-        category_tag = "KICAD_DRC_RULES"
-        rules_found = re.findall(r'\(rule\s+"([^"]+)"', raw_text)
-        rules_str = ", ".join(rules_found) if rules_found else "Benutzerdefinierte DRC-Regeln"
-        markdown_content = f"""[TAG: KICAD_DRC_RULES]
-
-# KiCad Custom DRC Rules: {filename}
-
-- **Dateipfad:** `{rel_path}`
-- **Erkannte Regeln:** `{rules_str}`
-
-## Regel-Definition (Custom Design Rules)
-{TB}lisp
-{raw_text[:8000]}
-{TB}
-"""
-        return category_tag, markdown_content
-
-    elif ext == ".rules":
-        category_tag = "FREEROUTING_RULES"
-        markdown_content = f"""[TAG: FREEROUTING_RULES]
-
-# FreeRouting Rules & Net Classes: {filename}
-
-- **Dateipfad:** `{rel_path}`
-
-## Routing-Konfiguration (Specctra Rules)
-{TB}lisp
-{raw_text[:8000]}
-{TB}
-"""
-        return category_tag, markdown_content
-
-    elif ext == ".kicad_mod":
-        category_tag = "KICAD_FOOTPRINT"
-        fp_match = re.search(r'\(footprint\s+"?([^"\s)]+)"?', raw_text)
-        fp_name = fp_match.group(1) if fp_match else filename
-        descr_match = re.search(r'\(descr\s+"([^"]+)"\)', raw_text)
-        descr = descr_match.group(1) if descr_match else "Keine Beschreibung"
-        tags_match = re.search(r'\(tags\s+"([^"]+)"\)', raw_text)
-        tags = tags_match.group(1) if tags_match else "-"
-        pads = re.findall(r'\(pad\s+"([^"]+)"\s+([^\s]+)\s+([^\s]+)', raw_text)
-        pad_info = f"Gesamt: {len(pads)} Pads (" + ", ".join([f"Pad {p[0]} [{p[1]}]" for p in pads[:6]]) + ")" if pads else "Keine Pads"
-
-        markdown_content = f"""[TAG: KICAD_FOOTPRINT]
-
-# KiCad Footprint: {fp_name}
-
-- **Dateipfad:** `{rel_path}`
-- **Bauteil-Name:** `{fp_name}`
-- **Beschreibung:** {descr}
-- **Schlagwörter:** `{tags}`
-- **Anschlüsse / Pads:** {pad_info}
-
-## Verwendung für PCB-Layout (`pcbnew`)
-Dieser Footprint wird in `pcbnew` über den Footprint-Bezeichner `{fp_name}` adressiert.
-"""
-        return category_tag, markdown_content
-
-    elif ext == ".kicad_sym":
-        category_tag = "KICAD_SYM"
-        sym_matches = re.findall(r'\(symbol\s+"([^"]+)"', raw_text)
-        main_sym = sym_matches[0] if sym_matches else filename
-        descr_match = re.search(r'\(property\s+"Description"\s+"([^"]+)"', raw_text)
-        descr = descr_match.group(1) if descr_match else "Keine Beschreibung"
-        fp_ref_match = re.search(r'\(property\s+"Footprint"\s+"([^"]+)"', raw_text)
-        fp_ref = fp_ref_match.group(1) if fp_ref_match else "-"
-        pins = re.findall(r'\(pin\s+([^\s]+)\s+([^\s]+)', raw_text)
-        pin_summary = f"{len(pins)} Pins vorhanden" if pins else "Keine expliziten Pins"
-
-        markdown_content = f"""[TAG: KICAD_SYM]
-
-# KiCad Schaltplan-Symbol: {main_sym}
-
-- **Dateipfad:** `{rel_path}`
-- **Symbol-Name:** `{main_sym}`
-- **Beschreibung:** {descr}
-- **Zugeordneter Footprint:** `{fp_ref}`
-- **Pin-Konfiguration:** {pin_summary}
-
-## Verwendung für SKiDL / Schaltungssynthese
-Dieses Symbol steht für die Netzlistenerzeugung via SKiDL unter dem Bauteilnamen `{main_sym}` bereit.
-"""
-        return category_tag, markdown_content
-
-    else:
-        category_tag = "KICAD_EDA"
-        markdown_content = f"[TAG: KICAD_EDA]\n\n# KiCad Datei: {filename}\n- **Dateipfad:** `{rel_path}`"
-        return category_tag, markdown_content
-
-# --- FEINGLIEDRIGER AST & DOMAIN PARSER ---
-def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str) -> tuple[str, str] | tuple[None, None]:
-    filename = os.path.basename(rel_path)
-    rel_lower = rel_path.lower()
-
-    # 1. Dateinamen & Pfad-Filter (Build-/Doku-Skripte verwerfen)
-    if filename in IGNORED_FILENAMES or any(p in rel_lower for p in IGNORED_PATH_PARTS):
-        return None, None
-
-    # 2. Differenzierung: Ist es SKiDL API Internals oder ein echtes Schaltungsbeispiel?
-    is_skidl_api_internal = any(p in rel_lower for p in ["/src/skidl/", "skidl/skidl/", "/skidl/src/"])
-    is_pcbnew_plugin = "pcbnew" in rel_lower or "action_plugin" in rel_lower
-
-    # 3. Dynamisches Größen-Limit:
-    # API- & Plugin-Dateien dürfen bis zu 150 KB groß sein (z.B. circuit.py mit 54 KB),
-    # reine Schaltungsbeispiele bleiben für hohe Relevanz auf 50 KB gedeckelt.
-    max_allowed_size = 150000 if (is_skidl_api_internal or is_pcbnew_plugin) else 50000
-    if len(raw_code) > max_allowed_size:
-        return None, None
-
-    # 4. Syntax-Prüfung via AST
-    try:
-        tree = ast.parse(raw_code)
-    except SyntaxError:
-        return None, None
-
-    has_skidl_instantiation = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func_name = ""
-            if isinstance(node.func, ast.Name):
-                func_name = node.func.id
-            elif isinstance(node.func, ast.Attribute):
-                func_name = node.func.attr
-            
-            if func_name in ["Part", "Net", "Bus", "generate_netlist", "generate_pcb", "subcircuit", "Circuit"]:
-                has_skidl_instantiation = True
-                break
-
-    # Falls weder API-Code noch ein Plugin noch ein SKiDL-Schaltplan vorliegt -> Überspringen
-    if not (is_skidl_api_internal or is_pcbnew_plugin or has_skidl_instantiation):
-        return None, None
-
-    docstring = ast.get_docstring(tree) or "Kein Modul-Docstring vorhanden"
-    imports = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                imports.append(alias.name)
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imports.append(node.module)
-
-    # Bestimme exakte Kategorie-Tags
-    if is_skidl_api_internal:
-        category_tag = "SKIDL_API"
-        tag_title = f"SKiDL API Modul: {filename}"
-    elif is_pcbnew_plugin:
-        category_tag = "KICAD_PCBNEW"
-        tag_title = f"KiCad PCBNew Plugin: {filename}"
-    else:
-        category_tag = "SKIDL_GOLDEN_EXAMPLE"
-        tag_title = f"Golden Example: {filename}"
-
-    enrichment_prompt = f"""Analysiere diesen Python-Code für ein EDA/PCB-System:
-
-{raw_code[:5000]}
-
-ERSTELLE FOLGENDE DREI ABSCHNITTE AUF DEUTSCH:
-1. Zweck: (Zusammenfassung der Funktion, API-Klassen oder Schaltung)
-2. Hauptkomponenten / Schnittstellen: (Verwendete Klassen, Bauteile, Methoden oder Signale)
-3. 3 Anwendungsfragen: (Drei typische Fragen eines Hardware-Entwicklers)
-
-Verändere den Code NICHT."""
-
-    try:
-        response = ollama_client.chat(
-            model=active_model,
-            messages=[{'role': 'user', 'content': enrichment_prompt}],
-            options={"num_ctx": DEFAULT_NUM_CTX}
-        )
-        enrichment_text = response['message']['content']
-    except Exception:
-        enrichment_text = f"**Zweck:** Python Modul ({rel_path})\n**Docstring:** {docstring}"
-
-    code_snippet = raw_code[:10000] + ("\n# ... [Code gekürzt wegen Dateigröße]" if len(raw_code) > 10000 else "")
-
-    markdown_content = f"""[TAG: {category_tag}]
-
-# {tag_title}
-
-- **Quelle/Dateipfad:** `{rel_path}`
-- **Erkannte Importe:** `{', '.join(set(imports))}`
-
-## Code-Analyse & Dokumentation
-{enrichment_text}
-
-## Validierter Quellcode (Python)
-{TB}python
-{code_snippet}
-{TB}
-"""
-    return category_tag, markdown_content
-
-# --- TASK MANAGER ---
+# --- THREAD-SICHERER BACKGROUND TASK MANAGER ---
 class IngestTaskManager:
     def __init__(self):
         self.lock = threading.Lock()
@@ -358,13 +135,17 @@ class IngestTaskManager:
                 self.cancel_event.set()
                 self.append_log("\n🛑 Abbruch-Signal empfangen. Aktuelle Datei wird noch zu Ende indiziert...")
                 self.status_header = "🟡 Status: WIRD ABGEBROCHEN..."
+                return f"### {self.status_header}"
             return f"### {self.status_header}"
 
-    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url=""):
+    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model):
         with self.lock:
             if self.is_running:
-                return "### ⚠️ Status: JOB LÄUFT BEREITS"
+                return f"### ⚠️ Status: JOB LÄUFT BEREITS"
             
+            # Speichere Modell- und Kategorie-Präferenz
+            save_config({"last_model": selected_model, "last_category": category_key})
+
             self.is_running = True
             self.cancel_event.clear()
             self.log_messages = []
@@ -372,109 +153,82 @@ class IngestTaskManager:
             self.total_files = 0
             self.status_header = "🟢 Status: WIRD GESTARTET..."
             
-            save_config({"last_model": selected_model, "last_category": category_key})
-
             self.current_thread = threading.Thread(
                 target=self._run_job,
-                args=(files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url),
+                args=(files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model),
                 daemon=True
             )
             self.current_thread.start()
             return f"### {self.status_header}"
 
-    def _run_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url):
-        temp_work_dir = None
+    def _run_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model):
+        category_info = CATEGORIES.get(category_key, CATEGORIES["📚 Allgemeines Wissen & Dokumente"])
+        target_collection = category_info["collection"]
+        system_prompt = category_info["system_prompt"]
+        active_model = selected_model if selected_model else DEFAULT_MODEL
+
+        session_id = str(uuid.uuid4())[:8]
+        temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
+        os.makedirs(temp_work_dir, exist_ok=True)
+
+        self.append_log(f"🚀 Starte entkoppelten Hintergrund-Ingest (Session: {session_id})")
+        self.append_log(f"Modell: {active_model} | Collection: '{target_collection}' | Embedding: {EMBED_MODEL}\n")
+
+        files_to_process = []
+
         try:
-            category_info = CATEGORIES.get(category_key, CATEGORIES["⚡ PCB & Hardware Design"])
-            target_collection = category_info["collection"]
-            system_prompt = category_info["system_prompt"]
-            active_model = selected_model if selected_model else DEFAULT_MODEL
+            # 1. Uploads & ZIPs
+            if files:
+                for file_obj in files:
+                    fname = os.path.basename(file_obj.name)
+                    ext = os.path.splitext(fname)[1].lower()
 
-            session_id = str(uuid.uuid4())[:8]
-            temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
-            os.makedirs(temp_work_dir, exist_ok=True)
+                    if ext == ".zip":
+                        self.append_log(f"📦 Entpacke ZIP: {fname}...")
+                        zip_extract_dir = os.path.join(temp_work_dir, f"zip_{uuid.uuid4()[:4]}")
+                        with zipfile.ZipFile(file_obj.name, 'r') as zip_ref:
+                            zip_ref.extractall(zip_extract_dir)
+                        extracted = collect_files_from_dir(zip_extract_dir)
+                        files_to_process.extend(extracted)
+                        self.append_log(f"   ↳ {len(extracted)} Datei(en) im ZIP entpackt.")
+                    elif ext in TEXT_EXTENSIONS:
+                        files_to_process.append((fname, file_obj.name))
 
-            files_to_process = []
-
-            # REPOSITORY MINING MODUS VIA GIT CLONE
-            if mode == "repo_mining":
-                clean_repo_url = sanitize_url(mining_repo_url)
-                if not clean_repo_url:
-                    self.append_log("❌ Keine valide Repository-URL für das Mining angegeben.")
-                    self.set_status("🔴 Status: BEENDET (Ungültige URL)")
-                    return
-
-                self.append_log(f"⛏️ Starte Git-Mining via `git clone`: {clean_repo_url}")
-                mined_repo_dir = os.path.join(temp_work_dir, "mined_repo")
-                
-                res = subprocess.run(
-                    ["git", "clone", "--depth", "1", clean_repo_url, mined_repo_dir],
-                    capture_output=True, text=True
-                )
-
-                if res.returncode != 0:
-                    self.append_log(f"❌ Git-Clone fehlgeschlagen: {res.stderr[:300]}")
-                    self.set_status("🔴 Status: GIT CLONE FEHLER")
-                    return
-
-                self.append_log("   ↳ Repository erfolgreich geklont. Scanne Dateien...")
-                for root, _, filenames in os.walk(mined_repo_dir):
-                    if ".git" in root:
-                        continue
-                    for f in filenames:
-                        ext = os.path.splitext(f)[1].lower()
-                        if ext in TEXT_EXTENSIONS:
-                            full_p = os.path.join(root, f)
-                            rel_p = os.path.relpath(full_p, mined_repo_dir)
-                            repo_base_name = os.path.basename(clean_repo_url.rstrip("/"))
-                            files_to_process.append((f"{repo_base_name}/{rel_p}", full_p))
-
-            # STANDARD DATEI & GIT CRAWLER MODUS
-            else:
-                if files:
-                    for file_item in files:
-                        fpath = file_item.name if hasattr(file_item, 'name') else (file_item.get('name') if isinstance(file_item, dict) else str(file_item))
-                        fname = os.path.basename(fpath)
-                        ext = os.path.splitext(fname)[1].lower()
-
-                        if ext == ".zip":
-                            self.append_log(f"📦 Entpacke ZIP: {fname}...")
-                            zip_extract_dir = os.path.join(temp_work_dir, f"zip_{uuid.uuid4()[:4]}")
-                            with zipfile.ZipFile(fpath, 'r') as zip_ref:
-                                zip_ref.extractall(zip_extract_dir)
-                            extracted = collect_files_from_dir(zip_extract_dir)
-                            files_to_process.extend(extracted)
-                        elif ext in TEXT_EXTENSIONS:
-                            files_to_process.append((fname, fpath))
-
-                if scanned_repo_path and os.path.exists(scanned_repo_path) and selected_folders:
-                    if "ALL_REPO" in selected_folders:
-                        repo_files = collect_files_from_dir(scanned_repo_path)
-                    else:
-                        repo_files = []
-                        for subfolder in selected_folders:
-                            repo_files.extend(collect_files_from_dir(scanned_repo_path, target_subfolder=subfolder))
-                    files_to_process.extend(repo_files)
-
-                if selected_exts:
-                    files_to_process = [
-                        (rel_p, full_p) for rel_p, full_p in files_to_process
-                        if os.path.splitext(rel_p)[1].lower() in selected_exts
-                    ]
-
-            files_to_process = list({rel_p: full_p for rel_p, full_p in files_to_process}.items())
+            # 2. Ausgewählte Git-Ordner
+            if scanned_repo_path and os.path.exists(scanned_repo_path) and selected_folders:
+                self.append_log("🌐 Erfassung ausgewählter Git-Ordner...")
+                if "ALL_REPO" in selected_folders:
+                    repo_files = collect_files_from_dir(scanned_repo_path)
+                else:
+                    repo_files = []
+                    for subfolder in selected_folders:
+                        repo_files.extend(collect_files_from_dir(scanned_repo_path, target_subfolder=subfolder))
+                files_to_process.extend(repo_files)
 
             if not files_to_process:
-                self.append_log("❌ Keine verwertbaren Dateien gefunden.")
+                self.append_log("\n❌ Keine Dateien zur Verarbeitung gefunden.")
                 self.set_status("🔴 Status: BEENDET (Keine Dateien)")
                 return
 
-            self.total_files = len(files_to_process)
-            self.append_log(f"📊 Gesamt: {self.total_files} Datei(en) bereit zur Indizierung.")
-            existing_hashes = get_indexed_hashes_set(target_collection)
-            self.append_log(f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
+            # 3. Filterung nach Dateiendungen
+            if selected_exts:
+                files_to_process = [
+                    (rel_p, full_p) for rel_p, full_p in files_to_process
+                    if os.path.splitext(rel_p)[1].lower() in selected_exts
+                ]
 
-            # MAIN INGESTION LOOP
+            # Duplikate filtern
+            files_to_process = list({rel_p: full_p for rel_p, full_p in files_to_process}.items())
+
+            if not files_to_process:
+                self.append_log("\n❌ Keine Dateien entsprechen den Dateiformat-Filtern.")
+                self.set_status("🔴 Status: BEENDET (Keine Übereinstimmung)")
+                return
+
+            self.total_files = len(files_to_process)
+            self.append_log(f"\n📊 Gesamt: {self.total_files} eindeutige Datei(en) bereit zur Indizierung.\n")
+
+            # 4. Haupt-Schleife mit transparenter Abbruch-Quittierung
             for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
                 if self.cancel_event.is_set():
                     self.append_log("🛑 Ingestion vorzeitig abgebrochen.")
@@ -486,61 +240,42 @@ class IngestTaskManager:
 
                 raw_text = extract_text_from_file(file_path)
                 if not raw_text.strip():
+                    self.append_log(f"[{idx}/{self.total_files}] ⚠️ Datei leer oder ungültig: {rel_path}")
                     continue
 
                 content_hash = calculate_sha256(raw_text)
-                if (rel_path, content_hash) in existing_hashes:
+
+                if is_file_indexed(target_collection, rel_path, content_hash):
                     self.append_log(f"[{idx}/{self.total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
                     continue
 
+                self.append_log(f"[{idx}/{self.total_files}] Verarbeite via LLM: {rel_path}")
+
                 ext = os.path.splitext(rel_path)[1].lower()
+                eda_guard = ""
+                if ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".cir", ".net"}:
+                    eda_guard = (
+                        "\n\nSTRIKTE ANWEISUNG FÜR NATIVE EDA-DATEIEN:\n"
+                        "- Bette den bereitgestellten ORIGINALTEXT zwingend 1:1 im Markdown-Codeblock ein.\n"
+                        "- Erfinde keine Geometrien, Pin-Anzahlen oder Maße, die nicht im Originaltext stehen!\n"
+                    )
+
+                full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}{eda_guard}"
 
                 try:
-                    if mode == "repo_mining" or ext == ".py":
-                        self.append_log(f"[{idx}/{self.total_files}] Hybrid AST-LLM Parse: {rel_path}")
-                        category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model)
-                        if not processed_md:
-                            self.append_log(f"   ⚠️ AST/Filter übersprungen (Kein SKiDL/API Code oder Build/Doku): {rel_path}")
-                            continue
+                    response = ollama_client.chat(
+                        model=active_model,
+                        messages=[
+                            {'role': 'system', 'content': system_prompt},
+                            {'role': 'user', 'content': full_user_prompt}
+                        ]
+                    )
+                    processed_md = response['message']['content']
 
-                    elif ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".kicad_dru", ".rules"}:
-                        self.append_log(f"[{idx}/{self.total_files}] Fast-Pass Parsing (ohne LLM): {rel_path}")
-                        category_tag, processed_md = fast_parse_kicad(rel_path, raw_text)
+                    tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
+                    category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
 
-                    else:
-                        self.append_log(f"[{idx}/{self.total_files}] Verarbeite via LLM ({active_model}): {rel_path}")
-                        full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}"
-                        response = ollama_client.chat(
-                            model=active_model,
-                            messages=[
-                                {'role': 'system', 'content': system_prompt},
-                                {'role': 'user', 'content': full_user_prompt}
-                            ],
-                            options={"num_ctx": DEFAULT_NUM_CTX}
-                        )
-                        processed_md = response['message']['content']
-                        tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
-                        category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
-
-                    if self.cancel_event.is_set():
-                        return
-
-                    # Abgesicherter Embedding-Aufruf mit Fallback bei Überlänge
-                    embed_prompt = processed_md[:7500]
-                    try:
-                        embed_res = ollama_client.embeddings(
-                            model=EMBED_MODEL, 
-                            prompt=embed_prompt,
-                            options={"num_ctx": DEFAULT_NUM_CTX}
-                        )
-                    except Exception as embed_err:
-                        self.append_log(f"   ⚠️ Token-Limit erreicht ({embed_err}). Kürze Embedding-Input für {rel_path}...")
-                        embed_res = ollama_client.embeddings(
-                            model=EMBED_MODEL, 
-                            prompt=processed_md[:3000],
-                            options={"num_ctx": DEFAULT_NUM_CTX}
-                        )
-
+                    embed_res = ollama_client.embeddings(model=EMBED_MODEL, prompt=processed_md)
                     vector = embed_res['embedding']
 
                     ensure_qdrant_collection(target_collection, len(vector))
@@ -564,27 +299,33 @@ class IngestTaskManager:
                         ]
                     )
                     
+                    # Quittierung erfolgt IMMER nach erfolgreichem Einpflegen in Qdrant
                     self.append_log(f"   ✅ Indiziert in '{target_collection}' | **Tag: #{category_tag}**\n")
 
                 except Exception as e:
                     self.append_log(f"   ❌ Fehler bei Verarbeitung: {str(e)}\n")
 
-            self.append_log(f"\n🎉 Ingestion abgeschlossen! Dokumente sind in Collection '{target_collection}' verfügbar.")
+                # Prüfe Abbruch direkt nach Quittierung des aktuellen Dokuments
+                if self.cancel_event.is_set():
+                    self.append_log("🛑 Letzte Datei erfolgreich quittiert. Ingestion jetzt beendet.")
+                    self.set_status(f"🔴 Status: ABGEBROCHEN ({idx}/{self.total_files})")
+                    return
+
+            self.append_log(f"\n🎉 Ingestion vollständig abgeschlossen! Alle Daten sind in Collection '{target_collection}' verfügbar.")
             self.set_status(f"✅ Status: ABGESCHLOSSEN ({self.total_files}/{self.total_files})")
 
-        except Exception as top_e:
-            self.append_log(f"\n❌ Unerwarteter Systemfehler: {str(top_e)}")
-            self.set_status("🔴 Status: FEHLER")
         finally:
             with self.lock:
                 self.is_running = False
-                self.cancel_event.clear()
-            if temp_work_dir and os.path.exists(temp_work_dir):
+            if os.path.exists(temp_work_dir):
                 shutil.rmtree(temp_work_dir, ignore_errors=True)
+            if scanned_repo_path and os.path.exists(scanned_repo_path):
+                shutil.rmtree(scanned_repo_path, ignore_errors=True)
 
+# Instanziierung
 task_manager = IngestTaskManager()
 
-# --- HILFSFUNKTIONEN UI & GIT ---
+# --- HILFSFUNKTIONEN ---
 def get_ollama_models():
     config = load_config()
     saved_model = config.get("last_model", DEFAULT_MODEL)
@@ -626,6 +367,22 @@ def ensure_qdrant_collection(collection_name: str, vector_size: int):
 
 def calculate_sha256(text: str) -> str:
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+def is_file_indexed(collection_name: str, rel_path: str, content_hash: str) -> bool:
+    try:
+        results, _ = qdrant_client.scroll(
+            collection_name=collection_name,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="file_path", match=MatchValue(value=rel_path)),
+                    FieldCondition(key="content_hash", match=MatchValue(value=content_hash))
+                ]
+            ),
+            limit=1
+        )
+        return len(results) > 0
+    except Exception:
+        return False
 
 def extract_text_from_file(file_path: str) -> str:
     ext = os.path.splitext(file_path)[1].lower()
@@ -672,48 +429,30 @@ def update_model_preference(model_name):
 def update_category_preference(cat_name):
     save_config({"last_category": cat_name})
 
-def scan_github_repository(github_url, old_scanned_repo):
-    if old_scanned_repo and os.path.exists(old_scanned_repo):
-        shutil.rmtree(old_scanned_repo, ignore_errors=True)
-
-    clean_url = sanitize_url(github_url)
-    if not clean_url:
-        yield (
+def scan_github_repository(github_url):
+    if not github_url or not github_url.strip():
+        return (
             gr.update(choices=[], value=[], visible=False),
             gr.update(choices=[], value=[], visible=False),
             "",
             "❌ Bitte valide Repository URL angeben."
         )
-        return
-
-    task_manager.set_status("🟡 Status: SCANNE REPOSITORY...")
-    task_manager.append_log(f"🌐 Starte Scan für Repository: {clean_url} ... Bitte warten.")
-
-    yield (
-        gr.update(visible=False),
-        gr.update(visible=False),
-        "",
-        f"🌐 Klone Repository {clean_url} im Hintergrund..."
-    )
 
     session_id = str(uuid.uuid4())[:8]
     repo_dir = os.path.join("/tmp", f"scan_repo_{session_id}")
 
     res = subprocess.run(
-        ["git", "clone", "--depth", "1", clean_url, repo_dir],
+        ["git", "clone", "--depth", "1", github_url.strip(), repo_dir],
         capture_output=True, text=True
     )
 
     if res.returncode != 0:
-        task_manager.set_status("🔴 Status: SCAN FEHLGESCHLAGEN")
-        task_manager.append_log(f"❌ Git-Clone fehlgeschlagen: {res.stderr[:200]}")
-        yield (
+        return (
             gr.update(choices=[], value=[], visible=False),
             gr.update(choices=[], value=[], visible=False),
             "",
             f"❌ Git-Clone fehlgeschlagen:\n{res.stderr[:300]}"
         )
-        return
 
     valid_dirs = set()
     ext_counts = {}
@@ -755,99 +494,50 @@ def scan_github_repository(github_url, old_scanned_repo):
     ]
 
     log_msg = f"✅ Repository gescannt! {len(folder_choices)-1} Ordner und {len(ext_choices)} Dateiformate erkannt."
-    task_manager.append_log(log_msg)
-    task_manager.set_status("⚪ Status: Inaktiv (Scan bereit)")
 
-    yield (
+    return (
         gr.update(choices=folder_choices, value=["ALL_REPO"], visible=True),
         gr.update(choices=ext_choices, value=[e[1] for e in ext_choices], visible=True),
         repo_dir,
         log_msg
     )
 
-# --- STYLES & JAVASCRIPT ---
-custom_css = """
-footer { visibility: hidden; }
-.row-stretch {
-    display: flex !important;
-    align-items: stretch !important;
-}
-.full-height-btn {
-    height: 100% !important;
-    min-height: 100% !important;
-    display: flex !important;
-    flex-direction: column !important;
-    justify-content: flex-end !important;
-}
-.full-height-btn button {
-    height: 100% !important;
-    min-height: 100% !important;
-    margin: 0 !important;
-}
-#log-textbox textarea {
-    font-family: monospace;
-    font-size: 0.85rem;
-    scroll-behavior: smooth;
-}
-"""
-
-autoscroll_js = """
-function() {
-    window.ragUserScrolledUp = false;
-    
-    const checkAndScroll = () => {
-        const textarea = document.querySelector('#log-textbox textarea');
-        if (!textarea) return;
-
-        if (!textarea.dataset.scrollBound) {
-            textarea.dataset.scrollBound = "true";
-            textarea.addEventListener('scroll', () => {
-                const distance = textarea.scrollHeight - textarea.scrollTop - textarea.clientHeight;
-                window.ragUserScrolledUp = (distance > 50);
-            });
-        }
-
-        if (!window.ragUserScrolledUp) {
-            textarea.scrollTop = textarea.scrollHeight;
-        }
-    };
-
-    setInterval(checkAndScroll, 300);
-}
-"""
-
-# --- GRADIO GUI BUILDER ---
+# --- GRADIO CONTROL CENTER (OPTIMIERTES DASHBOARD-LAYOUT) ---
 initial_model_choices, initial_default_model = get_ollama_models()
 saved_cfg = load_config()
 initial_default_category = saved_cfg.get("last_category", list(CATEGORIES.keys())[0])
 
-with gr.Blocks(title="Universal RAG Control Center") as demo:
+with gr.Blocks(title="Universal RAG Control Center", css="footer {visibility: hidden}") as demo:
     repo_state = gr.State("")
+
+    # Auto-Polling Timer
     status_timer = gr.Timer(value=2.0)
 
     gr.Markdown("# 🏢 Universal RAG Ingestion Control Center")
 
     with gr.Row():
+        # LINKS: Steuerung & Quellen (50% Breite)
         with gr.Column(scale=1):
             status_banner = gr.Markdown("### ⚪ Status: Inaktiv")
 
-            with gr.Row(elem_classes=["row-stretch"]):
+            with gr.Row():
                 model_dropdown = gr.Dropdown(
                     choices=initial_model_choices,
                     value=initial_default_model,
                     label="LLM Modell (Gespeichert)",
                     interactive=True,
-                    scale=4
+                    scale=3
                 )
-                refresh_models_btn = gr.Button("🔄", variant="secondary", scale=1, elem_classes=["full-height-btn"])
+                refresh_models_btn = gr.Button("🔄", variant="secondary", scale=1)
+                category_dropdown = gr.Dropdown(
+                    choices=list(CATEGORIES.keys()),
+                    value=initial_default_category,
+                    label="Knowledge Collection",
+                    interactive=True,
+                    scale=3
+                )
 
-            category_dropdown = gr.Dropdown(
-                choices=list(CATEGORIES.keys()),
-                value=initial_default_category,
-                label="Knowledge Collection",
-                interactive=True
-            )
-
+            # Quellen in Tabs unterteilt -> Extrem platzsparend!
             with gr.Tabs():
                 with gr.Tab("📁 Dateiupload / ZIP"):
                     file_input = gr.File(
@@ -856,85 +546,86 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     )
 
                 with gr.Tab("🌐 Git Repository Crawler"):
-                    with gr.Row(elem_classes=["row-stretch"]):
+                    with gr.Row():
                         github_input = gr.Textbox(
                             label="Repository URL",
-                            placeholder="[https://gitlab.com/kicad/libraries/kicad-symbols.git](https://gitlab.com/kicad/libraries/kicad-symbols.git)",
+                            placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
                             scale=4
                         )
-                        scan_repo_btn = gr.Button("🔍 Scannen", variant="secondary", scale=1, elem_classes=["full-height-btn"])
+                        scan_repo_btn = gr.Button("🔍 Scannen", variant="secondary", scale=1)
 
                     with gr.Row():
-                        folder_checkboxes = gr.CheckboxGroup(label="Ordnerstruktur", choices=[], visible=False, interactive=True, scale=1)
-                        ext_checkboxes = gr.CheckboxGroup(label="Dateiformate Filter", choices=[], visible=False, interactive=True, scale=1)
-
-                with gr.Tab("⭐ EDA & Rule Mining"):
-                    mining_repo_input = gr.Dropdown(
-                        choices=[
-                            ("SKiDL Haupt-Repository (Offiziell)", "[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)"),
-                            ("KiCad Python Action Plugins", "[https://github.com/KiCad/kicad-python](https://github.com/KiCad/kicad-python)"),
-                            ("Freerouting Java / Config Core", "[https://github.com/freerouting/freerouting](https://github.com/freerouting/freerouting)")
-                        ],
-                        value="[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)",
-                        label="Ziel-Repository für EDA Mining",
-                        allow_custom_value=True,
-                        interactive=True
-                    )
-                    start_mining_btn = gr.Button("⛏️ Mining & Hybrid Ingestion Starten", variant="primary")
-
-        with gr.Column(scale=1):
-            status_output = gr.Textbox(
-                label="Server Live-Protokoll", 
-                interactive=False, 
-                lines=24, 
-                autoscroll=False,
-                elem_id="log-textbox"
-            )
+                        folder_checkboxes = gr.CheckboxGroup(
+                            label="Ordnerstruktur",
+                            choices=[],
+                            visible=False,
+                            interactive=True,
+                            scale=1
+                        )
+                        ext_checkboxes = gr.CheckboxGroup(
+                            label="Dateiformate Filter",
+                            choices=[],
+                            visible=False,
+                            interactive=True,
+                            scale=1
+                        )
 
             with gr.Row():
                 start_btn = gr.Button("🚀 Ingest Starten", variant="primary", scale=3)
                 stop_btn = gr.Button("🛑 Abbrechen", variant="stop", scale=2)
 
+        # RECHTS: Live Protokoll (50% Breite)
+        with gr.Column(scale=1):
+            status_output = gr.Textbox(
+                label="Server Live-Protokoll", 
+                interactive=False, 
+                lines=24, 
+                autoscroll=True
+            )
+
+    # Event Bindings
     status_timer.tick(
         fn=task_manager.get_ui_snapshot,
-        outputs=[status_output, status_banner],
-        show_progress="hidden"
+        outputs=[status_output, status_banner]
     )
 
-    model_dropdown.change(fn=update_model_preference, inputs=[model_dropdown])
-    category_dropdown.change(fn=update_category_preference, inputs=[category_dropdown])
-    refresh_models_btn.click(fn=lambda: gr.Dropdown(choices=get_ollama_models()[0]), outputs=[model_dropdown])
+    model_dropdown.change(
+        fn=update_model_preference,
+        inputs=[model_dropdown]
+    )
+
+    category_dropdown.change(
+        fn=update_category_preference,
+        inputs=[category_dropdown]
+    )
+
+    refresh_models_btn.click(
+        fn=lambda: gr.Dropdown(choices=get_ollama_models()[0]),
+        outputs=[model_dropdown]
+    )
 
     scan_repo_btn.click(
         fn=scan_github_repository,
-        inputs=[github_input, repo_state],
+        inputs=[github_input],
         outputs=[folder_checkboxes, ext_checkboxes, repo_state, status_output]
     )
 
-    folder_checkboxes.change(fn=handle_folder_selection, inputs=[folder_checkboxes], outputs=[folder_checkboxes])
+    folder_checkboxes.change(
+        fn=handle_folder_selection,
+        inputs=[folder_checkboxes],
+        outputs=[folder_checkboxes]
+    )
 
     start_btn.click(
-        fn=lambda files, repo, f_cb, e_cb, cat, mod: task_manager.start_background_job(
-            files, repo, f_cb, e_cb, cat, mod, mode="standard"
-        ),
+        fn=task_manager.start_background_job,
         inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown],
         outputs=[status_banner]
     )
 
-    start_mining_btn.click(
-        fn=lambda cat, mod, url: task_manager.start_background_job(
-            None, None, None, None, cat, mod, mode="repo_mining", mining_repo_url=url
-        ),
-        inputs=[category_dropdown, model_dropdown, mining_repo_input],
+    stop_btn.click(
+        fn=task_manager.request_cancel,
         outputs=[status_banner]
     )
 
-    stop_btn.click(fn=task_manager.request_cancel, outputs=[status_banner])
-
 if __name__ == "__main__":
-    demo.launch(
-        server_name="0.0.0.0", 
-        server_port=7861,
-        css=custom_css,
-        js=autoscroll_js
-    )
+    demo.launch(server_name="0.0.0.0", server_port=7861)
