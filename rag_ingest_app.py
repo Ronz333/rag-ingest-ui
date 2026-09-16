@@ -69,6 +69,26 @@ STRIKTE REGELN:
 ollama_client = ollama.Client(host=OLLAMA_HOST)
 qdrant_client = QdrantClient(url=QDRANT_HOST)
 
+# --- HELPER FÜR UNUNTERBRECHBARE OLLAMA-CALLS (STREAMING CANCEL) ---
+def call_ollama_chat_with_cancel(model: str, messages: list, options: dict, cancel_event: threading.Event) -> str | None:
+    """Führt Ollama-Chat via Streaming aus, um bei gesetztem cancel_event SOFORT abzubrechen."""
+    try:
+        response_stream = ollama_client.chat(
+            model=model,
+            messages=messages,
+            options=options,
+            stream=True
+        )
+        full_text = []
+        for chunk in response_stream:
+            if cancel_event.is_set():
+                return None
+            content = chunk.get('message', {}).get('content', '')
+            full_text.append(content)
+        return "".join(full_text)
+    except Exception as e:
+        raise e
+
 # --- SANITIZATION & CONFIG HELPERS ---
 def sanitize_url(raw_url: str) -> str:
     if not raw_url:
@@ -224,7 +244,7 @@ Dieses Symbol steht für die Netzlistenerzeugung via SKiDL unter dem Bauteilname
         return category_tag, markdown_content
 
 # --- FEINGLIEDRIGER AST & DOMAIN PARSER ---
-def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str) -> tuple[str, str] | tuple[None, None]:
+def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, cancel_event: threading.Event) -> tuple[str, str] | tuple[None, None]:
     filename = os.path.basename(rel_path)
     rel_lower = rel_path.lower()
 
@@ -290,15 +310,16 @@ ERSTELLE FOLGENDE DREI ABSCHNITTE AUF DEUTSCH:
 
 Verändere den Code NICHT."""
 
-    try:
-        response = ollama_client.chat(
-            model=active_model,
-            messages=[{'role': 'user', 'content': enrichment_prompt}],
-            options={"num_ctx": DEFAULT_NUM_CTX}
-        )
-        enrichment_text = response['message']['content']
-    except Exception:
-        enrichment_text = f"**Zweck:** Python Modul ({rel_path})\n**Docstring:** {docstring}"
+    # Streaming-LLM Call mit Abbruchprüfung
+    enrichment_text = call_ollama_chat_with_cancel(
+        model=active_model,
+        messages=[{'role': 'user', 'content': enrichment_prompt}],
+        options={"num_ctx": DEFAULT_NUM_CTX},
+        cancel_event=cancel_event
+    )
+
+    if enrichment_text is None:
+        return None, None  # Abbruch durch den Benutzer
 
     code_snippet = raw_code[:12000] + ("\n# ... [Code gekürzt wegen Dateigröße]" if len(raw_code) > 12000 else "")
 
@@ -345,21 +366,21 @@ class IngestTaskManager:
             return full_log, f"### {self.status_header}"
 
     def request_cancel(self):
+        """Wird aufgerufen, wenn der Abbrechen-Button geklickt wird."""
         with self.lock:
-            if self.is_running:
-                self.cancel_event.set()
-                self.append_log("\n🛑 Abbruch-Signal empfangen! Beende aktuellen Vorgang nach dem laufenden Teilschritt...")
-                self.status_header = "🟡 Status: INGESTION WIRD BEENDET..."
-            else:
-                self.status_header = "⚪ Status: Inaktiv"
-                self.append_log("ℹ️ Kein aktiver Job zum Abbrechen vorhanden.")
-            return f"### {self.status_header}"
+            self.cancel_event.set()
+            self.is_running = False  # Gibt die UI SOFORT für neue Anfragen frei
+            self.status_header = "🔴 Status: ABGEBROCHEN"
+            self.append_log("\n🛑 Abbruch-Signal empfangen! Vorgang wurde umgehend beendet.")
+            full_log = "\n".join(self.log_messages)
+            return full_log, f"### {self.status_header}"
 
     def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url=""):
         with self.lock:
             if self.is_running:
-                self.append_log("⚠️ Ein Ingestion-Job läuft derzeit noch oder wird gerade abgebrochen. Bitte kurz warten...")
-                return "### ⚠️ Status: JOB LÄUFT BEREITS / WIRD BEENDET"
+                self.append_log("⚠️ Ein Ingestion-Job läuft bereits. Bitte erst abbrechen...")
+                full_log = "\n".join(self.log_messages)
+                return full_log, f"### {self.status_header}"
             
             self.is_running = True
             self.cancel_event.clear()
@@ -376,7 +397,8 @@ class IngestTaskManager:
                 daemon=True
             )
             self.current_thread.start()
-            return f"### {self.status_header}"
+            full_log = "\n".join(self.log_messages)
+            return full_log, f"### {self.status_header}"
 
     def _run_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url):
         temp_work_dir = None
@@ -491,7 +513,11 @@ class IngestTaskManager:
                 try:
                     if mode == "repo_mining" or ext == ".py":
                         self.append_log(f"[{idx}/{self.total_files}] Hybrid AST-LLM Parse: {rel_path}")
-                        category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model)
+                        category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model, self.cancel_event)
+                        if self.cancel_event.is_set():
+                            self.append_log("\n🛑 Ingestion vorzeitig abgebrochen.")
+                            self.set_status(f"🔴 Status: ABGEBROCHEN ({self.processed_files}/{self.total_files})")
+                            return
                         if not processed_md:
                             self.append_log(f"   ⚠️ AST/Filter übersprungen (Kein SKiDL/API Code oder Build/Doku): {rel_path}")
                             continue
@@ -503,15 +529,21 @@ class IngestTaskManager:
                     else:
                         self.append_log(f"[{idx}/{self.total_files}] Verarbeite via LLM ({active_model}): {rel_path}")
                         full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}"
-                        response = ollama_client.chat(
+                        
+                        processed_md = call_ollama_chat_with_cancel(
                             model=active_model,
                             messages=[
                                 {'role': 'system', 'content': system_prompt},
                                 {'role': 'user', 'content': full_user_prompt}
                             ],
-                            options={"num_ctx": DEFAULT_NUM_CTX}
+                            options={"num_ctx": DEFAULT_NUM_CTX},
+                            cancel_event=self.cancel_event
                         )
-                        processed_md = response['message']['content']
+                        if self.cancel_event.is_set() or processed_md is None:
+                            self.append_log("\n🛑 Ingestion vorzeitig abgebrochen.")
+                            self.set_status(f"🔴 Status: ABGEBROCHEN ({self.processed_files}/{self.total_files})")
+                            return
+
                         tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
                         category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
 
@@ -520,7 +552,6 @@ class IngestTaskManager:
                         self.set_status(f"🔴 Status: ABGEBROCHEN ({self.processed_files}/{self.total_files})")
                         return
 
-                    # Optimierte Zeichengrenze (7.500 Chars = ~4.000 bis 5.000 Code-Tokens)
                     embed_prompt = processed_md[:7500]
                     try:
                         embed_res = ollama_client.embeddings(
@@ -920,7 +951,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
             files, repo, f_cb, e_cb, cat, mod, mode="standard"
         ),
         inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown],
-        outputs=[status_banner]
+        outputs=[status_output, status_banner]
     )
 
     start_mining_btn.click(
@@ -928,10 +959,13 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
             None, None, None, None, cat, mod, mode="repo_mining", mining_repo_url=url
         ),
         inputs=[category_dropdown, model_dropdown, mining_repo_input],
-        outputs=[status_banner]
+        outputs=[status_output, status_banner]
     )
 
-    stop_btn.click(fn=task_manager.request_cancel, outputs=[status_banner])
+    stop_btn.click(
+        fn=task_manager.request_cancel,
+        outputs=[status_output, status_banner]
+    )
 
 if __name__ == "__main__":
     demo.launch(
