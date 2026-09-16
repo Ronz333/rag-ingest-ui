@@ -9,6 +9,7 @@ import ast
 import warnings
 import subprocess
 import multiprocessing
+from datetime import datetime
 import gradio as gr
 import ollama
 from qdrant_client import QdrantClient
@@ -19,7 +20,7 @@ from pypdf import PdfReader
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:32b")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3:8k")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "hf.co/Qwen/Qwen3-Embedding-8B-GGUF:Q5_K_M")
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
 DEFAULT_NUM_CTX = 8192
 TB = "```"
@@ -66,6 +67,11 @@ STRIKTE REGELN:
         "system_prompt": """Du bist ein allgemeiner Dokumenten-Ingestion-Agent."""
     }
 }
+
+# --- LOGGING HELPER MIT ZEITSTEMPEL ---
+def log_msg(log_list, text: str):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    log_list.append(f"[{timestamp}] {text}")
 
 # --- SANITIZATION & CONFIG HELPERS ---
 def sanitize_url(raw_url: str) -> str:
@@ -279,7 +285,6 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
     if len(raw_code) > max_allowed_size:
         return None, None
 
-    # Unterdrückung von SyntaxWarnings durch ast.parse
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -384,11 +389,11 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         if mode == "repo_mining":
             clean_repo_url = sanitize_url(mining_repo_url)
             if not clean_repo_url:
-                log_list.append("❌ Keine valide Repository-URL für das Mining angegeben.")
+                log_msg(log_list, "❌ Keine valide Repository-URL für das Mining angegeben.")
                 status_dict["header"] = "🔴 Status: BEENDET (Ungültige URL)"
                 return
 
-            log_list.append(f"⛏️ Starte Git-Mining via `git clone`: {clean_repo_url}")
+            log_msg(log_list, f"⛏️ Starte Git-Mining via `git clone`: {clean_repo_url}")
             mined_repo_dir = os.path.join(temp_work_dir, "mined_repo")
             
             res = subprocess.run(
@@ -397,11 +402,11 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             )
 
             if res.returncode != 0:
-                log_list.append(f"❌ Git-Clone fehlgeschlagen: {res.stderr[:300]}")
+                log_msg(log_list, f"❌ Git-Clone fehlgeschlagen: {res.stderr[:300]}")
                 status_dict["header"] = "🔴 Status: GIT CLONE FEHLER"
                 return
 
-            log_list.append("   ↳ Repository erfolgreich geklont. Scanne Dateien...")
+            log_msg(log_list, "   ↳ Repository erfolgreich geklont. Scanne Dateien...")
             for root, _, filenames in os.walk(mined_repo_dir):
                 if ".git" in root:
                     continue
@@ -421,7 +426,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     ext = os.path.splitext(fname)[1].lower()
 
                     if ext == ".zip":
-                        log_list.append(f"📦 Entpacke ZIP: {fname}...")
+                        log_msg(log_list, f"📦 Entpacke ZIP: {fname}...")
                         zip_extract_dir = os.path.join(temp_work_dir, f"zip_{uuid.uuid4()[:4]}")
                         with zipfile.ZipFile(fpath, 'r') as zip_ref:
                             zip_ref.extractall(zip_extract_dir)
@@ -448,14 +453,14 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         files_to_process = list({rel_p: full_p for rel_p, full_p in files_to_process}.items())
 
         if not files_to_process:
-            log_list.append("❌ Keine verwertbaren Dateien gefunden.")
+            log_msg(log_list, "❌ Keine verwertbaren Dateien gefunden.")
             status_dict["header"] = "🔴 Status: BEENDET (Keine Dateien)"
             return
 
         total_files = len(files_to_process)
-        log_list.append(f"📊 Gesamt: {total_files} Datei(en) bereit zur Indizierung.")
+        log_msg(log_list, f"📊 Gesamt: {total_files} Datei(en) bereit zur Indizierung.")
         existing_hashes = get_indexed_hashes_set(qdrant_worker, target_collection)
-        log_list.append(f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
+        log_msg(log_list, f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
 
         for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
             status_dict["header"] = f"🟢 Status: LÄUFT ({idx}/{total_files} - {os.path.basename(rel_path)})"
@@ -466,25 +471,25 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
             content_hash = calculate_sha256(raw_text)
             if (rel_path, content_hash) in existing_hashes:
-                log_list.append(f"[{idx}/{total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
+                log_msg(log_list, f"[{idx}/{total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
                 continue
 
             ext = os.path.splitext(rel_path)[1].lower()
 
             try:
                 if mode == "repo_mining" or ext == ".py":
-                    log_list.append(f"[{idx}/{total_files}] Hybrid AST-LLM Parse: {rel_path}")
+                    log_msg(log_list, f"[{idx}/{total_files}] Hybrid AST-LLM Parse: {rel_path}")
                     category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model, ollama_worker)
                     if not processed_md:
-                        log_list.append(f"   ⚠️ AST/Filter übersprungen (Kein SKiDL/API Code oder Build/Doku): {rel_path}")
+                        log_msg(log_list, f"   ⚠️ AST/Filter übersprungen (Kein SKiDL/API Code oder Build/Doku): {rel_path}")
                         continue
 
                 elif ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".kicad_dru", ".rules"}:
-                    log_list.append(f"[{idx}/{total_files}] Fast-Pass Parsing (ohne LLM): {rel_path}")
+                    log_msg(log_list, f"[{idx}/{total_files}] Fast-Pass Parsing (ohne LLM): {rel_path}")
                     category_tag, processed_md = fast_parse_kicad(rel_path, raw_text)
 
                 else:
-                    log_list.append(f"[{idx}/{total_files}] Verarbeite via LLM ({active_model}): {rel_path}")
+                    log_msg(log_list, f"[{idx}/{total_files}] Verarbeite via LLM ({active_model}): {rel_path}")
                     full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}"
                     response = ollama_worker.chat(
                         model=active_model,
@@ -507,7 +512,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     )
                 except Exception as embed_err:
                     fallback_model = "bge-m3" if EMBED_MODEL != "bge-m3" else EMBED_MODEL
-                    log_list.append(f"   ⚠️ Embedding-Fehler bei {EMBED_MODEL} ({embed_err}). Versuche Fallback mit {fallback_model} (4000 Zeichen)...")
+                    log_msg(log_list, f"   ⚠️ Embedding-Fehler bei {EMBED_MODEL} ({embed_err}). Versuche Fallback mit {fallback_model} (4000 Zeichen)...")
                     embed_res = ollama_worker.embeddings(
                         model=fallback_model, 
                         prompt=processed_md[:4000],
@@ -537,33 +542,34 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     ]
                 )
                 
-                log_list.append(f"   ✅ Indiziert in '{target_collection}' | **Tag: #{category_tag}**\n")
+                log_msg(log_list, f"   ✅ Indiziert in '{target_collection}' | **Tag: #{category_tag}**\n")
 
             except Exception as e:
-                log_list.append(f"   ❌ Fehler bei Verarbeitung: {str(e)}\n")
+                log_msg(log_list, f"   ❌ Fehler bei Verarbeitung: {str(e)}\n")
 
-        log_list.append(f"\n🎉 Ingestion abgeschlossen! Dokumente sind in Collection '{target_collection}' verfügbar.")
+        log_msg(log_list, f"\n🎉 Ingestion abgeschlossen! Dokumente sind in Collection '{target_collection}' verfügbar.")
         status_dict["header"] = f"✅ Status: ABGESCHLOSSEN ({total_files}/{total_files})"
 
     except Exception as top_e:
-        log_list.append(f"\n❌ Unerwarteter Systemfehler: {str(top_e)}")
+        log_msg(log_list, f"\n❌ Unerwarteter Systemfehler: {str(top_e)}")
         status_dict["header"] = "🔴 Status: FEHLER"
     finally:
         status_dict["running"] = False
         if temp_work_dir and os.path.exists(temp_work_dir):
             shutil.rmtree(temp_work_dir, ignore_errors=True)
-        log_list.append("✨ System ist wieder inaktiv und bereit für neue Anfragen.")
+        log_msg(log_list, "✨ System ist wieder inaktiv und bereit für neue Anfragen.")
 
 # --- INGEST TASK PROCESS MANAGER ---
 class IngestProcessManager:
     def __init__(self):
         self.process = None
         self.manager = multiprocessing.Manager()
-        self.log_list = self.manager.list(["Inaktiv. Bereit für neuen Ingestion-Job."])
+        self.log_list = self.manager.list()
+        log_msg(self.log_list, "Inaktiv. Bereit für neuen Ingestion-Job.")
         self.status_dict = self.manager.dict({"header": "⚪ Status: Inaktiv", "running": False})
 
     def append_log(self, text: str):
-        self.log_list.append(text)
+        log_msg(self.log_list, text)
 
     def set_status(self, header: str):
         self.status_dict["header"] = header
@@ -577,7 +583,7 @@ class IngestProcessManager:
         return self.process is not None and self.process.is_alive()
 
     def request_cancel(self):
-        """Beendet den Ingest-Prozess HARTE per SIGTERM/SIGKILL."""
+        """Beendet den Ingest-Prozess hart per SIGTERM/SIGKILL."""
         if self.is_alive():
             self.process.terminate()
             self.process.join(timeout=1.0)
@@ -586,21 +592,20 @@ class IngestProcessManager:
             
             self.status_dict["running"] = False
             self.status_dict["header"] = "🔴 Status: ABGEBROCHEN"
-            self.log_list.append("\n🛑 Abbruch-Signal ausgeführt: Prozess wurde umgehend beendet.")
-            self.log_list.append("✨ System ist wieder inaktiv und bereit für neue Anfragen.")
+            log_msg(self.log_list, "\n🛑 Abbruch-Signal ausgeführt: Prozess wurde umgehend beendet.")
+            log_msg(self.log_list, "✨ System ist wieder inaktiv und bereit für neue Anfragen.")
         else:
             self.status_dict["header"] = "⚪ Status: Inaktiv"
             self.status_dict["running"] = False
-            self.log_list.append("ℹ️ Kein aktiver Job zum Abbrechen vorhanden.")
+            log_msg(self.log_list, "ℹ️ Kein aktiver Job zum Abbrechen vorhanden.")
 
         return "\n".join(list(self.log_list)), f"### {self.status_dict['header']}"
 
     def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url=""):
         if self.is_alive():
-            self.log_list.append("⚠️ Ein Ingestion-Job läuft derzeit noch. Bitte erst abbrechen...")
+            log_msg(self.log_list, "⚠️ Ein Ingestion-Job läuft derzeit noch. Bitte erst abbrechen...")
             return f"### {self.status_dict['header']}"
 
-        # Vorherige Protokolle zurücksetzen
         del self.log_list[:]
         self.status_dict["header"] = "🟢 Status: WIRD GESTARTET..."
         self.status_dict["running"] = True
@@ -749,15 +754,15 @@ def scan_github_repository(github_url, old_scanned_repo):
         for ext, count in sorted(ext_counts.items(), key=lambda x: x[0])
     ]
 
-    log_msg = f"✅ Repository gescannt! {len(folder_choices)-1} Ordner und {len(ext_choices)} Dateiformate erkannt."
-    task_manager.append_log(log_msg)
+    log_msg_text = f"✅ Repository gescannt! {len(folder_choices)-1} Ordner und {len(ext_choices)} Dateiformate erkannt."
+    task_manager.append_log(log_msg_text)
     task_manager.set_status("⚪ Status: Inaktiv (Scan bereit)")
 
     yield (
         gr.update(choices=folder_choices, value=["ALL_REPO"], visible=True),
         gr.update(choices=ext_choices, value=[e[1] for e in ext_choices], visible=True),
         repo_dir,
-        log_msg
+        log_msg_text
     )
 
 # --- STYLES & JAVASCRIPT ---
