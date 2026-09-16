@@ -6,8 +6,9 @@ import zipfile
 import hashlib
 import json
 import ast
-import threading
+import warnings
 import subprocess
+import multiprocessing
 import gradio as gr
 import ollama
 from qdrant_client import QdrantClient
@@ -66,29 +67,6 @@ STRIKTE REGELN:
     }
 }
 
-ollama_client = ollama.Client(host=OLLAMA_HOST)
-qdrant_client = QdrantClient(url=QDRANT_HOST)
-
-# --- HELPER FÜR UNUNTERBRECHBARE OLLAMA-CALLS (STREAMING CANCEL) ---
-def call_ollama_chat_with_cancel(model: str, messages: list, options: dict, cancel_event: threading.Event) -> str | None:
-    """Führt Ollama-Chat via Streaming aus, um bei gesetztem cancel_event SOFORT abzubrechen."""
-    try:
-        response_stream = ollama_client.chat(
-            model=model,
-            messages=messages,
-            options=options,
-            stream=True
-        )
-        full_text = []
-        for chunk in response_stream:
-            if cancel_event.is_set():
-                return None
-            content = chunk.get('message', {}).get('content', '')
-            full_text.append(content)
-        return "".join(full_text)
-    except Exception as e:
-        raise e
-
 # --- SANITIZATION & CONFIG HELPERS ---
 def sanitize_url(raw_url: str) -> str:
     if not raw_url:
@@ -119,7 +97,7 @@ def save_config(data: dict):
     except Exception as e:
         print(f"Fehler beim Speichern der Konfiguration: {e}")
 
-def get_indexed_hashes_set(collection_name: str) -> set:
+def get_indexed_hashes_set(qdrant_client, collection_name: str) -> set:
     indexed_set = set()
     try:
         collections = [c.name for c in qdrant_client.get_collections().collections]
@@ -147,6 +125,49 @@ def get_indexed_hashes_set(collection_name: str) -> set:
     except Exception as e:
         print(f"Fehler beim Batch-Laden der Qdrant-Hashes: {e}")
     return indexed_set
+
+def ensure_qdrant_collection(qdrant_client, collection_name: str, vector_size: int):
+    collections = [c.name for c in qdrant_client.get_collections().collections]
+    if collection_name not in collections:
+        qdrant_client.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+        )
+
+def calculate_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+def extract_text_from_file(file_path: str) -> str:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        try:
+            reader = PdfReader(file_path)
+            return "\n".join([page.extract_text() or "" for page in reader.pages])
+        except Exception:
+            return ""
+    else:
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        except Exception:
+            return ""
+
+def collect_files_from_dir(directory: str, target_subfolder: str = ""):
+    collected = []
+    base_search_path = os.path.join(directory, target_subfolder) if target_subfolder else directory
+    if not os.path.exists(base_search_path):
+        return collected
+
+    for root, _, files in os.walk(base_search_path):
+        if ".git" in root:
+            continue
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in TEXT_EXTENSIONS:
+                full_path = os.path.join(root, f)
+                rel_path = os.path.relpath(full_path, directory)
+                collected.append((rel_path, full_path))
+    return collected
 
 # --- SPEZIALPARSER FÜR KICAD, DRC & RULES ---
 def fast_parse_kicad(rel_path: str, raw_text: str) -> tuple[str, str]:
@@ -244,7 +265,7 @@ Dieses Symbol steht für die Netzlistenerzeugung via SKiDL unter dem Bauteilname
         return category_tag, markdown_content
 
 # --- FEINGLIEDRIGER AST & DOMAIN PARSER ---
-def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, cancel_event: threading.Event) -> tuple[str, str] | tuple[None, None]:
+def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama_client) -> tuple[str, str] | tuple[None, None]:
     filename = os.path.basename(rel_path)
     rel_lower = rel_path.lower()
 
@@ -258,9 +279,12 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, cancel
     if len(raw_code) > max_allowed_size:
         return None, None
 
+    # Unterdrückung von SyntaxWarnings durch ast.parse
     try:
-        tree = ast.parse(raw_code)
-    except SyntaxError:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(raw_code)
+    except Exception:
         return None, None
 
     has_skidl_instantiation = False
@@ -310,16 +334,15 @@ ERSTELLE FOLGENDE DREI ABSCHNITTE AUF DEUTSCH:
 
 Verändere den Code NICHT."""
 
-    # Streaming-LLM Call mit Abbruchprüfung
-    enrichment_text = call_ollama_chat_with_cancel(
-        model=active_model,
-        messages=[{'role': 'user', 'content': enrichment_prompt}],
-        options={"num_ctx": DEFAULT_NUM_CTX},
-        cancel_event=cancel_event
-    )
-
-    if enrichment_text is None:
-        return None, None  # Abbruch durch den Benutzer
+    try:
+        response = ollama_client.chat(
+            model=active_model,
+            messages=[{'role': 'user', 'content': enrichment_prompt}],
+            options={"num_ctx": DEFAULT_NUM_CTX}
+        )
+        enrichment_text = response['message']['content']
+    except Exception:
+        enrichment_text = f"**Zweck:** Python Modul ({rel_path})\n**Docstring:** {docstring}"
 
     code_snippet = raw_code[:12000] + ("\n# ... [Code gekürzt wegen Dateigröße]" if len(raw_code) > 12000 else "")
 
@@ -340,282 +363,263 @@ Verändere den Code NICHT."""
 """
     return category_tag, markdown_content
 
-# --- TASK MANAGER MIT OPTIMIERTEM ABBRUCH-HANDLING ---
-class IngestTaskManager:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.is_running = False
-        self.cancel_event = threading.Event()
-        self.log_messages = ["Inaktiv. Bereit für neuen Ingestion-Job."]
-        self.status_header = "⚪ Status: Inaktiv"
-        self.total_files = 0
-        self.processed_files = 0
-        self.current_thread = None
+# --- PROZESS WORKER (AUFGERUFEN IM EIGENEN OS-PROZESS) ---
+def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url):
+    temp_work_dir = None
+    try:
+        ollama_worker = ollama.Client(host=OLLAMA_HOST)
+        qdrant_worker = QdrantClient(url=QDRANT_HOST)
 
-    def append_log(self, text: str):
-        with self.lock:
-            self.log_messages.append(text)
+        category_info = CATEGORIES.get(category_key, CATEGORIES["⚡ PCB & Hardware Design"])
+        target_collection = category_info["collection"]
+        system_prompt = category_info["system_prompt"]
+        active_model = selected_model if selected_model else DEFAULT_MODEL
 
-    def set_status(self, header: str):
-        with self.lock:
-            self.status_header = header
+        session_id = str(uuid.uuid4())[:8]
+        temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
+        os.makedirs(temp_work_dir, exist_ok=True)
 
-    def get_ui_snapshot(self):
-        with self.lock:
-            full_log = "\n".join(self.log_messages)
-            return full_log, f"### {self.status_header}"
+        files_to_process = []
 
-    def request_cancel(self):
-        """Wird aufgerufen, wenn der Abbrechen-Button geklickt wird."""
-        with self.lock:
-            self.cancel_event.set()
-            self.is_running = False  # Gibt die UI SOFORT für neue Anfragen frei
-            self.status_header = "🔴 Status: ABGEBROCHEN"
-            self.append_log("\n🛑 Abbruch-Signal empfangen! Vorgang wurde umgehend beendet.")
-            full_log = "\n".join(self.log_messages)
-            return full_log, f"### {self.status_header}"
-
-    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url=""):
-        with self.lock:
-            if self.is_running:
-                self.append_log("⚠️ Ein Ingestion-Job läuft bereits. Bitte erst abbrechen...")
-                full_log = "\n".join(self.log_messages)
-                return full_log, f"### {self.status_header}"
-            
-            self.is_running = True
-            self.cancel_event.clear()
-            self.log_messages = []
-            self.processed_files = 0
-            self.total_files = 0
-            self.status_header = "🟢 Status: WIRD GESTARTET..."
-            
-            save_config({"last_model": selected_model, "last_category": category_key})
-
-            self.current_thread = threading.Thread(
-                target=self._run_job,
-                args=(files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url),
-                daemon=True
-            )
-            self.current_thread.start()
-            full_log = "\n".join(self.log_messages)
-            return full_log, f"### {self.status_header}"
-
-    def _run_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url):
-        temp_work_dir = None
-        try:
-            category_info = CATEGORIES.get(category_key, CATEGORIES["⚡ PCB & Hardware Design"])
-            target_collection = category_info["collection"]
-            system_prompt = category_info["system_prompt"]
-            active_model = selected_model if selected_model else DEFAULT_MODEL
-
-            session_id = str(uuid.uuid4())[:8]
-            temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
-            os.makedirs(temp_work_dir, exist_ok=True)
-
-            files_to_process = []
-
-            if mode == "repo_mining":
-                clean_repo_url = sanitize_url(mining_repo_url)
-                if not clean_repo_url:
-                    self.append_log("❌ Keine valide Repository-URL für das Mining angegeben.")
-                    self.set_status("🔴 Status: BEENDET (Ungültige URL)")
-                    return
-
-                self.append_log(f"⛏️ Starte Git-Mining via `git clone`: {clean_repo_url}")
-                mined_repo_dir = os.path.join(temp_work_dir, "mined_repo")
-                
-                res = subprocess.run(
-                    ["git", "clone", "--depth", "1", clean_repo_url, mined_repo_dir],
-                    capture_output=True, text=True
-                )
-
-                if res.returncode != 0:
-                    self.append_log(f"❌ Git-Clone fehlgeschlagen: {res.stderr[:300]}")
-                    self.set_status("🔴 Status: GIT CLONE FEHLER")
-                    return
-
-                self.append_log("   ↳ Repository erfolgreich geklont. Scanne Dateien...")
-                for root, _, filenames in os.walk(mined_repo_dir):
-                    if ".git" in root:
-                        continue
-                    for f in filenames:
-                        ext = os.path.splitext(f)[1].lower()
-                        if ext in TEXT_EXTENSIONS:
-                            full_p = os.path.join(root, f)
-                            rel_p = os.path.relpath(full_p, mined_repo_dir)
-                            repo_base_name = os.path.basename(clean_repo_url.rstrip("/"))
-                            files_to_process.append((f"{repo_base_name}/{rel_p}", full_p))
-
-            else:
-                if files:
-                    for file_item in files:
-                        fpath = file_item.name if hasattr(file_item, 'name') else (file_item.get('name') if isinstance(file_item, dict) else str(file_item))
-                        fname = os.path.basename(fpath)
-                        ext = os.path.splitext(fname)[1].lower()
-
-                        if ext == ".zip":
-                            self.append_log(f"📦 Entpacke ZIP: {fname}...")
-                            zip_extract_dir = os.path.join(temp_work_dir, f"zip_{uuid.uuid4()[:4]}")
-                            with zipfile.ZipFile(fpath, 'r') as zip_ref:
-                                zip_ref.extractall(zip_extract_dir)
-                            extracted = collect_files_from_dir(zip_extract_dir)
-                            files_to_process.extend(extracted)
-                        elif ext in TEXT_EXTENSIONS:
-                            files_to_process.append((fname, fpath))
-
-                if scanned_repo_path and os.path.exists(scanned_repo_path) and selected_folders:
-                    if "ALL_REPO" in selected_folders:
-                        repo_files = collect_files_from_dir(scanned_repo_path)
-                    else:
-                        repo_files = []
-                        for subfolder in selected_folders:
-                            repo_files.extend(collect_files_from_dir(scanned_repo_path, target_subfolder=subfolder))
-                    files_to_process.extend(repo_files)
-
-                if selected_exts:
-                    files_to_process = [
-                        (rel_p, full_p) for rel_p, full_p in files_to_process
-                        if os.path.splitext(rel_p)[1].lower() in selected_exts
-                    ]
-
-            files_to_process = list({rel_p: full_p for rel_p, full_p in files_to_process}.items())
-
-            if not files_to_process:
-                self.append_log("❌ Keine verwertbaren Dateien gefunden.")
-                self.set_status("🔴 Status: BEENDET (Keine Dateien)")
+        if mode == "repo_mining":
+            clean_repo_url = sanitize_url(mining_repo_url)
+            if not clean_repo_url:
+                log_list.append("❌ Keine valide Repository-URL für das Mining angegeben.")
+                status_dict["header"] = "🔴 Status: BEENDET (Ungültige URL)"
                 return
 
-            self.total_files = len(files_to_process)
-            self.append_log(f"📊 Gesamt: {self.total_files} Datei(en) bereit zur Indizierung.")
-            existing_hashes = get_indexed_hashes_set(target_collection)
-            self.append_log(f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
+            log_list.append(f"⛏️ Starte Git-Mining via `git clone`: {clean_repo_url}")
+            mined_repo_dir = os.path.join(temp_work_dir, "mined_repo")
+            
+            res = subprocess.run(
+                ["git", "clone", "--depth", "1", clean_repo_url, mined_repo_dir],
+                capture_output=True, text=True
+            )
 
-            for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
-                if self.cancel_event.is_set():
-                    self.append_log("\n🛑 Ingestion vorzeitig abgebrochen.")
-                    self.set_status(f"🔴 Status: ABGEBROCHEN ({self.processed_files}/{self.total_files})")
-                    return
+            if res.returncode != 0:
+                log_list.append(f"❌ Git-Clone fehlgeschlagen: {res.stderr[:300]}")
+                status_dict["header"] = "🔴 Status: GIT CLONE FEHLER"
+                return
 
-                self.processed_files = idx
-                self.set_status(f"🟢 Status: LÄUFT ({idx}/{self.total_files} - {os.path.basename(rel_path)})")
-
-                raw_text = extract_text_from_file(file_path)
-                if not raw_text.strip():
+            log_list.append("   ↳ Repository erfolgreich geklont. Scanne Dateien...")
+            for root, _, filenames in os.walk(mined_repo_dir):
+                if ".git" in root:
                     continue
+                for f in filenames:
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext in TEXT_EXTENSIONS:
+                        full_p = os.path.join(root, f)
+                        rel_p = os.path.relpath(full_p, mined_repo_dir)
+                        repo_base_name = os.path.basename(clean_repo_url.rstrip("/"))
+                        files_to_process.append((f"{repo_base_name}/{rel_p}", full_p))
 
-                content_hash = calculate_sha256(raw_text)
-                if (rel_path, content_hash) in existing_hashes:
-                    self.append_log(f"[{idx}/{self.total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
-                    continue
+        else:
+            if files:
+                for file_item in files:
+                    fpath = file_item.name if hasattr(file_item, 'name') else (file_item.get('name') if isinstance(file_item, dict) else str(file_item))
+                    fname = os.path.basename(fpath)
+                    ext = os.path.splitext(fname)[1].lower()
 
-                ext = os.path.splitext(rel_path)[1].lower()
+                    if ext == ".zip":
+                        log_list.append(f"📦 Entpacke ZIP: {fname}...")
+                        zip_extract_dir = os.path.join(temp_work_dir, f"zip_{uuid.uuid4()[:4]}")
+                        with zipfile.ZipFile(fpath, 'r') as zip_ref:
+                            zip_ref.extractall(zip_extract_dir)
+                        extracted = collect_files_from_dir(zip_extract_dir)
+                        files_to_process.extend(extracted)
+                    elif ext in TEXT_EXTENSIONS:
+                        files_to_process.append((fname, fpath))
 
-                try:
-                    if mode == "repo_mining" or ext == ".py":
-                        self.append_log(f"[{idx}/{self.total_files}] Hybrid AST-LLM Parse: {rel_path}")
-                        category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model, self.cancel_event)
-                        if self.cancel_event.is_set():
-                            self.append_log("\n🛑 Ingestion vorzeitig abgebrochen.")
-                            self.set_status(f"🔴 Status: ABGEBROCHEN ({self.processed_files}/{self.total_files})")
-                            return
-                        if not processed_md:
-                            self.append_log(f"   ⚠️ AST/Filter übersprungen (Kein SKiDL/API Code oder Build/Doku): {rel_path}")
-                            continue
+            if scanned_repo_path and os.path.exists(scanned_repo_path) and selected_folders:
+                if "ALL_REPO" in selected_folders:
+                    repo_files = collect_files_from_dir(scanned_repo_path)
+                else:
+                    repo_files = []
+                    for subfolder in selected_folders:
+                        repo_files.extend(collect_files_from_dir(scanned_repo_path, target_subfolder=subfolder))
+                files_to_process.extend(repo_files)
 
-                    elif ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".kicad_dru", ".rules"}:
-                        self.append_log(f"[{idx}/{self.total_files}] Fast-Pass Parsing (ohne LLM): {rel_path}")
-                        category_tag, processed_md = fast_parse_kicad(rel_path, raw_text)
+            if selected_exts:
+                files_to_process = [
+                    (rel_p, full_p) for rel_p, full_p in files_to_process
+                    if os.path.splitext(rel_p)[1].lower() in selected_exts
+                ]
 
-                    else:
-                        self.append_log(f"[{idx}/{self.total_files}] Verarbeite via LLM ({active_model}): {rel_path}")
-                        full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}"
-                        
-                        processed_md = call_ollama_chat_with_cancel(
-                            model=active_model,
-                            messages=[
-                                {'role': 'system', 'content': system_prompt},
-                                {'role': 'user', 'content': full_user_prompt}
-                            ],
-                            options={"num_ctx": DEFAULT_NUM_CTX},
-                            cancel_event=self.cancel_event
-                        )
-                        if self.cancel_event.is_set() or processed_md is None:
-                            self.append_log("\n🛑 Ingestion vorzeitig abgebrochen.")
-                            self.set_status(f"🔴 Status: ABGEBROCHEN ({self.processed_files}/{self.total_files})")
-                            return
+        files_to_process = list({rel_p: full_p for rel_p, full_p in files_to_process}.items())
 
-                        tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
-                        category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
+        if not files_to_process:
+            log_list.append("❌ Keine verwertbaren Dateien gefunden.")
+            status_dict["header"] = "🔴 Status: BEENDET (Keine Dateien)"
+            return
 
-                    if self.cancel_event.is_set():
-                        self.append_log("\n🛑 Ingestion vorzeitig abgebrochen.")
-                        self.set_status(f"🔴 Status: ABGEBROCHEN ({self.processed_files}/{self.total_files})")
-                        return
+        total_files = len(files_to_process)
+        log_list.append(f"📊 Gesamt: {total_files} Datei(en) bereit zur Indizierung.")
+        existing_hashes = get_indexed_hashes_set(qdrant_worker, target_collection)
+        log_list.append(f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
 
-                    embed_prompt = processed_md[:7500]
-                    try:
-                        embed_res = ollama_client.embeddings(
-                            model=EMBED_MODEL, 
-                            prompt=embed_prompt,
-                            options={"num_ctx": DEFAULT_NUM_CTX}
-                        )
-                    except Exception as embed_err:
-                        fallback_model = "bge-m3" if EMBED_MODEL != "bge-m3" else EMBED_MODEL
-                        self.append_log(f"   ⚠️ Embedding-Fehler bei {EMBED_MODEL} ({embed_err}). Versuche Fallback mit {fallback_model} (4000 Zeichen)...")
-                        embed_res = ollama_client.embeddings(
-                            model=fallback_model, 
-                            prompt=processed_md[:4000],
-                            options={"num_ctx": DEFAULT_NUM_CTX}
-                        )
+        for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
+            status_dict["header"] = f"🟢 Status: LÄUFT ({idx}/{total_files} - {os.path.basename(rel_path)})"
 
-                    if self.cancel_event.is_set():
-                        self.append_log("\n🛑 Ingestion vorzeitig abgebrochen.")
-                        self.set_status(f"🔴 Status: ABGEBROCHEN ({self.processed_files}/{self.total_files})")
-                        return
+            raw_text = extract_text_from_file(file_path)
+            if not raw_text.strip():
+                continue
 
-                    vector = embed_res['embedding']
+            content_hash = calculate_sha256(raw_text)
+            if (rel_path, content_hash) in existing_hashes:
+                log_list.append(f"[{idx}/{total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
+                continue
 
-                    ensure_qdrant_collection(target_collection, len(vector))
+            ext = os.path.splitext(rel_path)[1].lower()
 
-                    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{rel_path}"))
+            try:
+                if mode == "repo_mining" or ext == ".py":
+                    log_list.append(f"[{idx}/{total_files}] Hybrid AST-LLM Parse: {rel_path}")
+                    category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model, ollama_worker)
+                    if not processed_md:
+                        log_list.append(f"   ⚠️ AST/Filter übersprungen (Kein SKiDL/API Code oder Build/Doku): {rel_path}")
+                        continue
 
-                    qdrant_client.upsert(
-                        collection_name=target_collection,
-                        points=[
-                            PointStruct(
-                                id=point_id,
-                                vector=vector,
-                                payload={
-                                    "filename": os.path.basename(rel_path),
-                                    "file_path": rel_path,
-                                    "content_hash": content_hash,
-                                    "category_tag": category_tag,
-                                    "content": processed_md
-                                }
-                            )
-                        ]
+                elif ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".kicad_dru", ".rules"}:
+                    log_list.append(f"[{idx}/{total_files}] Fast-Pass Parsing (ohne LLM): {rel_path}")
+                    category_tag, processed_md = fast_parse_kicad(rel_path, raw_text)
+
+                else:
+                    log_list.append(f"[{idx}/{total_files}] Verarbeite via LLM ({active_model}): {rel_path}")
+                    full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:6000]}"
+                    response = ollama_worker.chat(
+                        model=active_model,
+                        messages=[
+                            {'role': 'system', 'content': system_prompt},
+                            {'role': 'user', 'content': full_user_prompt}
+                        ],
+                        options={"num_ctx": DEFAULT_NUM_CTX}
                     )
-                    
-                    self.append_log(f"   ✅ Indiziert in '{target_collection}' | **Tag: #{category_tag}**\n")
+                    processed_md = response['message']['content']
+                    tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
+                    category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
 
-                except Exception as e:
-                    self.append_log(f"   ❌ Fehler bei Verarbeitung: {str(e)}\n")
+                embed_prompt = processed_md[:7500]
+                try:
+                    embed_res = ollama_worker.embeddings(
+                        model=EMBED_MODEL, 
+                        prompt=embed_prompt,
+                        options={"num_ctx": DEFAULT_NUM_CTX}
+                    )
+                except Exception as embed_err:
+                    fallback_model = "bge-m3" if EMBED_MODEL != "bge-m3" else EMBED_MODEL
+                    log_list.append(f"   ⚠️ Embedding-Fehler bei {EMBED_MODEL} ({embed_err}). Versuche Fallback mit {fallback_model} (4000 Zeichen)...")
+                    embed_res = ollama_worker.embeddings(
+                        model=fallback_model, 
+                        prompt=processed_md[:4000],
+                        options={"num_ctx": DEFAULT_NUM_CTX}
+                    )
 
-            self.append_log(f"\n🎉 Ingestion abgeschlossen! Dokumente sind in Collection '{target_collection}' verfügbar.")
-            self.set_status(f"✅ Status: ABGESCHLOSSEN ({self.total_files}/{self.total_files})")
+                vector = embed_res['embedding']
 
-        except Exception as top_e:
-            self.append_log(f"\n❌ Unerwarteter Systemfehler: {str(top_e)}")
-            self.set_status("🔴 Status: FEHLER")
-        finally:
-            with self.lock:
-                self.is_running = False
-                self.cancel_event.clear()
-            if temp_work_dir and os.path.exists(temp_work_dir):
-                shutil.rmtree(temp_work_dir, ignore_errors=True)
-            self.append_log("✨ System ist wieder inaktiv und bereit für neue Anfragen.")
+                ensure_qdrant_collection(qdrant_worker, target_collection, len(vector))
 
-task_manager = IngestTaskManager()
+                point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{rel_path}"))
+
+                qdrant_worker.upsert(
+                    collection_name=target_collection,
+                    points=[
+                        PointStruct(
+                            id=point_id,
+                            vector=vector,
+                            payload={
+                                "filename": os.path.basename(rel_path),
+                                "file_path": rel_path,
+                                "content_hash": content_hash,
+                                "category_tag": category_tag,
+                                "content": processed_md
+                            }
+                        )
+                    ]
+                )
+                
+                log_list.append(f"   ✅ Indiziert in '{target_collection}' | **Tag: #{category_tag}**\n")
+
+            except Exception as e:
+                log_list.append(f"   ❌ Fehler bei Verarbeitung: {str(e)}\n")
+
+        log_list.append(f"\n🎉 Ingestion abgeschlossen! Dokumente sind in Collection '{target_collection}' verfügbar.")
+        status_dict["header"] = f"✅ Status: ABGESCHLOSSEN ({total_files}/{total_files})"
+
+    except Exception as top_e:
+        log_list.append(f"\n❌ Unerwarteter Systemfehler: {str(top_e)}")
+        status_dict["header"] = "🔴 Status: FEHLER"
+    finally:
+        status_dict["running"] = False
+        if temp_work_dir and os.path.exists(temp_work_dir):
+            shutil.rmtree(temp_work_dir, ignore_errors=True)
+        log_list.append("✨ System ist wieder inaktiv und bereit für neue Anfragen.")
+
+# --- INGEST TASK PROCESS MANAGER ---
+class IngestProcessManager:
+    def __init__(self):
+        self.process = None
+        self.manager = multiprocessing.Manager()
+        self.log_list = self.manager.list(["Inaktiv. Bereit für neuen Ingestion-Job."])
+        self.status_dict = self.manager.dict({"header": "⚪ Status: Inaktiv", "running": False})
+
+    def append_log(self, text: str):
+        self.log_list.append(text)
+
+    def set_status(self, header: str):
+        self.status_dict["header"] = header
+
+    def get_ui_snapshot(self):
+        full_log = "\n".join(list(self.log_list))
+        header = self.status_dict.get("header", "⚪ Status: Inaktiv")
+        return full_log, f"### {header}"
+
+    def is_alive(self):
+        return self.process is not None and self.process.is_alive()
+
+    def request_cancel(self):
+        """Beendet den Ingest-Prozess HARTE per SIGTERM/SIGKILL."""
+        if self.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=1.0)
+            if self.process.is_alive():
+                self.process.kill()
+            
+            self.status_dict["running"] = False
+            self.status_dict["header"] = "🔴 Status: ABGEBROCHEN"
+            self.log_list.append("\n🛑 Abbruch-Signal ausgeführt: Prozess wurde umgehend beendet.")
+            self.log_list.append("✨ System ist wieder inaktiv und bereit für neue Anfragen.")
+        else:
+            self.status_dict["header"] = "⚪ Status: Inaktiv"
+            self.status_dict["running"] = False
+            self.log_list.append("ℹ️ Kein aktiver Job zum Abbrechen vorhanden.")
+
+        return "\n".join(list(self.log_list)), f"### {self.status_dict['header']}"
+
+    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url=""):
+        if self.is_alive():
+            self.log_list.append("⚠️ Ein Ingestion-Job läuft derzeit noch. Bitte erst abbrechen...")
+            return f"### {self.status_dict['header']}"
+
+        # Vorherige Protokolle zurücksetzen
+        del self.log_list[:]
+        self.status_dict["header"] = "🟢 Status: WIRD GESTARTET..."
+        self.status_dict["running"] = True
+        
+        save_config({"last_model": selected_model, "last_category": category_key})
+
+        self.process = multiprocessing.Process(
+            target=worker_process_entry,
+            args=(
+                self.log_list, self.status_dict, files, scanned_repo_path, 
+                selected_folders, selected_exts, category_key, selected_model, 
+                mode, mining_repo_url
+            ),
+            daemon=True
+        )
+        self.process.start()
+        return f"### {self.status_dict['header']}"
+
+task_manager = IngestProcessManager()
 
 # --- HILFSFUNKTIONEN UI & GIT ---
 def get_ollama_models():
@@ -623,6 +627,7 @@ def get_ollama_models():
     saved_model = config.get("last_model", DEFAULT_MODEL)
 
     try:
+        ollama_client = ollama.Client(host=OLLAMA_HOST)
         res = ollama_client.list()
         models_data = res.get('models', []) if isinstance(res, dict) else getattr(res, 'models', [])
         choices = []
@@ -648,49 +653,6 @@ def get_ollama_models():
         print(f"Fehler beim Abrufen der Ollama-Modelle: {e}")
     
     return [(f"{DEFAULT_MODEL} (💻 Lokal)", DEFAULT_MODEL)], DEFAULT_MODEL
-
-def ensure_qdrant_collection(collection_name: str, vector_size: int):
-    collections = [c.name for c in qdrant_client.get_collections().collections]
-    if collection_name not in collections:
-        qdrant_client.create_collection(
-            collection_name=collection_name,
-            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
-        )
-
-def calculate_sha256(text: str) -> str:
-    return hashlib.sha256(text.encode('utf-8')).hexdigest()
-
-def extract_text_from_file(file_path: str) -> str:
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".pdf":
-        try:
-            reader = PdfReader(file_path)
-            return "\n".join([page.extract_text() or "" for page in reader.pages])
-        except Exception:
-            return ""
-    else:
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
-        except Exception:
-            return ""
-
-def collect_files_from_dir(directory: str, target_subfolder: str = ""):
-    collected = []
-    base_search_path = os.path.join(directory, target_subfolder) if target_subfolder else directory
-    if not os.path.exists(base_search_path):
-        return collected
-
-    for root, _, files in os.walk(base_search_path):
-        if ".git" in root:
-            continue
-        for f in files:
-            ext = os.path.splitext(f)[1].lower()
-            if ext in TEXT_EXTENSIONS:
-                full_path = os.path.join(root, f)
-                rel_path = os.path.relpath(full_path, directory)
-                collected.append((rel_path, full_path))
-    return collected
 
 def handle_folder_selection(selected):
     if not selected:
@@ -951,7 +913,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
             files, repo, f_cb, e_cb, cat, mod, mode="standard"
         ),
         inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown],
-        outputs=[status_output, status_banner]
+        outputs=[status_banner]
     )
 
     start_mining_btn.click(
@@ -959,7 +921,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
             None, None, None, None, cat, mod, mode="repo_mining", mining_repo_url=url
         ),
         inputs=[category_dropdown, model_dropdown, mining_repo_input],
-        outputs=[status_output, status_banner]
+        outputs=[status_banner]
     )
 
     stop_btn.click(
