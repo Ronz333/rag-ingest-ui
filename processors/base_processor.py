@@ -1,8 +1,7 @@
 """
 BASE INGESTION PROCESSOR PLUGIN TEMPLATE
 ----------------------------------------
-Abstrakte Basisklasse für alle RAG-Ingestion-Processoren.
-Jedes Modul steuert seine eigenen Prompts, AST/Regex-Analysen und Dateiendungen.
+Abstrakte Basisklasse mit erweiterter Relevanz-Prüfung für GUI-Kategorien.
 """
 
 from abc import ABC, abstractmethod
@@ -10,21 +9,14 @@ from typing import Tuple, Set, Optional
 
 
 class BaseProcessor(ABC):
-    # Eindeutiger Kategorie-Name für das Webpanel Dropdown
     category_key: str = "Allgemeines Wissen"
-    
-    # Qdrant Collection Zielname
-    collection_name: str = "general_knowledge_base"
-    
-    # Der spezifische Ingestion-Systemprompt für dieses Modul
+    collection_name = "general_knowledge_base"
     system_prompt: str = ""
-    
-    # Set aller unterstützten Dateiendungen (z. B. {".py"})
     supported_extensions: Set[str] = set()
 
     @abstractmethod
-    def can_handle(self, rel_path: str, ext: str) -> bool:
-        """Prüft, ob dieser Processor für die angegebene Datei zuständig ist."""
+    def can_handle(self, rel_path: str, ext: str, selected_category: str = "") -> bool:
+        """Prüft, ob dieser Processor für Dateiendung und gewählte Kategorie zuständig ist."""
         pass
 
     @abstractmethod
@@ -35,10 +27,14 @@ class BaseProcessor(ABC):
         active_model: str, 
         ollama_client, 
         num_ctx: int, 
-        max_code_len: int
+        max_code_len: int,
+        selected_category: str = ""
     ) -> Tuple[Optional[str], Optional[str]]:
         """
-        Analysiert die Datei und gibt ein Tupel zurück:
-        (category_tag, markdown_content) oder (None, None) falls übersprungen.
+        Analysiert die Datei.
+        Rückgabe-Optionen:
+        - (category_tag, markdown_content) bei Erfolg.
+        - ("IGNORED", "SKIP") wenn die Datei für die gewählte Kategorie irrelevant ist.
+        - (None, None) wenn die Datei nicht verarbeitet werden kann.
         """
         pass
