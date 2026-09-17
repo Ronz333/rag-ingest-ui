@@ -10,7 +10,6 @@ import ast
 import warnings
 import subprocess
 import multiprocessing
-from datetime import datetime
 import gradio as gr
 import ollama
 from qdrant_client import QdrantClient
@@ -71,7 +70,6 @@ STRIKTE REGELN:
 
 # --- LOGGING HELPER MIT LOKALER ZEITZEILE ---
 def log_msg(log_list, text: str):
-    # Verwendet time.localtime() für eine zuverlässige lokale Zeitzonen-Darstellung
     timestamp = time.strftime("%H:%M:%S", time.localtime())
     log_list.append(f"[{timestamp}] {text}")
 
@@ -176,6 +174,13 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
                 rel_path = os.path.relpath(full_path, directory)
                 collected.append((rel_path, full_path))
     return collected
+
+def unload_ollama_model(ollama_client, model_name: str):
+    """Zwingt Ollama dazu, ein geladenes Modell umgehend aus dem VRAM zu entladen."""
+    try:
+        ollama_client.chat(model=model_name, messages=[], keep_alive=0)
+    except Exception:
+        pass
 
 # --- SPEZIALPARSER FÜR KICAD, DRC & RULES ---
 def fast_parse_kicad(rel_path: str, raw_text: str, max_code_len: int) -> tuple[str, str]:
@@ -286,7 +291,7 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
         any(p in rel_lower for p in ["/src/skidl/", "skidl/skidl/", "/skidl/src/"])
         or filename.lower() in SKIDL_CORE_FILES
     )
-    is_pcbnew_plugin = "pcbnew" in rel_lower or "action_plugin" in rel_lower
+    is_pcbnew_plugin = "pcbnew" in rel_lower or "action_plugin" in rel_lower or "kicad" in rel_lower
 
     max_allowed_size = 300000 if (is_skidl_api_internal or is_pcbnew_plugin) else 100000
     if len(raw_code) > max_allowed_size:
@@ -299,7 +304,6 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
     except Exception:
         return None, None
 
-    # Dynamische Extraktion aller definierten Klassen und Funktionen/Methoden aus dem AST
     extracted_elements = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -307,26 +311,6 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
                 extracted_elements.add(f"method:{node.name}()")
         elif isinstance(node, ast.ClassDef):
             extracted_elements.add(f"class:{node.name}")
-
-    has_skidl_content = is_skidl_api_internal or is_pcbnew_plugin
-    if not has_skidl_content:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef) and node.name in ["Circuit", "Part", "Net", "Bus", "SubCircuit", "Package"]:
-                has_skidl_content = True
-                break
-            if isinstance(node, ast.Call):
-                func_name = ""
-                if isinstance(node.func, ast.Name):
-                    func_name = node.func.id
-                elif isinstance(node.func, ast.Attribute):
-                    func_name = node.func.attr
-                
-                if func_name in ["Part", "Net", "Bus", "generate_netlist", "generate_pcb", "subcircuit", "Circuit"]:
-                    has_skidl_content = True
-                    break
-
-    if not has_skidl_content:
-        return None, None
 
     docstring = ast.get_docstring(tree) or "Kein Modul-Docstring vorhanden"
     imports = []
@@ -343,10 +327,10 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
         tag_title = f"SKiDL API Modul: {filename}"
     elif is_pcbnew_plugin:
         category_tag = "KICAD_PCBNEW"
-        tag_title = f"KiCad PCBNew Plugin: {filename}"
+        tag_title = f"KiCad / PCBNew Plugin: {filename}"
     else:
-        category_tag = "SKIDL_GOLDEN_EXAMPLE"
-        tag_title = f"Golden Example: {filename}"
+        category_tag = "CODE_DOCUMENTATION"
+        tag_title = f"Source Modul: {filename}"
 
     elements_checklist = ", ".join(sorted(list(extracted_elements))) if extracted_elements else "Keine spezifischen Methoden extrahiert"
     full_code_for_llm = raw_code[:max_code_len]
@@ -364,11 +348,11 @@ STRIKTE REGELN FÜR ABSCHNITT 3:
 a) ERZWUNGENE AST-ABDECKUNG: Generiere ZWINGEND für JEDES der folgenden im Code erkannten Elemente mindestens eine spezifische Steuerungs-/Anwendungsfrage:
    [{elements_checklist}]
 b) MANDATORISCHE STEUERUNGSDIMENSIONEN: Deckt gezielt folgende Bereiche ab, sofern im Code vorhanden:
-   - State Cleansing & Cleanup (z. B. cull_unconnected_parts, reset, mini_reset, disconnect)
-   - Vergleich & Struktur-Export (z. B. to_tuple, Netlist-, PCB-, SVG-, DOT-Generierung)
-   - Pipeline & Headless-Steuerung (z. B. no_files Flag, Logging, File Suppression)
-   - Scoping & Context-Management (Hierarchieebenen, Context-Manager __enter__/__exit__, activate/deactivate)
-   - Regel- & Parameterverwaltung (ERC/DRC, netclasses, partclasses, unique names)
+   - State Cleansing & Cleanup
+   - Vergleich & Struktur-Export
+   - Pipeline & Headless-Steuerung
+   - Scoping & Context-Management
+   - Regel- & Parameterverwaltung
 c) FORMULIERUNG: Verwende AUSSCHLIESSLICH "Wie steuere / nutze / erstelle / vergleiche / konfiguriere ich X mit dieser API?"-Fragen. Stelle KEINE Fragen zu temporären Zuständen einer konkreten Beispielschaltung (z. B. NICHT: "Wie viele Bauteile/Busse sind enthalten?").
 
 Verändere den Quelltext/Inhalt NICHT."""
@@ -402,8 +386,8 @@ Verändere den Quelltext/Inhalt NICHT."""
 """
     return category_tag, markdown_content
 
-# --- PROZESS WORKER (AUFGERUFEN IM EIGENEN OS-PROZESS) ---
-def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars):
+# --- PROZESS WORKER MIT PHASE-BATCHING & VRAM-ENTLASTUNG ---
+def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size):
     temp_work_dir = None
     try:
         ollama_worker = ollama.Client(host=OLLAMA_HOST)
@@ -492,99 +476,160 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             return
 
         total_files = len(files_to_process)
+        total_batches = (total_files + batch_size - 1) // batch_size
         log_msg(log_list, f"📊 Gesamt: {total_files} Datei(en) bereit zur Indizierung.")
-        log_msg(log_list, f"⚙️ Konfiguration: Context={num_ctx} Tokens | Embedding Limit={max_embed_chars} Chars")
+        log_msg(log_list, f"⚙️ Modus: Phase-Batching ({batch_size} Dateien/Batch -> {total_batches} Batches total)")
+        log_msg(log_list, f"⚙️ Konfiguration: Context={num_ctx} Tokens | Max Embed Chars={max_embed_chars}")
+        
         existing_hashes = get_indexed_hashes_set(qdrant_worker, target_collection)
         log_msg(log_list, f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
 
-        for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
-            file_start_time = time.time()
-            status_dict["header"] = f"🟢 Status: LÄUFT ({idx}/{total_files} - {os.path.basename(rel_path)})"
+        # Outer Loop: Verarbeite Dateien in Chunks der konfigurierten Batch-Größe
+        for batch_idx in range(0, total_files, batch_size):
+            chunk = files_to_process[batch_idx : batch_idx + batch_size]
+            current_batch_num = (batch_idx // batch_size) + 1
 
-            raw_text = extract_text_from_file(file_path)
-            if not raw_text.strip():
-                continue
+            log_msg(log_list, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            log_msg(log_list, f"📦 STARTE BATCH {current_batch_num}/{total_batches} ({len(chunk)} Dateien in diesem Durchlauf)")
+            log_msg(log_list, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-            content_hash = calculate_sha256(raw_text)
-            if (rel_path, content_hash) in existing_hashes:
-                log_msg(log_list, f"[{idx}/{total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
-                continue
+            batch_prepared_items = []
+            used_llm_in_this_batch = False
 
-            ext = os.path.splitext(rel_path)[1].lower()
+            # --- PHASE A: TEXTANALYSE & MARKDOWN GENERIERUNG (LLM MODELL BELEGT VRAM) ---
+            log_msg(log_list, f"🧠 Phase A [Batch {current_batch_num}]: Analysiere und strukturiere Dokumente...")
+            for idx_in_chunk, (rel_path, file_path) in enumerate(chunk, 1):
+                global_idx = batch_idx + idx_in_chunk
+                status_dict["header"] = f"🟢 Status: LÄUFT (Batch {current_batch_num}/{total_batches} | Datei {global_idx}/{total_files})"
 
-            try:
-                if mode == "repo_mining" or ext == ".py":
-                    log_msg(log_list, f"[{idx}/{total_files}] Hybrid AST-LLM Parse: {rel_path}")
-                    category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model, ollama_worker, num_ctx, max_embed_chars)
-                    if not processed_md:
-                        log_msg(log_list, f"   ⚠️ AST/Filter übersprungen (Kein SKiDL/API Code oder Build/Doku): {rel_path}")
-                        continue
+                raw_text = extract_text_from_file(file_path)
+                if not raw_text.strip():
+                    continue
 
-                elif ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".kicad_dru", ".rules"}:
-                    log_msg(log_list, f"[{idx}/{total_files}] Fast-Pass Parsing (ohne LLM): {rel_path}")
-                    category_tag, processed_md = fast_parse_kicad(rel_path, raw_text, max_embed_chars)
+                content_hash = calculate_sha256(raw_text)
+                if (rel_path, content_hash) in existing_hashes:
+                    log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
+                    continue
 
-                else:
-                    log_msg(log_list, f"[{idx}/{total_files}] Verarbeite via LLM ({active_model}): {rel_path}")
-                    full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:12000]}"
-                    response = ollama_worker.chat(
-                        model=active_model,
-                        messages=[
-                            {'role': 'system', 'content': system_prompt},
-                            {'role': 'user', 'content': full_user_prompt}
-                        ],
-                        options={"num_ctx": num_ctx}
-                    )
-                    processed_md = response['message']['content']
-                    tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
-                    category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
+                ext = os.path.splitext(rel_path)[1].lower()
+                parse_start_time = time.time()
 
-                embed_prompt = processed_md[:max_embed_chars]
                 try:
-                    embed_res = ollama_worker.embeddings(
-                        model=EMBED_MODEL, 
-                        prompt=embed_prompt,
-                        options={"num_ctx": num_ctx}
-                    )
-                except Exception as embed_err:
-                    fallback_model = "bge-m3" if EMBED_MODEL != "bge-m3" else EMBED_MODEL
-                    log_msg(log_list, f"   ⚠️ Embedding-Fehler bei {EMBED_MODEL} ({embed_err}). Versuche Fallback mit {fallback_model} (4000 Zeichen)...")
-                    embed_res = ollama_worker.embeddings(
-                        model=fallback_model, 
-                        prompt=processed_md[:4000],
-                        options={"num_ctx": num_ctx}
-                    )
+                    if mode == "repo_mining" or ext == ".py":
+                        log_msg(log_list, f"[{global_idx}/{total_files}] Hybrid AST-LLM Parse: {rel_path}")
+                        used_llm_in_this_batch = True
+                        category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model, ollama_worker, num_ctx, max_embed_chars)
+                        if not processed_md:
+                            log_msg(log_list, f"   ⚠️ Übersprungen (Kein SKiDL/API Code oder Build/Doku): {rel_path}")
+                            continue
 
-                vector = embed_res['embedding']
+                    elif ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".kicad_dru", ".rules"}:
+                        log_msg(log_list, f"[{global_idx}/{total_files}] Fast-Pass Parsing (ohne LLM): {rel_path}")
+                        category_tag, processed_md = fast_parse_kicad(rel_path, raw_text, max_embed_chars)
 
-                ensure_qdrant_collection(qdrant_worker, target_collection, len(vector))
-
-                point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{rel_path}"))
-
-                qdrant_worker.upsert(
-                    collection_name=target_collection,
-                    points=[
-                        PointStruct(
-                            id=point_id,
-                            vector=vector,
-                            payload={
-                                "filename": os.path.basename(rel_path),
-                                "file_path": rel_path,
-                                "content_hash": content_hash,
-                                "category_tag": category_tag,
-                                "content": processed_md
-                            }
+                    else:
+                        log_msg(log_list, f"[{global_idx}/{total_files}] Verarbeite via LLM ({active_model}): {rel_path}")
+                        used_llm_in_this_batch = True
+                        full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:12000]}"
+                        response = ollama_worker.chat(
+                            model=active_model,
+                            messages=[
+                                {'role': 'system', 'content': system_prompt},
+                                {'role': 'user', 'content': full_user_prompt}
+                            ],
+                            options={"num_ctx": num_ctx}
                         )
-                    ]
-                )
-                
-                file_duration = time.time() - file_start_time
-                log_msg(log_list, f"   ✅ Indiziert in '{target_collection}' in {file_duration:.2f}s | **Tag: #{category_tag}**\n")
+                        processed_md = response['message']['content']
+                        tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
+                        category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
 
-            except Exception as e:
-                log_msg(log_list, f"   ❌ Fehler bei Verarbeitung: {str(e)}\n")
+                    parse_duration = time.time() - parse_start_time
+                    batch_prepared_items.append({
+                        "rel_path": rel_path,
+                        "content_hash": content_hash,
+                        "category_tag": category_tag,
+                        "processed_md": processed_md,
+                        "parse_duration": parse_duration,
+                        "global_idx": global_idx
+                    })
 
-        log_msg(log_list, f"\n🎉 Ingestion abgeschlossen! Dokumente sind in Collection '{target_collection}' verfügbar.")
+                except Exception as parse_err:
+                    log_msg(log_list, f"   ❌ Analyse-Fehler bei {rel_path}: {str(parse_err)}")
+
+            # --- VRAM SWITCH: ENTLEERE LLM-MODELL AUS DEM SPEICHER ---
+            if used_llm_in_this_batch:
+                log_msg(log_list, f"🔄 Phase A abgeschlossen. Entlade Anwendungs-LLM ({active_model}) aus dem VRAM...")
+                unload_ollama_model(ollama_worker, active_model)
+                time.sleep(1.5)
+
+            if not batch_prepared_items:
+                log_msg(log_list, f"ℹ️ Batch {current_batch_num} enthält keine neu zu indizierenden Dateien.\n")
+                continue
+
+            # --- PHASE B: VEKTORISIERUNG & QDRANT UPSERT (EMBEDDING MODELL BELEGT VRAM) ---
+            log_msg(log_list, f"📐 Phase B [Batch {current_batch_num}]: Erzeuge Embeddings ({EMBED_MODEL}) & speichere in Qdrant...")
+            for prep_item in batch_prepared_items:
+                rel_path = prep_item["rel_path"]
+                content_hash = prep_item["content_hash"]
+                category_tag = prep_item["category_tag"]
+                processed_md = prep_item["processed_md"]
+                parse_dur = prep_item["parse_duration"]
+                global_idx = prep_item["global_idx"]
+
+                embed_start_time = time.time()
+                embed_prompt = processed_md[:max_embed_chars]
+
+                try:
+                    try:
+                        embed_res = ollama_worker.embeddings(
+                            model=EMBED_MODEL, 
+                            prompt=embed_prompt,
+                            options={"num_ctx": num_ctx}
+                        )
+                    except Exception as embed_err:
+                        log_msg(log_list, f"   ⚠️ Embedding-Fehler bei {EMBED_MODEL} ({embed_err}). Versuche verkleinerten Prompt (8000 Chars)...")
+                        time.sleep(2)  # Kurze GPU-Erholungszeit nach Vulkan/VRAM Reset
+                        embed_res = ollama_worker.embeddings(
+                            model=EMBED_MODEL, 
+                            prompt=processed_md[:8000],
+                            options={"num_ctx": num_ctx}
+                        )
+
+                    vector = embed_res['embedding']
+                    ensure_qdrant_collection(qdrant_worker, target_collection, len(vector))
+                    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{rel_path}"))
+
+                    qdrant_worker.upsert(
+                        collection_name=target_collection,
+                        points=[
+                            PointStruct(
+                                id=point_id,
+                                vector=vector,
+                                payload={
+                                    "filename": os.path.basename(rel_path),
+                                    "file_path": rel_path,
+                                    "content_hash": content_hash,
+                                    "category_tag": category_tag,
+                                    "content": processed_md
+                                }
+                            )
+                        ]
+                    )
+
+                    embed_dur = time.time() - embed_start_time
+                    total_file_dur = parse_dur + embed_dur
+                    log_msg(log_list, f"[{global_idx}/{total_files}] ✅ Indiziert in {total_file_dur:.2f}s (Analyse: {parse_dur:.2f}s | Embed: {embed_dur:.2f}s) | **#{category_tag}**: {rel_path}")
+
+                except Exception as upsert_err:
+                    log_msg(log_list, f"   ❌ Indizierungs-Fehler bei {rel_path}: {str(upsert_err)}")
+
+            # --- VRAM CLEANUP: ENTLEERE EMBEDDING-MODELL VOR NÄCHSTEM BATCH ---
+            log_msg(log_list, f"🔄 Phase B abgeschlossen. Entlade Embedding-Modell ({EMBED_MODEL}) aus dem VRAM...")
+            unload_ollama_model(ollama_worker, EMBED_MODEL)
+            time.sleep(1.5)
+            log_msg(log_list, f"✅ Batch {current_batch_num}/{total_batches} vollständig in Qdrant verankert!\n")
+
+        log_msg(log_list, f"🎉 Ingestion erfolgreich beendet! Alle Dokumente sind in Collection '{target_collection}' verfügbar.")
         status_dict["header"] = f"✅ Status: ABGESCHLOSSEN ({total_files}/{total_files})"
 
     except Exception as top_e:
@@ -638,7 +683,7 @@ class IngestProcessManager:
 
         return "\n".join(list(self.log_list)), f"### {self.status_dict['header']}"
 
-    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url="", num_ctx=32768, max_embed_chars=50000):
+    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url="", num_ctx=32768, max_embed_chars=50000, batch_size=25):
         if self.is_alive():
             log_msg(self.log_list, "⚠️ Ein Ingestion-Job läuft derzeit noch. Bitte erst abbrechen...")
             return f"### {self.status_dict['header']}"
@@ -651,7 +696,8 @@ class IngestProcessManager:
             "last_model": selected_model, 
             "last_category": category_key,
             "last_num_ctx": num_ctx,
-            "last_max_embed_chars": max_embed_chars
+            "last_max_embed_chars": max_embed_chars,
+            "last_batch_size": batch_size
         })
 
         self.process = multiprocessing.Process(
@@ -659,7 +705,7 @@ class IngestProcessManager:
             args=(
                 self.log_list, self.status_dict, files, scanned_repo_path, 
                 selected_folders, selected_exts, category_key, selected_model, 
-                mode, mining_repo_url, num_ctx, max_embed_chars
+                mode, mining_repo_url, num_ctx, max_embed_chars, batch_size
             ),
             daemon=True
         )
@@ -864,6 +910,7 @@ saved_cfg = load_config()
 initial_default_category = saved_cfg.get("last_category", list(CATEGORIES.keys())[0])
 initial_num_ctx = saved_cfg.get("last_num_ctx", 32768)
 initial_max_embed_chars = saved_cfg.get("last_max_embed_chars", 50000)
+initial_batch_size = saved_cfg.get("last_batch_size", 25)
 
 with gr.Blocks(title="Universal RAG Control Center") as demo:
     repo_state = gr.State("")
@@ -893,6 +940,14 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
             )
 
             with gr.Accordion("⚙️ Kontext- & Performance-Einstellungen", open=True):
+                batch_size_slider = gr.Slider(
+                    minimum=5, 
+                    maximum=200, 
+                    step=5, 
+                    value=initial_batch_size, 
+                    label="Batch-Größe (Dateien pro Wechsel)",
+                    info="Legt fest, nach wie vielen analysierten Dateien VRAM entladen und Embeddings in Qdrant gespeichert werden."
+                )
                 num_ctx_slider = gr.Slider(
                     minimum=4096, 
                     maximum=32768, 
@@ -976,18 +1031,18 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     folder_checkboxes.change(fn=handle_folder_selection, inputs=[folder_checkboxes], outputs=[folder_checkboxes])
 
     start_btn.click(
-        fn=lambda files, repo, f_cb, e_cb, cat, mod, ctx, chars: task_manager.start_background_job(
-            files, repo, f_cb, e_cb, cat, mod, mode="standard", num_ctx=ctx, max_embed_chars=chars
+        fn=lambda files, repo, f_cb, e_cb, cat, mod, ctx, chars, batch: task_manager.start_background_job(
+            files, repo, f_cb, e_cb, cat, mod, mode="standard", num_ctx=ctx, max_embed_chars=chars, batch_size=batch
         ),
-        inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown, num_ctx_slider, embed_chars_slider],
+        inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown, num_ctx_slider, embed_chars_slider, batch_size_slider],
         outputs=[status_banner]
     )
 
     start_mining_btn.click(
-        fn=lambda cat, mod, url, ctx, chars: task_manager.start_background_job(
-            None, None, None, None, cat, mod, mode="repo_mining", mining_repo_url=url, num_ctx=ctx, max_embed_chars=chars
+        fn=lambda cat, mod, url, ctx, chars, batch: task_manager.start_background_job(
+            None, None, None, None, cat, mod, mode="repo_mining", mining_repo_url=url, num_ctx=ctx, max_embed_chars=chars, batch_size=batch
         ),
-        inputs=[category_dropdown, model_dropdown, mining_repo_input, num_ctx_slider, embed_chars_slider],
+        inputs=[category_dropdown, model_dropdown, mining_repo_input, num_ctx_slider, embed_chars_slider, batch_size_slider],
         outputs=[status_banner]
     )
 
