@@ -1,7 +1,7 @@
 """
 JAVASCRIPT & TYPESCRIPT INGESTION PROCESSOR
 -------------------------------------------
-Analysiert JavaScript-, TypeScript- und Node.js-Codebases.
+Analysiert JS/TS Codebases. Reagiert im PCB-Modus nur auf spezifische EDA-Plugins.
 """
 
 import os
@@ -17,12 +17,22 @@ class JavaScriptProcessor(BaseProcessor):
     collection_name = "programming_knowledge_base"
     supported_extensions = {".js", ".jsx", ".ts", ".tsx", ".mjs"}
 
+    PCB_CATEGORY = "⚡ PCB & Hardware Design"
+    PCB_KEYWORDS = {"easyeda", "kicad", "pcb", "gerber", "bom", "eda"}
+
     system_prompt = """Du bist ein Ingestion-Agent für JavaScript/TypeScript-Code.
 Analysiere den Code strikt faktengetreu und erstelle ein strukturiertes Markdown-Dokument."""
 
     IGNORED_PATH_PARTS = ["/node_modules/", "/dist/", "/build/", "/.next/", "/.git/"]
 
-    def can_handle(self, rel_path: str, ext: str) -> bool:
+    def _is_pcb_relevant(self, rel_path: str, raw_code: str) -> bool:
+        rel_lower = rel_path.lower()
+        if any(kw in rel_lower for kw in self.PCB_KEYWORDS):
+            return True
+        code_snippet = raw_code[:3000].lower()
+        return any(kw in code_snippet for kw in self.PCB_KEYWORDS)
+
+    def can_handle(self, rel_path: str, ext: str, selected_category: str = "") -> bool:
         rel_lower = rel_path.lower()
         if any(p in rel_lower for p in self.IGNORED_PATH_PARTS):
             return False
@@ -35,10 +45,14 @@ Analysiere den Code strikt faktengetreu und erstelle ein strukturiertes Markdown
         active_model: str, 
         ollama_client, 
         num_ctx: int, 
-        max_code_len: int
+        max_code_len: int,
+        selected_category: str = ""
     ) -> Tuple[Optional[str], Optional[str]]:
+        if selected_category == self.PCB_CATEGORY and not self._is_pcb_relevant(rel_path, raw_code):
+            return "IGNORED", "SKIP"
+
         if len(raw_code) > 300000:
-            return None, None
+            return "IGNORED", "SKIP"
 
         filename = os.path.basename(rel_path)
 
