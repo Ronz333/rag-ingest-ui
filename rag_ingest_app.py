@@ -1,6 +1,7 @@
 import os
 import re
 import uuid
+import time
 import shutil
 import zipfile
 import hashlib
@@ -47,10 +48,8 @@ STRIKTE REGELN:
    [TAG: SKIDL_API], [TAG: SKIDL_GOLDEN_EXAMPLE], [TAG: KICAD_FOOTPRINT], [TAG: KICAD_SYM], [TAG: KICAD_DRC_RULES], [TAG: FREEROUTING_RULES].
 2. ABSOLUTES HALLUZINATIONSVERBOT: Verarbeite Dateinamen und Inhalt strikt faktengetreu.
 3. INHALTS-INTEGRITÄT: Bette bereitgestellten Quellcode, S-Expressions oder Routing-Regeln 1:1 im passenden Codeblock ein.
-4. EXHAUSTIVE AGENTEN-FRAGEN: Erstelle eine VOLLSTÄNDIGE, UNBEGRENZTE Liste aller Fragen, die ein autonomer AI-PCB-Designer an diese Datei stellen könnte. Passe die Fragen dynamisch an den Dateityp an:
-   - Bei Python/SKiDL: Fragen zu API-Methoden, Scoping, Modifikationen, State-Management, ERC und Exporten.
-   - Bei KiCad Footprints/Symbols: Fragen zu Pin/Pad-Mappings, Pin-Funktionen, Geometrien, Package-Typen und Footprint-Filtern.
-   - Bei DRC & FreeRouting Rules: Fragen zu Leiterbahnbreiten, Minimum Clearances, Via-Spezifikationen, Layer-Regeln und Netzklassen."""
+4. EXHAUSTIVE AGENTEN-FRAGEN: Erstelle eine VOLLSTÄNDIGE, UNBEGRENZTE Liste von Entwickler- und Agenten-Steuerungsfragen.
+   WICHTIG: Formuliere AUSSCHLIESSLICH "Wie steuere / nutze / erstelle / vergleiche / konfiguriere ich X mit dieser API oder Spezifikation?"-Fragen (z. B. zu Methoden, Parametern, Flags, Operatoren, Context-Managern, Scoping, State-Reset, Footprint-Formaten oder Clearance-Limits). Stelle KEINE Fragen zum temporären Zustand einer konkreten Beispielschaltung (z. B. NICHT: "Wie viele Bauteile sind in der Schaltung enthalten?")."""
     },
     "💻 Programmiersprachen & Software": {
         "collection": "programming_knowledge_base",
@@ -70,9 +69,9 @@ STRIKTE REGELN:
     }
 }
 
-# --- LOGGING HELPER MIT ZEITSTEMPEL ---
+# --- LOGGING HELPER MIT LOKALER ZEITZEILE ---
 def log_msg(log_list, text: str):
-    timestamp = datetime.now().strftime("%H:%M:%S")
+    timestamp = datetime.now().astimezone().strftime("%H:%M:%S")
     log_list.append(f"[{timestamp}] {text}")
 
 # --- SANITIZATION & CONFIG HELPERS ---
@@ -345,9 +344,10 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
 ERSTELLE FOLGENDE ABSCHNITTE AUF DEUTSCH:
 1. Zweck: (Strukturierte Zusammenfassung der Funktion, Modulrolle oder Regeldefinition)
 2. Hauptkomponenten & Schnittstellen: (Liste aller Klassen, Methoden, Operatoren, Parameter, Pads, Pin-Belegungen oder Layout-Regeln)
-3. Autonome Agenten- & API-Anwendungsfragen: Erstelle eine VOLLSTÄNDIGE, UNBEGRENZTE Liste präziser Fragen, die ein autonomer Agent durch diese Datei beantworten kann. 
+3. Autonome Agenten- & API-Anwendungsfragen: Erstelle eine VOLLSTÄNDIGE, UNBEGRENZTE Liste präziser Steuerungs- und Programmierfragen, die ein autonomer Agent durch diese Datei beantworten kann.
 
-Passe die Fragestellungen strikt an den vorliegenden Gegenstand an (z. B. API-Steuerung bei Code, Footprint/Pad-Details bei KiCad-Dateien oder Clearance/Routing-Grenzen bei Design-Rules).
+WICHTIG FÜR ABSCHNITT 3:
+Formuliere AUSSCHLIESSLICH "Wie steuere / nutze / erstelle / vergleiche / konfiguriere ich X mit dieser API?"-Fragen (z. B. zu Methoden, Parametern, Flags, Operatoren, Context-Managern, State-Reset, Footprint-Formaten oder Rule-Limits). Stelle KEINE Fragen zum temporären Inhalt einer konkreten Beispielschaltung (z. B. NICHT: "Wie viele Bauteile/Busse sind in der Schaltung enthalten?").
 
 Verändere den Quelltext/Inhalt NICHT."""
 
@@ -476,6 +476,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         log_msg(log_list, f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
 
         for idx, (rel_path, file_path) in enumerate(files_to_process, 1):
+            file_start_time = time.time()
             status_dict["header"] = f"🟢 Status: LÄUFT ({idx}/{total_files} - {os.path.basename(rel_path)})"
 
             raw_text = extract_text_from_file(file_path)
@@ -555,7 +556,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     ]
                 )
                 
-                log_msg(log_list, f"   ✅ Indiziert in '{target_collection}' | **Tag: #{category_tag}**\n")
+                elapsed_file = time.time() - file_start_time
+                log_msg(log_list, f"   ✅ Indiziert in '{target_collection}' in {elapsed_file:.2f}s | **Tag: #{category_tag}**\n")
 
             except Exception as e:
                 log_msg(log_list, f"   ❌ Fehler bei Verarbeitung: {str(e)}\n")
