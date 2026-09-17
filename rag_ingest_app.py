@@ -71,7 +71,8 @@ STRIKTE REGELN:
 
 # --- LOGGING HELPER MIT LOKALER ZEITZEILE ---
 def log_msg(log_list, text: str):
-    timestamp = datetime.now().astimezone().strftime("%H:%M:%S")
+    # Verwendet time.localtime() für eine zuverlässige lokale Zeitzonen-Darstellung
+    timestamp = time.strftime("%H:%M:%S", time.localtime())
     log_list.append(f"[{timestamp}] {text}")
 
 # --- SANITIZATION & CONFIG HELPERS ---
@@ -271,7 +272,7 @@ Dieses Symbol steht für die Netzlistenerzeugung via SKiDL unter dem Bauteilname
         markdown_content = f"[TAG: KICAD_EDA]\n\n# KiCad Datei: {filename}\n- **Dateipfad:** `{rel_path}`"
         return category_tag, markdown_content
 
-# --- FEINGLIEDRIGER AST & DOMAIN PARSER ---
+# --- FEINGLIEDRIGER DYNAMISCHER AST PARSER (UNIVERSAL) ---
 def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama_client, num_ctx: int, max_code_len: int) -> tuple[str, str] | tuple[None, None]:
     filename = os.path.basename(rel_path)
     rel_lower = rel_path.lower()
@@ -298,23 +299,33 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
     except Exception:
         return None, None
 
-    has_skidl_content = False
+    # Dynamische Extraktion aller definierten Klassen und Funktionen/Methoden aus dem AST
+    extracted_elements = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name in ["Circuit", "Part", "Net", "Bus", "SubCircuit", "Package"]:
-            has_skidl_content = True
-            break
-        if isinstance(node, ast.Call):
-            func_name = ""
-            if isinstance(node.func, ast.Name):
-                func_name = node.func.id
-            elif isinstance(node.func, ast.Attribute):
-                func_name = node.func.attr
-            
-            if func_name in ["Part", "Net", "Bus", "generate_netlist", "generate_pcb", "subcircuit", "Circuit"]:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not node.name.startswith("__") or node.name in ["__enter__", "__exit__", "__iadd__", "__isub__", "__init__"]:
+                extracted_elements.add(f"method:{node.name}()")
+        elif isinstance(node, ast.ClassDef):
+            extracted_elements.add(f"class:{node.name}")
+
+    has_skidl_content = is_skidl_api_internal or is_pcbnew_plugin
+    if not has_skidl_content:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name in ["Circuit", "Part", "Net", "Bus", "SubCircuit", "Package"]:
                 has_skidl_content = True
                 break
+            if isinstance(node, ast.Call):
+                func_name = ""
+                if isinstance(node.func, ast.Name):
+                    func_name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    func_name = node.func.attr
+                
+                if func_name in ["Part", "Net", "Bus", "generate_netlist", "generate_pcb", "subcircuit", "Circuit"]:
+                    has_skidl_content = True
+                    break
 
-    if not (is_skidl_api_internal or is_pcbnew_plugin or has_skidl_content):
+    if not has_skidl_content:
         return None, None
 
     docstring = ast.get_docstring(tree) or "Kein Modul-Docstring vorhanden"
@@ -337,17 +348,28 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
         category_tag = "SKIDL_GOLDEN_EXAMPLE"
         tag_title = f"Golden Example: {filename}"
 
+    elements_checklist = ", ".join(sorted(list(extracted_elements))) if extracted_elements else "Keine spezifischen Methoden extrahiert"
+    full_code_for_llm = raw_code[:max_code_len]
+
     enrichment_prompt = f"""Analysiere diesen Quellcode / diese EDA-Spezifikation für ein autonomes AI-PCB-Design-System:
 
-{raw_code[:12000]}
+{full_code_for_llm}
 
 ERSTELLE FOLGENDE ABSCHNITTE AUF DEUTSCH:
 1. Zweck: (Strukturierte Zusammenfassung der Funktion, Modulrolle oder Regeldefinition)
 2. Hauptkomponenten & Schnittstellen: (Liste aller Klassen, Methoden, Operatoren, Parameter, Pads, Pin-Belegungen oder Layout-Regeln)
-3. Autonome Agenten- & API-Anwendungsfragen: Erstelle eine VOLLSTÄNDIGE, UNBEGRENZTE Liste präziser Steuerungs- und Programmierfragen, die ein autonomer Agent durch diese Datei beantworten kann.
+3. Autonome Agenten- & API-Anwendungsfragen: Erstelle eine VOLLSTÄNDIGE, ERSCHÖPFENDE Liste präziser Steuerungs- und Programmierfragen.
 
-WICHTIG FÜR ABSCHNITT 3:
-Formuliere AUSSCHLIESSLICH "Wie steuere / nutze / erstelle / vergleiche / konfiguriere ich X mit dieser API?"-Fragen (z. B. zu Methoden, Parametern, Flags, Operatoren, Context-Managern, State-Reset, Footprint-Formaten oder Rule-Limits). Stelle KEINE Fragen zum temporären Inhalt einer konkreten Beispielschaltung (z. B. NICHT: "Wie viele Bauteile/Busse sind in der Schaltung enthalten?").
+STRIKTE REGELN FÜR ABSCHNITT 3:
+a) ERZWUNGENE AST-ABDECKUNG: Generiere ZWINGEND für JEDES der folgenden im Code erkannten Elemente mindestens eine spezifische Steuerungs-/Anwendungsfrage:
+   [{elements_checklist}]
+b) MANDATORISCHE STEUERUNGSDIMENSIONEN: Deckt gezielt folgende Bereiche ab, sofern im Code vorhanden:
+   - State Cleansing & Cleanup (z. B. cull_unconnected_parts, reset, mini_reset, disconnect)
+   - Vergleich & Struktur-Export (z. B. to_tuple, Netlist-, PCB-, SVG-, DOT-Generierung)
+   - Pipeline & Headless-Steuerung (z. B. no_files Flag, Logging, File Suppression)
+   - Scoping & Context-Management (Hierarchieebenen, Context-Manager __enter__/__exit__, activate/deactivate)
+   - Regel- & Parameterverwaltung (ERC/DRC, netclasses, partclasses, unique names)
+c) FORMULIERUNG: Verwende AUSSCHLIESSLICH "Wie steuere / nutze / erstelle / vergleiche / konfiguriere ich X mit dieser API?"-Fragen. Stelle KEINE Fragen zu temporären Zuständen einer konkreten Beispielschaltung (z. B. NICHT: "Wie viele Bauteile/Busse sind enthalten?").
 
 Verändere den Quelltext/Inhalt NICHT."""
 
@@ -556,8 +578,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     ]
                 )
                 
-                elapsed_file = time.time() - file_start_time
-                log_msg(log_list, f"   ✅ Indiziert in '{target_collection}' in {elapsed_file:.2f}s | **Tag: #{category_tag}**\n")
+                file_duration = time.time() - file_start_time
+                log_msg(log_list, f"   ✅ Indiziert in '{target_collection}' in {file_duration:.2f}s | **Tag: #{category_tag}**\n")
 
             except Exception as e:
                 log_msg(log_list, f"   ❌ Fehler bei Verarbeitung: {str(e)}\n")
