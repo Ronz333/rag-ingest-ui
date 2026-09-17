@@ -18,7 +18,6 @@ class GeneralDocumentProcessor(BaseProcessor):
 
     PCB_CATEGORY = "⚡ PCB & Hardware Design"
 
-    # Repository-Verwaltungsdateien, die für RAG-Pipelines irrelevant sind
     META_FILENAMES = {
         "authors", "authors.md", "authors.txt",
         "claude.md", "claude.txt",
