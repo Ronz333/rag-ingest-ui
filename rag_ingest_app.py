@@ -39,15 +39,18 @@ TEXT_EXTENSIONS = {
 CATEGORIES = {
     "⚡ PCB & Hardware Design": {
         "collection": "pcb_knowledge_base",
-        "system_prompt": """Du bist ein Ingestion-Agent für ein EDA/PCB-RAG-System.
-Analysiere den Inhalt (z.B. Python/SKiDL-Code, KiCad-Dateien, DRC/ERC Rules) und erstelle ein strukturiertes RAG-Dokument im Markdown-Format.
+        "system_prompt": """Du bist ein Ingestion-Agent für ein EDA/PCB-RAG-System zur Unterstützung eines autonomen AI-PCB-Designers.
+Analysiere den Inhalt (z. B. SKiDL-Code, KiCad-Footprints/Symbols, DRC-Rules, FreeRouting-Dateien) strikt faktengetreu und erstelle ein strukturiertes Markdown-Dokument.
 
 STRIKTE REGELN:
-1. ERSTE ZEILE: Zwingend ein exaktes Kategorie-Schlagwort in eckigen Klammern, z.B.:
-   [TAG: SKIDL_API], [TAG: SKIDL_GOLDEN_EXAMPLE], [TAG: KICAD_PCBNEW], [TAG: KICAD_DRC_RULES], [TAG: FREEROUTING_RULES] oder [TAG: SPICE_SIM].
-2. ABSOLUTES HALLUZINATIONSVERBOT: Verarbeite den DATEINAMEN und den INHALT strikt faktengetreu.
-3. CODE-INTEGRITÄT: Bette bereitgestellten Quellcode/Regeln 1:1 im Markdown-Codeblock ein.
-4. Zusammenfassung: Fasse Zweck, Parameter, Regeln, Schnittstellen und dynamisch 3 bis 8 prägnante Anwendungsfragen sachlich zusammen."""
+1. ERSTE ZEILE: Zwingend ein exaktes Kategorie-Schlagwort in eckigen Klammern, z. B.:
+   [TAG: SKIDL_API], [TAG: SKIDL_GOLDEN_EXAMPLE], [TAG: KICAD_FOOTPRINT], [TAG: KICAD_SYM], [TAG: KICAD_DRC_RULES], [TAG: FREEROUTING_RULES].
+2. ABSOLUTES HALLUZINATIONSVERBOT: Verarbeite Dateinamen und Inhalt strikt faktengetreu.
+3. INHALTS-INTEGRITÄT: Bette bereitgestellten Quellcode, S-Expressions oder Routing-Regeln 1:1 im passenden Codeblock ein.
+4. EXHAUSTIVE AGENTEN-FRAGEN: Erstelle eine VOLLSTÄNDIGE, UNBEGRENZTE Liste aller Fragen, die ein autonomer AI-PCB-Designer an diese Datei stellen könnte. Passe die Fragen dynamisch an den Dateityp an:
+   - Bei Python/SKiDL: Fragen zu API-Methoden, Scoping, Modifikationen, State-Management, ERC und Exporten.
+   - Bei KiCad Footprints/Symbols: Fragen zu Pin/Pad-Mappings, Pin-Funktionen, Geometrien, Package-Typen und Footprint-Filtern.
+   - Bei DRC & FreeRouting Rules: Fragen zu Leiterbahnbreiten, Minimum Clearances, Via-Spezifikationen, Layer-Regeln und Netzklassen."""
     },
     "💻 Programmiersprachen & Software": {
         "collection": "programming_knowledge_base",
@@ -335,16 +338,18 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
         category_tag = "SKIDL_GOLDEN_EXAMPLE"
         tag_title = f"Golden Example: {filename}"
 
-    enrichment_prompt = f"""Analysiere diesen Python-Code für ein EDA/PCB-System:
+    enrichment_prompt = f"""Analysiere diesen Quellcode / diese EDA-Spezifikation für ein autonomes AI-PCB-Design-System:
 
-{raw_code[:10000]}
+{raw_code[:12000]}
 
-ERSTELLE FOLGENDE DREI ABSCHNITTE AUF DEUTSCH:
-1. Zweck: (Zusammenfassung der Funktion, API-Klassen oder Schaltung)
-2. Hauptkomponenten / Schnittstellen: (Verwendete Klassen, Bauteile, Methoden oder Signale)
-3. Anwendungsfragen: (Erstelle je nach Umfang und Komplexität 3 bis 8 prägnante Entwickler-Fragen, die dieser Code/API-Abschnitt beantwortet)
+ERSTELLE FOLGENDE ABSCHNITTE AUF DEUTSCH:
+1. Zweck: (Strukturierte Zusammenfassung der Funktion, Modulrolle oder Regeldefinition)
+2. Hauptkomponenten & Schnittstellen: (Liste aller Klassen, Methoden, Operatoren, Parameter, Pads, Pin-Belegungen oder Layout-Regeln)
+3. Autonome Agenten- & API-Anwendungsfragen: Erstelle eine VOLLSTÄNDIGE, UNBEGRENZTE Liste präziser Fragen, die ein autonomer Agent durch diese Datei beantworten kann. 
 
-Verändere den Code NICHT."""
+Passe die Fragestellungen strikt an den vorliegenden Gegenstand an (z. B. API-Steuerung bei Code, Footprint/Pad-Details bei KiCad-Dateien oder Clearance/Routing-Grenzen bei Design-Rules).
+
+Verändere den Quelltext/Inhalt NICHT."""
 
     try:
         response = ollama_client.chat(
@@ -498,7 +503,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                 else:
                     log_msg(log_list, f"[{idx}/{total_files}] Verarbeite via LLM ({active_model}): {rel_path}")
-                    full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:10000]}"
+                    full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:12000]}"
                     response = ollama_worker.chat(
                         model=active_model,
                         messages=[
