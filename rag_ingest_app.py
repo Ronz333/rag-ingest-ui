@@ -25,12 +25,14 @@ CONFIG_FILE = "/tmp/rag_ingest_config.json"
 TB = "```"
 
 IGNORED_FILENAMES = {"setup.py", "conftest.py", "__init__.py"}
-IGNORED_PATH_PARTS = ["/docs/", "/tests/", "/build/", "/dist/"]
+IGNORED_PATH_PARTS = ["/docs/", "/tests/", "/build/", "/dist/", "/.git/"]
 
+# Ergänzt um Java-, Gradle-, Properties- und Specctra DSN/SES Formate für FreeRouting
 TEXT_EXTENSIONS = {
     ".kicad_sym", ".kicad_mod", ".kicad_pcb", ".kicad_sch", ".kicad_prj", ".kicad_dru",
     ".sch", ".net", ".cir", ".lib", ".mod", ".sym", ".spice", ".sub", ".mcb", ".dxf",
     ".rules", ".dsn", ".ses",
+    ".java", ".gradle", ".properties", ".xml",
     ".py", ".md", ".txt", ".json", ".yaml", ".yml", ".c", ".h", ".cpp", ".hpp",
     ".js", ".ts", ".html", ".css", ".rst", ".csv", ".ini", ".conf", ".sh",
     ".pdf"
@@ -40,11 +42,11 @@ CATEGORIES = {
     "⚡ PCB & Hardware Design": {
         "collection": "pcb_knowledge_base",
         "system_prompt": """Du bist ein Ingestion-Agent für ein EDA/PCB-RAG-System zur Unterstützung eines autonomen AI-PCB-Designers.
-Analysiere den Inhalt (z. B. SKiDL-Code, KiCad-Footprints/Symbols, DRC-Rules, FreeRouting-Dateien) strikt faktengetreu und erstelle ein strukturiertes Markdown-Dokument.
+Analysiere den Inhalt (z. B. SKiDL-Code, KiCad-Footprints/Symbols, DRC-Rules, FreeRouting-Java-Code, Specctra DSN/SES) strikt faktengetreu und erstelle ein strukturiertes Markdown-Dokument.
 
 STRIKTE REGELN:
 1. ERSTE ZEILE: Zwingend ein exaktes Kategorie-Schlagwort in eckigen Klammern, z. B.:
-   [TAG: SKIDL_API], [TAG: SKIDL_GOLDEN_EXAMPLE], [TAG: KICAD_FOOTPRINT], [TAG: KICAD_SYM], [TAG: KICAD_DRC_RULES], [TAG: FREEROUTING_RULES].
+   [TAG: SKIDL_API], [TAG: FREEROUTING_JAVA], [TAG: KICAD_FOOTPRINT], [TAG: KICAD_SYM], [TAG: KICAD_DRC_RULES], [TAG: FREEROUTING_RULES], [TAG: SPECCTRA_DSN].
 2. ABSOLUTES HALLUZINATIONSVERBOT: Verarbeite Dateinamen und Inhalt strikt faktengetreu.
 3. INHALTS-INTEGRITÄT: Bette bereitgestellten Quellcode, S-Expressions oder Routing-Regeln 1:1 im passenden Codeblock ein.
 4. EXHAUSTIVE AGENTEN-FRAGEN: Erstelle eine VOLLSTÄNDIGE, UNBEGRENZTE Liste von Entwickler- und Agenten-Steuerungsfragen.
@@ -182,7 +184,49 @@ def unload_ollama_model(ollama_client, model_name: str):
     except Exception:
         pass
 
-# --- SPEZIALPARSER FÜR KICAD, DRC & RULES ---
+def calculate_dynamic_num_ctx(text_len: int, max_limit: int = 32768) -> int:
+    """Berechnet ein optimales Kontextfenster (Power of 2) basierend auf der Textlänge."""
+    estimated_tokens = int(text_len / 3.0) + 512
+    num_ctx = 2048
+    while num_ctx < estimated_tokens and num_ctx < max_limit:
+        num_ctx *= 2
+    return min(num_ctx, max_limit)
+
+def smart_markdown_chunking(text: str, max_chars: int = 12000, overlap_chars: int = 1200) -> list[str]:
+    """Trennt Markdown strukturbewusst an Überschriften/Absätzen und hält Kontext via Overlap."""
+    if len(text) <= max_chars:
+        return [text]
+
+    paragraphs = re.split(r'(\n(?=#{1,4} )|\n\n+)', text)
+    chunks = []
+    current_chunk = ""
+
+    for p in paragraphs:
+        if not p:
+            continue
+        if len(current_chunk) + len(p) <= max_chars:
+            current_chunk += p
+        else:
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+            
+            overlap_start = max(0, len(current_chunk) - overlap_chars)
+            overlap_text = current_chunk[overlap_start:]
+            
+            if len(p) > max_chars:
+                p_chunks = [p[i:i + max_chars] for i in range(0, len(p), max_chars - overlap_chars)]
+                for pc in p_chunks:
+                    chunks.append(pc.strip())
+                current_chunk = ""
+            else:
+                current_chunk = overlap_text + p
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+# --- SPEZIALPARSER FÜR KICAD, DRC, RULES & SPECCTRA ---
 def fast_parse_kicad(rel_path: str, raw_text: str, max_code_len: int) -> tuple[str, str]:
     ext = os.path.splitext(rel_path)[1].lower()
     filename = os.path.basename(rel_path)
@@ -205,15 +249,15 @@ def fast_parse_kicad(rel_path: str, raw_text: str, max_code_len: int) -> tuple[s
 """
         return category_tag, markdown_content
 
-    elif ext == ".rules":
-        category_tag = "FREEROUTING_RULES"
-        markdown_content = f"""[TAG: FREEROUTING_RULES]
+    elif ext in {".rules", ".dsn", ".ses"}:
+        category_tag = "FREEROUTING_RULES" if ext == ".rules" else "SPECCTRA_DSN"
+        markdown_content = f"""[TAG: {category_tag}]
 
-# FreeRouting Rules & Net Classes: {filename}
+# Specctra / FreeRouting Datei: {filename}
 
 - **Dateipfad:** `{rel_path}`
 
-## Routing-Konfiguration (Specctra Rules)
+## Struktur-Definition
 {TB}lisp
 {raw_text[:max_code_len]}
 {TB}
@@ -277,7 +321,89 @@ Dieses Symbol steht für die Netzlistenerzeugung via SKiDL unter dem Bauteilname
         markdown_content = f"[TAG: KICAD_EDA]\n\n# KiCad Datei: {filename}\n- **Dateipfad:** `{rel_path}`"
         return category_tag, markdown_content
 
-# --- FEINGLIEDRIGER DYNAMISCHER AST PARSER (UNIVERSAL) ---
+# --- FEINGLIEDRIGER JAVA PARSER (FREEROUTING / EDA CORE) ---
+def hybrid_java_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama_client, num_ctx: int, max_code_len: int) -> tuple[str, str] | tuple[None, None]:
+    filename = os.path.basename(rel_path)
+    rel_lower = rel_path.lower()
+
+    if filename in IGNORED_FILENAMES or any(p in rel_lower for p in IGNORED_PATH_PARTS):
+        return None, None
+
+    if len(raw_code) > 300000:
+        return None, None
+
+    # Structural Extraction für Java
+    package_match = re.search(r'package\s+([a-zA-Z0-9_.]+);', raw_code)
+    package_name = package_match.group(1) if package_match else "default"
+
+    classes = re.findall(r'(?:public|protected|private)?\s*(?:static\s+)?(?:class|interface|enum)\s+([A-Za-z0-9_]+)', raw_code)
+    methods = re.findall(r'(?:public|protected)\s+(?:[A-Za-z0-9_<>\[\]]+\s+)+([A-Za-z0-9_]+)\s*\([^\)]*\)', raw_code)
+
+    extracted_elements = set()
+    for c in classes:
+        extracted_elements.add(f"class/interface:{c}")
+    for m in methods:
+        if m not in {"if", "for", "while", "switch", "catch"}:
+            extracted_elements.add(f"method:{m}()")
+
+    is_freerouting = "freerouting" in rel_lower or "autoroute" in rel_lower or "board" in rel_lower or "routing" in rel_lower
+    category_tag = "FREEROUTING_JAVA" if is_freerouting else "JAVA_SOURCE"
+    tag_title = f"FreeRouting Java Modul: {filename}" if is_freerouting else f"Java Modul: {filename}"
+
+    elements_checklist = ", ".join(sorted(list(extracted_elements))) if extracted_elements else "Keine spezifischen Methoden extrahiert"
+    full_code_for_llm = raw_code[:max_code_len]
+
+    enrichment_prompt = f"""Analysiere diesen Java-Quellcode (FreeRouting Autorouter / EDA Core) für ein autonomes AI-PCB-Design-System:
+
+{full_code_for_llm}
+
+ERSTELLE FOLGENDE ABSCHNITTE AUF DEUTSCH:
+1. Zweck: (Strukturierte Zusammenfassung der Funktion, Modulrolle, Datenstruktur oder Routing-Algorithmus)
+2. Hauptkomponenten & Schnittstellen: (Liste aller Klassen, Interfaces, Hauptmethoden, Parameter, Datenstrukturen)
+3. Autonome Agenten- & API-Anwendungsfragen: Erstelle eine VOLLSTÄNDIGE, ERSCHÖPFENDE Liste präziser Steuerungs- und Programmierfragen.
+
+STRIKTE REGELN FÜR ABSCHNITT 3:
+a) ERZWUNGENE JAVA-ELEMENT-ABDECKUNG: Generiere ZWINGEND für JEDES der folgenden im Code erkannten Elemente mindestens eine spezifische Steuerungs-/Anwendungsfrage:
+   [{elements_checklist}]
+b) MANDATORISCHE STEUERUNGSDIMENSIONEN: Deckt gezielt folgende Bereiche ab, sofern im Code vorhanden:
+   - Routing-Algorithmen & Heuristiken (z. B. Maze Routing, Push & Shove, Via-Placement, Clearance Check)
+   - Board- & Geometrie-Datenstrukturen (z. B. Board, Item, Net, Trace, Padstack, Shape)
+   - Konfiguration & Parameterisierung (z. B. Autoroute Settings, DRC Rules, Layer Rules)
+   - Import & Export Schnittstellen (z. B. Specctra DSN Import, SES Export, Rules Parsing)
+c) FORMULIERUNG: Verwende AUSSCHLIESSLICH "Wie steuere / nutze / erstelle / vergleiche / konfiguriere / starte ich X mit dieser Java API?"-Fragen.
+
+Verändere den Quelltext/Inhalt NICHT."""
+
+    try:
+        response = ollama_client.chat(
+            model=active_model,
+            messages=[{'role': 'user', 'content': enrichment_prompt}],
+            options={"num_ctx": num_ctx}
+        )
+        enrichment_text = response['message']['content']
+    except Exception:
+        enrichment_text = f"**Zweck:** Java Modul (`{rel_path}`)\n**Package:** `{package_name}`"
+
+    code_snippet = raw_code[:max_code_len] + ("\n// ... [Code gekürzt wegen Dateigröße]" if len(raw_code) > max_code_len else "")
+
+    markdown_content = f"""[TAG: {category_tag}]
+
+# {tag_title}
+
+- **Quelle/Dateipfad:** `{rel_path}`
+- **Package:** `{package_name}`
+
+## Code-Analyse & Dokumentation
+{enrichment_text}
+
+## Validierter Quellcode (Java)
+{TB}java
+{code_snippet}
+{TB}
+"""
+    return category_tag, markdown_content
+
+# --- FEINGLIEDRIGER PYTHON AST PARSER ---
 def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama_client, num_ctx: int, max_code_len: int) -> tuple[str, str] | tuple[None, None]:
     filename = os.path.basename(rel_path)
     rel_lower = rel_path.lower()
@@ -285,16 +411,7 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
     if filename in IGNORED_FILENAMES or any(p in rel_lower for p in IGNORED_PATH_PARTS):
         return None, None
 
-    SKIDL_CORE_FILES = {"circuit.py", "part.py", "net.py", "bus.py", "package.py", "interface.py", "skidl.py", "erc.py", "schlib.py", "proto.py"}
-
-    is_skidl_api_internal = (
-        any(p in rel_lower for p in ["/src/skidl/", "skidl/skidl/", "/skidl/src/"])
-        or filename.lower() in SKIDL_CORE_FILES
-    )
-    is_pcbnew_plugin = "pcbnew" in rel_lower or "action_plugin" in rel_lower or "kicad" in rel_lower
-
-    max_allowed_size = 300000 if (is_skidl_api_internal or is_pcbnew_plugin) else 100000
-    if len(raw_code) > max_allowed_size:
+    if len(raw_code) > 300000:
         return None, None
 
     try:
@@ -322,15 +439,15 @@ def hybrid_ast_llm_parse(rel_path: str, raw_code: str, active_model: str, ollama
             if node.module:
                 imports.append(node.module)
 
-    if is_skidl_api_internal:
+    if "skidl" in rel_lower:
         category_tag = "SKIDL_API"
         tag_title = f"SKiDL API Modul: {filename}"
-    elif is_pcbnew_plugin:
+    elif "pcbnew" in rel_lower or "kicad" in rel_lower:
         category_tag = "KICAD_PCBNEW"
         tag_title = f"KiCad / PCBNew Plugin: {filename}"
     else:
-        category_tag = "CODE_DOCUMENTATION"
-        tag_title = f"Source Modul: {filename}"
+        category_tag = "PYTHON_MODULE"
+        tag_title = f"Python Modul: {filename}"
 
     elements_checklist = ", ".join(sorted(list(extracted_elements))) if extracted_elements else "Keine spezifischen Methoden extrahiert"
     full_code_for_llm = raw_code[:max_code_len]
@@ -347,13 +464,7 @@ ERSTELLE FOLGENDE ABSCHNITTE AUF DEUTSCH:
 STRIKTE REGELN FÜR ABSCHNITT 3:
 a) ERZWUNGENE AST-ABDECKUNG: Generiere ZWINGEND für JEDES der folgenden im Code erkannten Elemente mindestens eine spezifische Steuerungs-/Anwendungsfrage:
    [{elements_checklist}]
-b) MANDATORISCHE STEUERUNGSDIMENSIONEN: Deckt gezielt folgende Bereiche ab, sofern im Code vorhanden:
-   - State Cleansing & Cleanup
-   - Vergleich & Struktur-Export
-   - Pipeline & Headless-Steuerung
-   - Scoping & Context-Management
-   - Regel- & Parameterverwaltung
-c) FORMULIERUNG: Verwende AUSSCHLIESSLICH "Wie steuere / nutze / erstelle / vergleiche / konfiguriere ich X mit dieser API?"-Fragen. Stelle KEINE Fragen zu temporären Zuständen einer konkreten Beispielschaltung (z. B. NICHT: "Wie viele Bauteile/Busse sind enthalten?").
+b) FORMULIERUNG: Verwende AUSSCHLIESSLICH "Wie steuere / nutze / erstelle / vergleiche / konfiguriere ich X mit dieser API?"-Fragen.
 
 Verändere den Quelltext/Inhalt NICHT."""
 
@@ -386,7 +497,7 @@ Verändere den Quelltext/Inhalt NICHT."""
 """
     return category_tag, markdown_content
 
-# --- PROZESS WORKER MIT PHASE-BATCHING & DYNAMISCHEM RETRY-HANDLING ---
+# --- PROZESS WORKER MIT DISPATCH-PARSING, BATCHING & STRUCTURAL CHUNKING ---
 def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size):
     temp_work_dir = None
     try:
@@ -515,16 +626,19 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 parse_start_time = time.time()
 
                 try:
-                    if mode == "repo_mining" or ext == ".py":
-                        log_msg(log_list, f"[{global_idx}/{total_files}] Hybrid AST-LLM Parse: {rel_path}")
+                    # Determinismus nach Dateiendungen (Kein vorschnelles Infiltrations-Skipping)
+                    if ext == ".py":
+                        log_msg(log_list, f"[{global_idx}/{total_files}] Hybrid AST-LLM Parse (Python): {rel_path}")
                         used_llm_in_this_batch = True
                         category_tag, processed_md = hybrid_ast_llm_parse(rel_path, raw_text, active_model, ollama_worker, num_ctx, max_embed_chars)
-                        if not processed_md:
-                            log_msg(log_list, f"   ⚠️ Übersprungen (Kein SKiDL/API Code oder Build/Doku): {rel_path}")
-                            continue
 
-                    elif ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".kicad_dru", ".rules"}:
-                        log_msg(log_list, f"[{global_idx}/{total_files}] Fast-Pass Parsing (ohne LLM): {rel_path}")
+                    elif ext == ".java":
+                        log_msg(log_list, f"[{global_idx}/{total_files}] Hybrid AST-LLM Parse (Java/FreeRouting): {rel_path}")
+                        used_llm_in_this_batch = True
+                        category_tag, processed_md = hybrid_java_llm_parse(rel_path, raw_text, active_model, ollama_worker, num_ctx, max_embed_chars)
+
+                    elif ext in {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".kicad_dru", ".rules", ".dsn", ".ses"}:
+                        log_msg(log_list, f"[{global_idx}/{total_files}] Fast-Pass Parsing (EDA/Specctra): {rel_path}")
                         category_tag, processed_md = fast_parse_kicad(rel_path, raw_text, max_embed_chars)
 
                     else:
@@ -542,6 +656,10 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                         processed_md = response['message']['content']
                         tag_match = re.search(r'\[(?:TAG|PAGE|CATEGORY):\s*([A-Z0-9_]+)\]', processed_md, re.IGNORECASE)
                         category_tag = tag_match.group(1).upper() if tag_match else "GENERAL"
+
+                    if not processed_md:
+                        log_msg(log_list, f"   ⚠️ Übersprungen (Datei-Filter/Größenlimit): {rel_path}")
+                        continue
 
                     parse_duration = time.time() - parse_start_time
                     batch_prepared_items.append({
@@ -566,7 +684,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 log_msg(log_list, f"ℹ️ Batch {current_batch_num} enthält keine neu zu indizierenden Dateien.\n")
                 continue
 
-            # --- PHASE B: VEKTORISIERUNG MIT ADAPTIVER 10%-REDUKTIONS-SCHLEIFE ---
+            # --- PHASE B: VEKTORISIERUNG MIT STRUCTURAL OVERLAP CHUNKING ---
             log_msg(log_list, f"📐 Phase B [Batch {current_batch_num}]: Erzeuge Embeddings ({EMBED_MODEL}) & speichere in Qdrant...")
             for prep_item in batch_prepared_items:
                 rel_path = prep_item["rel_path"]
@@ -577,68 +695,64 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 global_idx = prep_item["global_idx"]
 
                 embed_start_time = time.time()
-                current_chars = max_embed_chars
-                min_chars_limit = 500
-                embed_res = None
-                success = False
 
-                # Dynamic Adaptive Fallback Loop
-                while current_chars >= min_chars_limit:
-                    embed_prompt = processed_md[:current_chars]
-                    try:
-                        embed_res = ollama_worker.embeddings(
-                            model=EMBED_MODEL, 
-                            prompt=embed_prompt,
-                            options={"num_ctx": num_ctx}
-                        )
-                        success = True
-                        break  # Embedding erfolgreich!
+                # Strukturbewusstes Chunking mit Overlap
+                md_chunks = smart_markdown_chunking(processed_md, max_chars=12000, overlap_chars=1200)
 
-                    except Exception as embed_err:
-                        new_chars = int(current_chars * 0.90)
-                        if new_chars >= current_chars:
-                            new_chars = current_chars - 100
-                        
-                        log_msg(
-                            log_list, 
-                            f"   ⚠️ Embedding-Fehler bei {rel_path} ({embed_err}). "
-                            f"Reduziere Zeichenanzahl um 10% ({current_chars} ➔ {new_chars} Chars)..."
-                        )
-                        current_chars = new_chars
-                        time.sleep(2.0)  # Erholungszeit für den Vulkan-Treiber nach ErrorDeviceLost
+                for chunk_idx, md_chunk in enumerate(md_chunks):
+                    chunk_success = False
+                    retry_count = 0
+                    current_chars = len(md_chunk)
 
-                if not success or embed_res is None:
-                    log_msg(log_list, f"   ❌ Indizierungs-Fehler bei {rel_path}: Selbst nach Reduktion auf {min_chars_limit} Zeichen fehlgeschlagen.")
-                    continue
+                    while not chunk_success and retry_count < 3:
+                        try:
+                            chunk_ctx = calculate_dynamic_num_ctx(current_chars, max_limit=32768)
 
-                try:
-                    vector = embed_res['embedding']
-                    ensure_qdrant_collection(qdrant_worker, target_collection, len(vector))
-                    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{rel_path}"))
-
-                    qdrant_worker.upsert(
-                        collection_name=target_collection,
-                        points=[
-                            PointStruct(
-                                id=point_id,
-                                vector=vector,
-                                payload={
-                                    "filename": os.path.basename(rel_path),
-                                    "file_path": rel_path,
-                                    "content_hash": content_hash,
-                                    "category_tag": category_tag,
-                                    "content": processed_md
-                                }
+                            embed_res = ollama_worker.embeddings(
+                                model=EMBED_MODEL, 
+                                prompt=md_chunk[:current_chars],
+                                options={"num_ctx": chunk_ctx}
                             )
-                        ]
-                    )
 
-                    embed_dur = time.time() - embed_start_time
-                    total_file_dur = parse_dur + embed_dur
-                    log_msg(log_list, f"[{global_idx}/{total_files}] ✅ Indiziert in {total_file_dur:.2f}s (Analyse: {parse_dur:.2f}s | Embed: {embed_dur:.2f}s | {current_chars} Chars) | **#{category_tag}**: {rel_path}")
+                            vector = embed_res['embedding']
+                            ensure_qdrant_collection(qdrant_worker, target_collection, len(vector))
 
-                except Exception as upsert_err:
-                    log_msg(log_list, f"   ❌ Qdrant Upsert-Fehler bei {rel_path}: {str(upsert_err)}")
+                            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{rel_path}_chunk_{chunk_idx}"))
+
+                            qdrant_worker.upsert(
+                                collection_name=target_collection,
+                                points=[
+                                    PointStruct(
+                                        id=point_id,
+                                        vector=vector,
+                                        payload={
+                                            "filename": os.path.basename(rel_path),
+                                            "file_path": rel_path,
+                                            "content_hash": content_hash,
+                                            "category_tag": category_tag,
+                                            "chunk_index": chunk_idx,
+                                            "total_chunks": len(md_chunks),
+                                            "content": md_chunk[:current_chars]
+                                        }
+                                    )
+                                ]
+                            )
+                            chunk_success = True
+
+                        except Exception as embed_err:
+                            retry_count += 1
+                            log_msg(log_list, f"   ⚠️ Vulkan-Reset bei {rel_path} (Chunk {chunk_idx+1}/{len(md_chunks)}): {embed_err}")
+                            unload_ollama_model(ollama_worker, EMBED_MODEL)
+                            time.sleep(2.5)
+                            current_chars = int(current_chars * 0.85)
+
+                embed_dur = time.time() - embed_start_time
+                total_file_dur = parse_dur + embed_dur
+                log_msg(
+                    log_list, 
+                    f"[{global_idx}/{total_files}] ✅ Indiziert in {total_file_dur:.2f}s "
+                    f"({len(md_chunks)} Chunk(s) | Analyse: {parse_dur:.2f}s | Embed: {embed_dur:.2f}s) | **#{category_tag}**: {rel_path}"
+                )
 
             # --- VRAM CLEANUP VOR NÄCHSTEM BATCH ---
             log_msg(log_list, f"🔄 Phase B abgeschlossen. Entlade Embedding-Modell ({EMBED_MODEL}) aus dem VRAM...")
@@ -1009,7 +1123,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                             ("KiCad Python Action Plugins", "[https://github.com/KiCad/kicad-python](https://github.com/KiCad/kicad-python)"),
                             ("Freerouting Java / Config Core", "[https://github.com/freerouting/freerouting](https://github.com/freerouting/freerouting)")
                         ],
-                        value="[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)",
+                        value="[https://github.com/freerouting/freerouting](https://github.com/freerouting/freerouting)",
                         label="Ziel-Repository für EDA Mining",
                         allow_custom_value=True,
                         interactive=True
