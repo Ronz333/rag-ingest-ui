@@ -310,12 +310,17 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 parse_start_time = time.time()
 
                 try:
-                    # Dynamischer Dispatcher-Aufruf über die Registry
+                    # Delegiere Analyse an Registry unter Angabe der gewählten GUI-Kategorie
                     category_tag, processed_md = registry.dispatch_parse(
-                        rel_path, raw_text, active_model, ollama_worker, num_ctx, max_embed_chars
+                        rel_path, raw_text, active_model, ollama_worker, num_ctx, max_embed_chars, selected_category=category_key
                     )
 
-                    # Fallback für Standard-Dokumente ohne Spezial-Plugin
+                    # Überspringen, wenn das Plugin die Datei als irrelevant eingestuft hat ("SKIP")
+                    if processed_md == "SKIP":
+                        log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Übersprungen (Irrelevant für '{category_key}'): {rel_path}")
+                        continue
+
+                    # Fallback für Standard-Dokumentation nur ausführen, wenn gar kein Spezial-Processor zuständig war
                     if not processed_md:
                         log_msg(log_list, f"[{global_idx}/{total_files}] Standard LLM Parse ({active_model}): {rel_path}")
                         used_llm_in_this_batch = True
