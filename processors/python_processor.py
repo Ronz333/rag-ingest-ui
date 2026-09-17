@@ -1,8 +1,8 @@
 """
 PYTHON & SKIDL INGESTION PROCESSOR
 ----------------------------------
-Analysiert Python-Quellcode, SKiDL-Schaltplan-APIs und KiCad-PCBNew-Plugins
-mittels nativer Python AST-Extraktion.
+Analysiert Python-Quellcode. Filtert im PCB-Modus strikt auf EDA-, SKiDL- 
+und KiCad-Relevanz, um allgemeine Python-Skripte im PCB-Kontext zu ignorieren.
 """
 
 import os
@@ -19,14 +19,30 @@ class PythonProcessor(BaseProcessor):
     collection_name = "programming_knowledge_base"
     supported_extensions = {".py"}
 
+    PCB_CATEGORY = "⚡ PCB & Hardware Design"
+    PCB_KEYWORDS = {
+        "skidl", "kicad", "pcb", "pcbnew", "footprint", "symbol", "netlist", 
+        "schematic", "circuit", "gerber", "spice", "pin", "part", "erc", "drc", "hardware"
+    }
+
     system_prompt = """Du bist ein Ingestion-Agent für Python-Quellcode und SKiDL/KiCad-APIs.
 Analysiere den Code strikt faktengetreu und erstelle ein strukturiertes Markdown-Dokument.
 Erstelle eine exhaustive Liste von Entwickler- und Agenten-Steuerungsfragen ("Wie steuere/nutze/konfiguriere ich X?")."""
 
-    IGNORED_FILENAMES = {"setup.py", "conftest.py", "__init__.py"}
+    IGNORED_FILENAMES = {"setup.py", "conftest.py"}
     IGNORED_PATH_PARTS = ["/docs/", "/tests/", "/build/", "/dist/", "/.git/"]
 
-    def can_handle(self, rel_path: str, ext: str) -> bool:
+    def _is_pcb_relevant(self, rel_path: str, raw_code: str) -> bool:
+        """Prüft, ob eine Python-Datei PCB/EDA-Relevanz aufweist."""
+        rel_lower = rel_path.lower()
+        if any(kw in rel_lower for kw in self.PCB_KEYWORDS):
+            return True
+        
+        # Inhaltsprüfung auf Importe und Begriffe
+        code_snippet = raw_code[:3000].lower()
+        return any(kw in code_snippet for kw in self.PCB_KEYWORDS)
+
+    def can_handle(self, rel_path: str, ext: str, selected_category: str = "") -> bool:
         filename = os.path.basename(rel_path)
         rel_lower = rel_path.lower()
         if filename in self.IGNORED_FILENAMES or any(p in rel_lower for p in self.IGNORED_PATH_PARTS):
@@ -40,10 +56,15 @@ Erstelle eine exhaustive Liste von Entwickler- und Agenten-Steuerungsfragen ("Wi
         active_model: str, 
         ollama_client, 
         num_ctx: int, 
-        max_code_len: int
+        max_code_len: int,
+        selected_category: str = ""
     ) -> Tuple[Optional[str], Optional[str]]:
+        # PCB-Kategorie Filter: Allgemeiner Code ohne PCB-Bezug wird übersprungen
+        if selected_category == self.PCB_CATEGORY and not self._is_pcb_relevant(rel_path, raw_code):
+            return "IGNORED", "SKIP"
+
         if len(raw_code) > 300000:
-            return None, None
+            return "IGNORED", "SKIP"
 
         try:
             with warnings.catch_warnings():
