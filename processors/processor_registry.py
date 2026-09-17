@@ -1,9 +1,7 @@
 """
 AUTOMATIC PROCESSOR REGISTRY & PLUGIN DISCOVERER
 -----------------------------------------------
-Lädt dynamisch alle Processor-Klassen aus dem Ordner `processors/`.
-Neue Plugin-Dateien werden beim Start automatisch erkannt, instanziiert
-und im GUI-Dropdown bereitgestellt.
+Leitet die gewählte Kategorie an die Plugins weiter.
 """
 
 import os
@@ -23,9 +21,7 @@ class ProcessorRegistry:
         self.reload_processors()
 
     def reload_processors(self):
-        """Durchsucht das Verzeichnis nach allen gültigen Processor-Plugins."""
         self.processors.clear()
-        
         if self.processors_dir not in sys.path:
             sys.path.insert(0, self.processors_dir)
 
@@ -48,7 +44,6 @@ class ProcessorRegistry:
                     print(f"⚠️ Fehler beim Laden des Processors '{entry}': {e}")
 
     def get_categories_dict(self) -> Dict[str, dict]:
-        """Generiert dynamisch das `CATEGORIES`-Dictionary für die Web-GUI."""
         categories = {}
         for p in self.processors:
             categories[p.category_key] = {
@@ -56,7 +51,6 @@ class ProcessorRegistry:
                 "system_prompt": p.system_prompt,
                 "processor": p
             }
-        # Fallback für allgemeine Dokumente ergänzen
         if "📚 Allgemeines Wissen & Dokumente" not in categories:
             categories["📚 Allgemeines Wissen & Dokumente"] = {
                 "collection": "general_knowledge_base",
@@ -66,7 +60,6 @@ class ProcessorRegistry:
         return categories
 
     def get_all_supported_extensions(self) -> Set[str]:
-        """Sammelt alle unterstützten Dateiendungen aus allen registrierten Processoren."""
         exts = {".md", ".txt", ".json", ".yaml", ".yml", ".pdf", ".csv", ".xml", ".ini", ".conf", ".sh"}
         for p in self.processors:
             exts.update(p.supported_extensions)
@@ -79,15 +72,15 @@ class ProcessorRegistry:
         active_model: str, 
         ollama_client, 
         num_ctx: int, 
-        max_code_len: int
+        max_code_len: int,
+        selected_category: str = ""
     ) -> Tuple[Optional[str], Optional[str]]:
-        """Findet den passenden Processor basierend auf Pfad und Endung."""
         ext = str(rel_path[rel_path.rfind('.'):]).lower() if '.' in rel_path else ""
 
         for processor in self.processors:
-            if processor.can_handle(rel_path, ext):
+            if processor.can_handle(rel_path, ext, selected_category=selected_category):
                 return processor.parse(
-                    rel_path, raw_text, active_model, ollama_client, num_ctx, max_code_len
+                    rel_path, raw_text, active_model, ollama_client, num_ctx, max_code_len, selected_category=selected_category
                 )
 
         return None, None
