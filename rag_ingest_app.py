@@ -320,21 +320,13 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                         log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Übersprungen (Irrelevant für '{category_key}'): {rel_path}")
                         continue
 
-                    # Fallback für Standard-Dokumentation nur ausführen, wenn gar kein Spezial-Processor zuständig war
+                    # Datei wird übersprungen, wenn kein Prozessor zuständig ist (Kein blinder LLM-Fallback)
                     if not processed_md:
-                        log_msg(log_list, f"[{global_idx}/{total_files}] Standard LLM Parse ({active_model}): {rel_path}")
+                        log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Kein passender Processor (Ignoriert): {rel_path}")
+                        continue
+
+                    if category_tag not in {"KICAD_FOOTPRINT", "KICAD_SYM", "KICAD_DRC_RULES", "SPECCTRA_DSN", "FREEROUTING_RULES"}:
                         used_llm_in_this_batch = True
-                        full_user_prompt = f"DATEIPFAD: {rel_path}\nINHALT:\n{raw_text[:12000]}"
-                        response = ollama_worker.chat(
-                            model=active_model,
-                            messages=[
-                                {'role': 'system', 'content': system_prompt},
-                                {'role': 'user', 'content': full_user_prompt}
-                            ],
-                            options={"num_ctx": num_ctx}
-                        )
-                        processed_md = response['message']['content']
-                        category_tag = "GENERAL"
 
                     parse_duration = time.time() - parse_start_time
                     batch_prepared_items.append({
