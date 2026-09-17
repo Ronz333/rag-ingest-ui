@@ -1,8 +1,8 @@
 """
 JAVA & FREEROUTING INGESTION PROCESSOR
 --------------------------------------
-Analysiert Java-Codebases (z. B. FreeRouting Autorouter Core).
-Nutzt Regex-basiertes AST-Structural-Parsing zur Methodenerfassung.
+Analysiert Java-Codebases. Filtert im PCB-Modus strikt auf FreeRouting,
+Autorouting und Board-Geometrien.
 """
 
 import os
@@ -18,12 +18,26 @@ class JavaProcessor(BaseProcessor):
     collection_name = "pcb_knowledge_base"
     supported_extensions = {".java"}
 
+    PCB_CATEGORY = "⚡ PCB & Hardware Design"
+    PCB_KEYWORDS = {
+        "freerouting", "autoroute", "board", "routing", "dsn", "ses", 
+        "padstack", "clearance", "net", "trace", "via", "kicad", "eda", "layer"
+    }
+
     system_prompt = """Du bist ein Ingestion-Agent für Java-Quellcode und FreeRouting Autorouting-Kernmodule.
 Analysiere den Code strikt faktengetreu und erstelle ein strukturiertes Markdown-Dokument."""
 
     IGNORED_PATH_PARTS = ["/docs/", "/tests/", "/build/", "/dist/", "/.git/"]
 
-    def can_handle(self, rel_path: str, ext: str) -> bool:
+    def _is_pcb_relevant(self, rel_path: str, raw_code: str) -> bool:
+        """Prüft, ob eine Java-Datei für PCB-Autorouting relevant ist."""
+        rel_lower = rel_path.lower()
+        if any(kw in rel_lower for kw in self.PCB_KEYWORDS):
+            return True
+        code_snippet = raw_code[:3000].lower()
+        return any(kw in code_snippet for kw in self.PCB_KEYWORDS)
+
+    def can_handle(self, rel_path: str, ext: str, selected_category: str = "") -> bool:
         rel_lower = rel_path.lower()
         if any(p in rel_lower for p in self.IGNORED_PATH_PARTS):
             return False
@@ -36,10 +50,15 @@ Analysiere den Code strikt faktengetreu und erstelle ein strukturiertes Markdown
         active_model: str, 
         ollama_client, 
         num_ctx: int, 
-        max_code_len: int
+        max_code_len: int,
+        selected_category: str = ""
     ) -> Tuple[Optional[str], Optional[str]]:
+        # PCB-Kategorie Filter: Allgemeiner Java-Code ohne Routing-Bezug wird übersprungen
+        if selected_category == self.PCB_CATEGORY and not self._is_pcb_relevant(rel_path, raw_code):
+            return "IGNORED", "SKIP"
+
         if len(raw_code) > 300000:
-            return None, None
+            return "IGNORED", "SKIP"
 
         filename = os.path.basename(rel_path)
         package_match = re.search(r'package\s+([a-zA-Z0-9_.]+);', raw_code)
