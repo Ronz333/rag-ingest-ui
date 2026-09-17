@@ -19,7 +19,7 @@ from pypdf import PdfReader
 # --- KONFIGURATION & KONSTANTEN ---
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
-DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:32b")
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_1")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "hf.co/Qwen/Qwen3-Embedding-8B-GGUF:Q5_K_M")
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
 TB = "```"
@@ -386,7 +386,7 @@ Verändere den Quelltext/Inhalt NICHT."""
 """
     return category_tag, markdown_content
 
-# --- PROZESS WORKER MIT PHASE-BATCHING & VRAM-ENTLASTUNG ---
+# --- PROZESS WORKER MIT PHASE-BATCHING & DYNAMISCHEM RETRY-HANDLING ---
 def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size):
     temp_work_dir = None
     try:
@@ -484,7 +484,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         existing_hashes = get_indexed_hashes_set(qdrant_worker, target_collection)
         log_msg(log_list, f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
 
-        # Outer Loop: Verarbeite Dateien in Chunks der konfigurierten Batch-Größe
+        # Outer Loop: Batching nach Benutzerkonfiguration
         for batch_idx in range(0, total_files, batch_size):
             chunk = files_to_process[batch_idx : batch_idx + batch_size]
             current_batch_num = (batch_idx // batch_size) + 1
@@ -496,7 +496,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             batch_prepared_items = []
             used_llm_in_this_batch = False
 
-            # --- PHASE A: TEXTANALYSE & MARKDOWN GENERIERUNG (LLM MODELL BELEGT VRAM) ---
+            # --- PHASE A: TEXTANALYSE & MARKDOWN GENERIERUNG ---
             log_msg(log_list, f"🧠 Phase A [Batch {current_batch_num}]: Analysiere und strukturiere Dokumente...")
             for idx_in_chunk, (rel_path, file_path) in enumerate(chunk, 1):
                 global_idx = batch_idx + idx_in_chunk
@@ -556,7 +556,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 except Exception as parse_err:
                     log_msg(log_list, f"   ❌ Analyse-Fehler bei {rel_path}: {str(parse_err)}")
 
-            # --- VRAM SWITCH: ENTLEERE LLM-MODELL AUS DEM SPEICHER ---
+            # --- VRAM RELEASE VOR EMBEDDING ---
             if used_llm_in_this_batch:
                 log_msg(log_list, f"🔄 Phase A abgeschlossen. Entlade Anwendungs-LLM ({active_model}) aus dem VRAM...")
                 unload_ollama_model(ollama_worker, active_model)
@@ -566,7 +566,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 log_msg(log_list, f"ℹ️ Batch {current_batch_num} enthält keine neu zu indizierenden Dateien.\n")
                 continue
 
-            # --- PHASE B: VEKTORISIERUNG & QDRANT UPSERT (EMBEDDING MODELL BELEGT VRAM) ---
+            # --- PHASE B: VEKTORISIERUNG MIT ADAPTIVER 10%-REDUKTIONS-SCHLEIFE ---
             log_msg(log_list, f"📐 Phase B [Batch {current_batch_num}]: Erzeuge Embeddings ({EMBED_MODEL}) & speichere in Qdrant...")
             for prep_item in batch_prepared_items:
                 rel_path = prep_item["rel_path"]
@@ -577,24 +577,41 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 global_idx = prep_item["global_idx"]
 
                 embed_start_time = time.time()
-                embed_prompt = processed_md[:max_embed_chars]
+                current_chars = max_embed_chars
+                min_chars_limit = 500
+                embed_res = None
+                success = False
 
-                try:
+                # Dynamic Adaptive Fallback Loop
+                while current_chars >= min_chars_limit:
+                    embed_prompt = processed_md[:current_chars]
                     try:
                         embed_res = ollama_worker.embeddings(
                             model=EMBED_MODEL, 
                             prompt=embed_prompt,
                             options={"num_ctx": num_ctx}
                         )
-                    except Exception as embed_err:
-                        log_msg(log_list, f"   ⚠️ Embedding-Fehler bei {EMBED_MODEL} ({embed_err}). Versuche verkleinerten Prompt (8000 Chars)...")
-                        time.sleep(2)  # Kurze GPU-Erholungszeit nach Vulkan/VRAM Reset
-                        embed_res = ollama_worker.embeddings(
-                            model=EMBED_MODEL, 
-                            prompt=processed_md[:8000],
-                            options={"num_ctx": num_ctx}
-                        )
+                        success = True
+                        break  # Embedding erfolgreich!
 
+                    except Exception as embed_err:
+                        new_chars = int(current_chars * 0.90)
+                        if new_chars >= current_chars:
+                            new_chars = current_chars - 100
+                        
+                        log_msg(
+                            log_list, 
+                            f"   ⚠️ Embedding-Fehler bei {rel_path} ({embed_err}). "
+                            f"Reduziere Zeichenanzahl um 10% ({current_chars} ➔ {new_chars} Chars)..."
+                        )
+                        current_chars = new_chars
+                        time.sleep(2.0)  # Erholungszeit für den Vulkan-Treiber nach ErrorDeviceLost
+
+                if not success or embed_res is None:
+                    log_msg(log_list, f"   ❌ Indizierungs-Fehler bei {rel_path}: Selbst nach Reduktion auf {min_chars_limit} Zeichen fehlgeschlagen.")
+                    continue
+
+                try:
                     vector = embed_res['embedding']
                     ensure_qdrant_collection(qdrant_worker, target_collection, len(vector))
                     point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{rel_path}"))
@@ -618,16 +635,16 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                     embed_dur = time.time() - embed_start_time
                     total_file_dur = parse_dur + embed_dur
-                    log_msg(log_list, f"[{global_idx}/{total_files}] ✅ Indiziert in {total_file_dur:.2f}s (Analyse: {parse_dur:.2f}s | Embed: {embed_dur:.2f}s) | **#{category_tag}**: {rel_path}")
+                    log_msg(log_list, f"[{global_idx}/{total_files}] ✅ Indiziert in {total_file_dur:.2f}s (Analyse: {parse_dur:.2f}s | Embed: {embed_dur:.2f}s | {current_chars} Chars) | **#{category_tag}**: {rel_path}")
 
                 except Exception as upsert_err:
-                    log_msg(log_list, f"   ❌ Indizierungs-Fehler bei {rel_path}: {str(upsert_err)}")
+                    log_msg(log_list, f"   ❌ Qdrant Upsert-Fehler bei {rel_path}: {str(upsert_err)}")
 
-            # --- VRAM CLEANUP: ENTLEERE EMBEDDING-MODELL VOR NÄCHSTEM BATCH ---
+            # --- VRAM CLEANUP VOR NÄCHSTEM BATCH ---
             log_msg(log_list, f"🔄 Phase B abgeschlossen. Entlade Embedding-Modell ({EMBED_MODEL}) aus dem VRAM...")
             unload_ollama_model(ollama_worker, EMBED_MODEL)
             time.sleep(1.5)
-            log_msg(log_list, f"✅ Batch {current_batch_num}/{total_batches} vollständig in Qdrant verankert!\n")
+            log_msg(log_list, f"✅ Batch {current_batch_num}/{total_batches} vollständig verankert!\n")
 
         log_msg(log_list, f"🎉 Ingestion erfolgreich beendet! Alle Dokumente sind in Collection '{target_collection}' verfügbar.")
         status_dict["header"] = f"✅ Status: ABGESCHLOSSEN ({total_files}/{total_files})"
