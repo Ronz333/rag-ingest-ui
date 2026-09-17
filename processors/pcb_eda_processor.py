@@ -1,8 +1,8 @@
 """
 KICAD & SPECCTRA EDA PROCESSOR
 ------------------------------
-Fast-Pass-Processor für KiCad Footprints, Symbols, DRC-Regeln und
-Specctra DSN/SES Routing-Konfigurationen ohne LLM-Overhead.
+Verarbeitet KiCad Footprints, Symbols, DRC-Regeln und Specctra DSN/SES.
+Ist im Modus "Programmiersprachen & Software" deaktiviert.
 """
 
 import os
@@ -18,7 +18,12 @@ class PcbEdaProcessor(BaseProcessor):
     collection_name = "pcb_knowledge_base"
     supported_extensions = {".kicad_mod", ".kicad_sym", ".kicad_pcb", ".kicad_sch", ".kicad_dru", ".rules", ".dsn", ".ses"}
 
-    def can_handle(self, rel_path: str, ext: str) -> bool:
+    SOFTWARE_CATEGORY = "💻 Programmiersprachen & Software"
+
+    def can_handle(self, rel_path: str, ext: str, selected_category: str = "") -> bool:
+        # KiCad-Footprints/DSN sind keine allgemeinen Programmiersprachen
+        if selected_category == self.SOFTWARE_CATEGORY:
+            return False
         return ext in self.supported_extensions
 
     def parse(
@@ -28,7 +33,8 @@ class PcbEdaProcessor(BaseProcessor):
         active_model: str, 
         ollama_client, 
         num_ctx: int, 
-        max_code_len: int
+        max_code_len: int,
+        selected_category: str = ""
     ) -> Tuple[Optional[str], Optional[str]]:
         ext = os.path.splitext(rel_path)[1].lower()
         filename = os.path.basename(rel_path)
