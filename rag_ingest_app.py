@@ -183,7 +183,7 @@ def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int
 
     return chunks
 
-# --- PROZESS WORKER MIT PRECISE REAL-TIME LOGGING ---
+# --- PROZESS WORKER MIT PRECISE REAL-TIME LOGGING & QWEN3-CODER OPTIMIERUNG ---
 def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size):
     temp_work_dir = None
     try:
@@ -193,6 +193,15 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         category_info = CATEGORIES.get(category_key, CATEGORIES[list(CATEGORIES.keys())[0]])
         target_collection = category_info["collection"]
         active_model = selected_model if selected_model else DEFAULT_MODEL
+
+        # Optimierte Parameter für Qwen3-Coder (Unsloth Recommendation)
+        llm_options = {
+            "num_ctx": num_ctx,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "repeat_penalty": 1.05
+        }
 
         session_id = str(uuid.uuid4())[:8]
         temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
@@ -274,6 +283,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         total_files = len(files_to_process)
         log_msg(log_list, f"📊 Gesamt: {total_files} Datei(en) bereit zur Prüfung.")
         log_msg(log_list, f"⚙️ Konfiguration: Target Batch Size = {batch_size} verarbeitete Dateien | Max Embed Chars = {max_embed_chars}")
+        log_msg(log_list, f"⚙️ Qwen3-Coder Parameter: temp=0.7 | top_p=0.8 | top_k=20 | repeat_penalty=1.05")
         
         existing_hashes = get_indexed_hashes_set(qdrant_worker, target_collection)
         log_msg(log_list, f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
@@ -300,8 +310,9 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             parse_start_time = time.time()
 
             try:
+                # Übergibt llm_options direkt an die Processoren
                 category_tag, processed_md = registry.dispatch_parse(
-                    rel_path, raw_text, active_model, ollama_worker, num_ctx, max_embed_chars, selected_category=category_key
+                    rel_path, raw_text, active_model, ollama_worker, llm_options, max_embed_chars, selected_category=category_key
                 )
 
                 if processed_md == "SKIP" or not processed_md:
