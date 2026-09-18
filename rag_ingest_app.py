@@ -183,7 +183,7 @@ def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int
 
     return chunks
 
-# --- PROZESS WORKER MIT DYNAMISCHER BATCH-AKKUMULATION & SLIDER-KOPPLUNG ---
+# --- PROZESS WORKER MIT DYNAMISCHER BATCH-AKKUMULATION & SCHRITTWEISEM LOGGING ---
 def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size):
     temp_work_dir = None
     try:
@@ -283,7 +283,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         used_llm_in_current_batch = False
 
         for global_idx, (rel_path, file_path) in enumerate(files_to_process, 1):
-            status_dict["header"] = f"🟢 Status: LÄUFT (Datei {global_idx}/{total_files} | Im Batch-Puffer: {len(batch_prepared_items)}/{batch_size})"
+            current_buffer_count = len(batch_prepared_items)
+            status_dict["header"] = f"🟢 Status: LÄUFT (Datei {global_idx}/{total_files} | Im Batch-Puffer: {current_buffer_count}/{batch_size})"
 
             raw_text = extract_text_from_file(file_path)
             if not raw_text.strip():
@@ -316,6 +317,14 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 })
                 used_llm_in_current_batch = True
 
+                # Sofortiges Feedback in Phase A inkl. aktuellem Batch-Zähler
+                new_buffer_count = len(batch_prepared_items)
+                log_msg(
+                    log_list, 
+                    f"[{global_idx}/{total_files}] 🧠 Phase A analysiert in {parse_duration:.2f}s "
+                    f"[Batch-Puffer: {new_buffer_count}/{batch_size}] | **#{category_tag}**: {rel_path}"
+                )
+
             except Exception as parse_err:
                 log_msg(log_list, f"   ❌ Analyse-Fehler bei {rel_path}: {str(parse_err)}")
 
@@ -323,8 +332,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             is_last_file = (global_idx == total_files)
             if len(batch_prepared_items) >= batch_size or (is_last_file and batch_prepared_items):
                 batch_count += 1
-                log_msg(log_list, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                log_msg(log_list, f"📦 VERARBEITE BATCH {batch_count} ({len(batch_prepared_items)} verarbeitungsbereite Dateien)")
+                log_msg(log_list, f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                log_msg(log_list, f"📦 STARTE VEKTORISIERUNG FÜR BATCH {batch_count} ({len(batch_prepared_items)} Dateien)")
                 log_msg(log_list, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
                 if used_llm_in_current_batch:
@@ -345,7 +354,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     g_idx = prep_item["global_idx"]
 
                     embed_start_time = time.time()
-                    # DIRECT SLIDER BINDING: Nutzt exakt max_embed_chars aus der GUI
                     md_chunks = smart_markdown_chunking(p_md, max_chars=max_embed_chars, overlap_chars=overlap_val)
 
                     for chunk_idx, md_chunk in enumerate(md_chunks):
@@ -399,8 +407,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     total_file_dur = p_dur + embed_dur
                     log_msg(
                         log_list, 
-                        f"[{g_idx}/{total_files}] ✅ Indiziert in {total_file_dur:.2f}s "
-                        f"({len(md_chunks)} Chunk(s) | Analyse: {p_dur:.2f}s | Embed: {embed_dur:.2f}s) | **#{c_tag}**: {r_path}"
+                        f"[{g_idx}/{total_files}] ✅ Phase B Vektorisierung abgeschlossen in {embed_dur:.2f}s "
+                        f"({len(md_chunks)} Chunk(s) | Gesamtzeit: {total_file_dur:.2f}s) | **#{c_tag}**: {r_path}"
                     )
 
                 log_msg(log_list, f"🔄 Phase B abgeschlossen. Entlade Embedding-Modell ({EMBED_MODEL}) aus VRAM...\n")
