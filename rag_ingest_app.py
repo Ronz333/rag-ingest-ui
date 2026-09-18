@@ -183,7 +183,7 @@ def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int
 
     return chunks
 
-# --- PROZESS WORKER MIT DYNAMISCHER BATCH-AKKUMULATION & SCHRITTWEISEM LOGGING ---
+# --- PROZESS WORKER MIT PRECISE REAL-TIME LOGGING ---
 def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size):
     temp_work_dir = None
     try:
@@ -295,6 +295,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
                 continue
 
+            # LOG START PHASE A ANALYSE
+            log_msg(log_list, f"[{global_idx}/{total_files}] ⏳ Starte Phase A Analyse [Batch-Puffer: {current_buffer_count}/{batch_size}]: {rel_path}")
             parse_start_time = time.time()
 
             try:
@@ -317,11 +319,11 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 })
                 used_llm_in_current_batch = True
 
-                # Sofortiges Feedback in Phase A inkl. aktuellem Batch-Zähler
+                # LOG END PHASE A ANALYSE
                 new_buffer_count = len(batch_prepared_items)
                 log_msg(
                     log_list, 
-                    f"[{global_idx}/{total_files}] 🧠 Phase A analysiert in {parse_duration:.2f}s "
+                    f"[{global_idx}/{total_files}] ✅ Phase A Analyse abgeschlossen in {parse_duration:.2f}s "
                     f"[Batch-Puffer: {new_buffer_count}/{batch_size}] | **#{category_tag}**: {rel_path}"
                 )
 
@@ -353,6 +355,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     p_dur = prep_item["parse_duration"]
                     g_idx = prep_item["global_idx"]
 
+                    # LOG START PHASE B VEKTORISIERUNG
+                    log_msg(log_list, f"[{g_idx}/{total_files}] ⏳ Starte Phase B Vektorisierung: {r_path}")
                     embed_start_time = time.time()
                     md_chunks = smart_markdown_chunking(p_md, max_chars=max_embed_chars, overlap_chars=overlap_val)
 
@@ -405,6 +409,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                     embed_dur = time.time() - embed_start_time
                     total_file_dur = p_dur + embed_dur
+                    # LOG END PHASE B VEKTORISIERUNG
                     log_msg(
                         log_list, 
                         f"[{g_idx}/{total_files}] ✅ Phase B Vektorisierung abgeschlossen in {embed_dur:.2f}s "
