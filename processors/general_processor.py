@@ -84,10 +84,12 @@ INHALT:
 Erstelle eine präzise, strukturierte Zusammenfassung auf Deutsch mit Fokus auf Funktionsweise, Verwendung und Steuerungsfragen."""
 
         try:
+            options_dict = num_ctx if isinstance(num_ctx, dict) else {"num_ctx": num_ctx}
+
             response = ollama_client.chat(
                 model=active_model,
                 messages=[{'role': 'user', 'content': enrichment_prompt}],
-                options={"num_ctx": num_ctx}
+                options=options_dict  # ✅ Reicht temperature, top_p, top_k etc. direkt an Ollama weiter
             )
             processed_md = response['message']['content']
             return "DOCUMENTATION", processed_md
