@@ -121,10 +121,12 @@ a) ERZWUNGENE AST-ABDECKUNG: Generiere ZWINGEND für JEDES dieser Elemente minde
 b) FORMULIERUNG: Verwende AUSSCHLIESSLICH "Wie steuere / nutze / erstelle / vergleiche / konfiguriere ich X mit dieser API?"-Fragen."""
 
         try:
+            options_dict = num_ctx if isinstance(num_ctx, dict) else {"num_ctx": num_ctx}
+
             response = ollama_client.chat(
                 model=active_model,
                 messages=[{'role': 'user', 'content': enrichment_prompt}],
-                options={"num_ctx": num_ctx}
+                options=options_dict  # ✅ Reicht temperature, top_p, top_k etc. direkt an Ollama weiter
             )
             enrichment_text = response['message']['content']
         except Exception:
