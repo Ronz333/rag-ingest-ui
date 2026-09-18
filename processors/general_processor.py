@@ -2,8 +2,8 @@
 GENERAL DOCUMENTATION PROCESSOR
 -------------------------------
 Verarbeitet allgemeine Dokumentationsdateien (.md, .txt, .rst).
-Filtert Meta- und Verwaltungsdateien (AUTHORS, CONTRIBUTING, HISTORY, LICENSE, etc.)
-rigoros heraus, insbesondere im PCB-/Hardware-Kontext.
+Filtert Meta- und Verwaltungsdateien sowie generierte Sphinx/HTML-Build-Artefakte
+(/_sources/, /html/) rigoros heraus.
 """
 
 import os
@@ -17,6 +17,12 @@ class GeneralDocumentProcessor(BaseProcessor):
     supported_extensions = {".md", ".txt", ".rst"}
 
     PCB_CATEGORY = "⚡ PCB & Hardware Design"
+
+    # Verzeichnisse von generierten Dokumentationen / Build-Artefakten
+    IGNORED_PATH_PARTS = [
+        "/_sources/", "/html/", "/_static/", "/_templates/", 
+        "/docs/api/", "/build/", "/dist/", "/.git/", "/site-packages/"
+    ]
 
     META_FILENAMES = {
         "authors", "authors.md", "authors.txt",
@@ -35,6 +41,9 @@ class GeneralDocumentProcessor(BaseProcessor):
     }
 
     def can_handle(self, rel_path: str, ext: str, selected_category: str = "") -> bool:
+        rel_lower = rel_path.lower()
+        if any(p in rel_lower for p in self.IGNORED_PATH_PARTS):
+            return False
         return ext in self.supported_extensions
 
     def parse(
@@ -48,22 +57,24 @@ class GeneralDocumentProcessor(BaseProcessor):
         selected_category: str = ""
     ) -> Tuple[Optional[str], Optional[str]]:
         filename = os.path.basename(rel_path).lower()
+        rel_lower = rel_path.lower()
 
-        # 1. Meta-Verwaltungsdateien immer ignorieren
+        # 1. Build-Artefakte und Doku-Quellen ignorieren
+        if any(p in rel_lower for p in self.IGNORED_PATH_PARTS):
+            return "IGNORED", "SKIP"
+
+        # 2. Meta-Verwaltungsdateien ignorieren
         if filename in self.META_FILENAMES or any(meta in filename for meta in ["changelog", "contributing", "code_of_conduct"]):
             return "IGNORED", "SKIP"
 
-        # 2. Im PCB-Modus: Prüfen, ob das Dokument wirklich relevanten PCB-/API-Bezug hat
+        # 3. Im PCB-Modus: Nur verarbeiten, wenn PCB-/API-Bezug vorliegt
         if selected_category == self.PCB_CATEGORY:
-            rel_lower = rel_path.lower()
             text_snippet = raw_text[:3000].lower()
-
             is_relevant = any(kw in rel_lower for kw in self.PCB_KEYWORDS) or any(kw in text_snippet for kw in self.PCB_KEYWORDS)
 
             if not is_relevant and filename != "readme.md":
                 return "IGNORED", "SKIP"
 
-        # 3. Verarbeiten von echter Dokumentation (z. B. README.md oder API-Guides)
         enrichment_prompt = f"""Analysiere diese Dokumentation für ein RAG-System:
 
 DATEIPFAD: {rel_path}
