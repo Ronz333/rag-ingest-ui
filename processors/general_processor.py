@@ -2,9 +2,8 @@
 GENERAL DOCUMENTATION PROCESSOR
 -------------------------------
 Verarbeitet allgemeine Dokumentationsdateien (.md, .txt, .rst).
-Filtert Meta- und Verwaltungsdateien, generierte Sphinx/HTML-Build-Artefakte
-sowie Entwickler- & CI/CD-Workflow-Dateien (/.agents/, /.github/, /code-quality/)
-rigoros heraus.
+Filtert Meta- und Verwaltungsdateien, generierte Sphinx/HTML-Build-Artefakte,
+Test-Fixtures sowie Entwickler- & CI/CD-Workflow-Dateien rigoros heraus.
 """
 
 import os
@@ -19,12 +18,13 @@ class GeneralDocumentProcessor(BaseProcessor):
 
     PCB_CATEGORY = "⚡ PCB & Hardware Design"
 
-    # Verzeichnisse von generierten Dokumentationen, Build-Artefakten & Repo-Meta/CI-Workflows
+    # Verzeichnisse von generierten Dokumentationen, Build-Artefakten, Test-Fixtures & Repo-Meta/CI-Workflows
     IGNORED_PATH_PARTS = [
         "/_sources/", "/html/", "/_static/", "/_templates/", 
         "/docs/api/", "/build/", "/dist/", "/.git/", "/site-packages/",
         "/.agents/", "/.github/", "/.gitlab/", "/.vscode/", "/.idea/",
-        "/code-quality", "/skills/", "/pre-commit", "/hooks/"
+        "/code-quality", "/skills/", "/pre-commit", "/hooks/",
+        "/fixtures/", "/tests/", "/test/", "/benchmarks/", "/scripts/benchmark/"
     ]
 
     META_FILENAMES = {
@@ -35,7 +35,7 @@ class GeneralDocumentProcessor(BaseProcessor):
         "changelog", "changelog.md", "changelog.txt",
         "license", "license.md", "license.txt", "licence",
         "code_of_conduct", "code_of_conduct.md",
-        "security.md", "governance.md", "todo.md", "skill.md"
+        "security.md", "governance.md", "todo.md", "skill.md", "report.txt"
     }
 
     PCB_KEYWORDS = {
@@ -62,11 +62,11 @@ class GeneralDocumentProcessor(BaseProcessor):
         filename = os.path.basename(rel_path).lower()
         rel_lower = rel_path.lower()
 
-        # 1. Build-Artefakte, Doku-Quellen und Entwickler-Meta-Ordner ignorieren
+        # 1. Build-Artefakte, Fixtures, Doku-Quellen und Entwickler-Meta-Ordner ignorieren
         if any(p in rel_lower for p in self.IGNORED_PATH_PARTS):
             return "IGNORED", "SKIP"
 
-        # 2. Meta-Verwaltungsdateien ignorieren
+        # 2. Meta-Verwaltungsdateien & Test-Reports ignorieren
         if filename in self.META_FILENAMES or any(meta in filename for meta in ["changelog", "contributing", "code_of_conduct"]):
             return "IGNORED", "SKIP"
 
