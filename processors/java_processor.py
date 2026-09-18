@@ -94,10 +94,12 @@ a) ERZWUNGENE JAVA-ELEMENT-ABDECKUNG: Generiere ZWINGEND für JEDES dieser Eleme
 b) FORMULIERUNG: Verwende "Wie steuere / nutze / konfiguriere ich X mit dieser Java API?"-Fragen."""
 
         try:
+            options_dict = num_ctx if isinstance(num_ctx, dict) else {"num_ctx": num_ctx}
+
             response = ollama_client.chat(
                 model=active_model,
                 messages=[{'role': 'user', 'content': enrichment_prompt}],
-                options={"num_ctx": num_ctx}
+                options=options_dict  # ✅ Reicht temperature, top_p, top_k etc. direkt an Ollama weiter
             )
             enrichment_text = response['message']['content']
         except Exception:
