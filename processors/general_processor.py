@@ -2,8 +2,9 @@
 GENERAL DOCUMENTATION PROCESSOR
 -------------------------------
 Verarbeitet allgemeine Dokumentationsdateien (.md, .txt, .rst).
-Filtert Meta- und Verwaltungsdateien sowie generierte Sphinx/HTML-Build-Artefakte
-(/_sources/, /html/) rigoros heraus.
+Filtert Meta- und Verwaltungsdateien, generierte Sphinx/HTML-Build-Artefakte
+sowie Entwickler- & CI/CD-Workflow-Dateien (/.agents/, /.github/, /code-quality/)
+rigoros heraus.
 """
 
 import os
@@ -18,10 +19,12 @@ class GeneralDocumentProcessor(BaseProcessor):
 
     PCB_CATEGORY = "⚡ PCB & Hardware Design"
 
-    # Verzeichnisse von generierten Dokumentationen / Build-Artefakten
+    # Verzeichnisse von generierten Dokumentationen, Build-Artefakten & Repo-Meta/CI-Workflows
     IGNORED_PATH_PARTS = [
         "/_sources/", "/html/", "/_static/", "/_templates/", 
-        "/docs/api/", "/build/", "/dist/", "/.git/", "/site-packages/"
+        "/docs/api/", "/build/", "/dist/", "/.git/", "/site-packages/",
+        "/.agents/", "/.github/", "/.gitlab/", "/.vscode/", "/.idea/",
+        "/code-quality", "/skills/", "/pre-commit", "/hooks/"
     ]
 
     META_FILENAMES = {
@@ -32,7 +35,7 @@ class GeneralDocumentProcessor(BaseProcessor):
         "changelog", "changelog.md", "changelog.txt",
         "license", "license.md", "license.txt", "licence",
         "code_of_conduct", "code_of_conduct.md",
-        "security.md", "governance.md", "todo.md"
+        "security.md", "governance.md", "todo.md", "skill.md"
     }
 
     PCB_KEYWORDS = {
@@ -52,14 +55,14 @@ class GeneralDocumentProcessor(BaseProcessor):
         raw_text: str, 
         active_model: str, 
         ollama_client, 
-        num_ctx: int, 
+        num_ctx,
         max_code_len: int,
         selected_category: str = ""
     ) -> Tuple[Optional[str], Optional[str]]:
         filename = os.path.basename(rel_path).lower()
         rel_lower = rel_path.lower()
 
-        # 1. Build-Artefakte und Doku-Quellen ignorieren
+        # 1. Build-Artefakte, Doku-Quellen und Entwickler-Meta-Ordner ignorieren
         if any(p in rel_lower for p in self.IGNORED_PATH_PARTS):
             return "IGNORED", "SKIP"
 
@@ -67,13 +70,15 @@ class GeneralDocumentProcessor(BaseProcessor):
         if filename in self.META_FILENAMES or any(meta in filename for meta in ["changelog", "contributing", "code_of_conduct"]):
             return "IGNORED", "SKIP"
 
-        # 3. Im PCB-Modus: Nur verarbeiten, wenn PCB-/API-Bezug vorliegt
+        # 3. Im PCB-Modus: Nur verarbeiten, wenn echter PCB-/API-Bezug vorliegt
         if selected_category == self.PCB_CATEGORY:
             text_snippet = raw_text[:3000].lower()
             is_relevant = any(kw in rel_lower for kw in self.PCB_KEYWORDS) or any(kw in text_snippet for kw in self.PCB_KEYWORDS)
 
             if not is_relevant and filename != "readme.md":
                 return "IGNORED", "SKIP"
+
+        options_dict = num_ctx if isinstance(num_ctx, dict) else {"num_ctx": num_ctx}
 
         enrichment_prompt = f"""Analysiere diese Dokumentation für ein RAG-System:
 
@@ -84,12 +89,10 @@ INHALT:
 Erstelle eine präzise, strukturierte Zusammenfassung auf Deutsch mit Fokus auf Funktionsweise, Verwendung und Steuerungsfragen."""
 
         try:
-            options_dict = num_ctx if isinstance(num_ctx, dict) else {"num_ctx": num_ctx}
-
             response = ollama_client.chat(
                 model=active_model,
                 messages=[{'role': 'user', 'content': enrichment_prompt}],
-                options=options_dict  # ✅ Reicht temperature, top_p, top_k etc. direkt an Ollama weiter
+                options=options_dict
             )
             processed_md = response['message']['content']
             return "DOCUMENTATION", processed_md
