@@ -149,7 +149,7 @@ def calculate_dynamic_num_ctx(text_len: int, max_limit: int = 32768) -> int:
         num_ctx *= 2
     return min(num_ctx, max_limit)
 
-def smart_markdown_chunking(text: str, max_chars: int = 12000, overlap_chars: int = 1200) -> list[str]:
+def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int = 400) -> list[str]:
     """Trennt Markdown strukturbewusst an Überschriften/Absätzen und hält Kontext via Overlap."""
     if len(text) <= max_chars:
         return [text]
@@ -183,7 +183,7 @@ def smart_markdown_chunking(text: str, max_chars: int = 12000, overlap_chars: in
 
     return chunks
 
-# --- PROZESS WORKER MIT PLUGIN-DISPATCHING & STRUCTURAL CHUNKING ---
+# --- PROZESS WORKER MIT DYNAMISCHER BATCH-AKKUMULATION & SLIDER-KOPPLUNG ---
 def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size):
     temp_work_dir = None
     try:
@@ -192,7 +192,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
         category_info = CATEGORIES.get(category_key, CATEGORIES[list(CATEGORIES.keys())[0]])
         target_collection = category_info["collection"]
-        system_prompt = category_info["system_prompt"]
         active_model = selected_model if selected_model else DEFAULT_MODEL
 
         session_id = str(uuid.uuid4())[:8]
@@ -273,155 +272,143 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             return
 
         total_files = len(files_to_process)
-        total_batches = (total_files + batch_size - 1) // batch_size
-        log_msg(log_list, f"📊 Gesamt: {total_files} Datei(en) bereit zur Indizierung.")
-        log_msg(log_list, f"⚙️ Modus: Phase-Batching ({batch_size} Dateien/Batch -> {total_batches} Batches total)")
-        log_msg(log_list, f"⚙️ Konfiguration: Context={num_ctx} Tokens | Max Embed Chars={max_embed_chars}")
+        log_msg(log_list, f"📊 Gesamt: {total_files} Datei(en) bereit zur Prüfung.")
+        log_msg(log_list, f"⚙️ Konfiguration: Target Batch Size = {batch_size} verarbeitete Dateien | Max Embed Chars = {max_embed_chars}")
         
         existing_hashes = get_indexed_hashes_set(qdrant_worker, target_collection)
         log_msg(log_list, f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
 
-        for batch_idx in range(0, total_files, batch_size):
-            chunk = files_to_process[batch_idx : batch_idx + batch_size]
-            current_batch_num = (batch_idx // batch_size) + 1
+        batch_prepared_items = []
+        batch_count = 0
+        used_llm_in_current_batch = False
 
-            log_msg(log_list, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            log_msg(log_list, f"📦 STARTE BATCH {current_batch_num}/{total_batches} ({len(chunk)} Dateien in diesem Durchlauf)")
-            log_msg(log_list, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        for global_idx, (rel_path, file_path) in enumerate(files_to_process, 1):
+            status_dict["header"] = f"🟢 Status: LÄUFT (Datei {global_idx}/{total_files} | Im Batch-Puffer: {len(batch_prepared_items)}/{batch_size})"
 
-            batch_prepared_items = []
-            used_llm_in_this_batch = False
-
-            # --- PHASE A: TEXTANALYSE BEIM REGISTRIERTEN PLUGIN DELEGIEREN ---
-            log_msg(log_list, f"🧠 Phase A [Batch {current_batch_num}]: Analysiere und strukturiere Dokumente...")
-            for idx_in_chunk, (rel_path, file_path) in enumerate(chunk, 1):
-                global_idx = batch_idx + idx_in_chunk
-                status_dict["header"] = f"🟢 Status: LÄUFT (Batch {current_batch_num}/{total_batches} | Datei {global_idx}/{total_files})"
-
-                raw_text = extract_text_from_file(file_path)
-                if not raw_text.strip():
-                    continue
-
-                content_hash = calculate_sha256(raw_text)
-                if (rel_path, content_hash) in existing_hashes:
-                    log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
-                    continue
-
-                parse_start_time = time.time()
-
-                try:
-                    # Delegiere Analyse an Registry unter Angabe der gewählten GUI-Kategorie
-                    category_tag, processed_md = registry.dispatch_parse(
-                        rel_path, raw_text, active_model, ollama_worker, num_ctx, max_embed_chars, selected_category=category_key
-                    )
-
-                    # Überspringen, wenn das Plugin die Datei als irrelevant eingestuft hat ("SKIP")
-                    if processed_md == "SKIP":
-                        log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Übersprungen (Irrelevant für '{category_key}'): {rel_path}")
-                        continue
-
-                    # Datei wird übersprungen, wenn kein Prozessor zuständig ist (Kein blinder LLM-Fallback)
-                    if not processed_md:
-                        log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Kein passender Processor (Ignoriert): {rel_path}")
-                        continue
-
-                    if category_tag not in {"KICAD_FOOTPRINT", "KICAD_SYM", "KICAD_DRC_RULES", "SPECCTRA_DSN", "FREEROUTING_RULES"}:
-                        used_llm_in_this_batch = True
-
-                    parse_duration = time.time() - parse_start_time
-                    batch_prepared_items.append({
-                        "rel_path": rel_path,
-                        "content_hash": content_hash,
-                        "category_tag": category_tag,
-                        "processed_md": processed_md,
-                        "parse_duration": parse_duration,
-                        "global_idx": global_idx
-                    })
-
-                except Exception as parse_err:
-                    log_msg(log_list, f"   ❌ Analyse-Fehler bei {rel_path}: {str(parse_err)}")
-
-            if used_llm_in_this_batch:
-                log_msg(log_list, f"🔄 Phase A abgeschlossen. Entlade Anwendungs-LLM ({active_model}) aus dem VRAM...")
-                unload_ollama_model(ollama_worker, active_model)
-                time.sleep(1.5)
-
-            if not batch_prepared_items:
-                log_msg(log_list, f"ℹ️ Batch {current_batch_num} enthält keine neu zu indizierenden Dateien.\n")
+            raw_text = extract_text_from_file(file_path)
+            if not raw_text.strip():
                 continue
 
-            # --- PHASE B: VEKTORISIERUNG MIT OVERLAP CHUNKING ---
-            log_msg(log_list, f"📐 Phase B [Batch {current_batch_num}]: Erzeuge Embeddings ({EMBED_MODEL}) & speichere in Qdrant...")
-            for prep_item in batch_prepared_items:
-                rel_path = prep_item["rel_path"]
-                content_hash = prep_item["content_hash"]
-                category_tag = prep_item["category_tag"]
-                processed_md = prep_item["processed_md"]
-                parse_dur = prep_item["parse_duration"]
-                global_idx = prep_item["global_idx"]
+            content_hash = calculate_sha256(raw_text)
+            if (rel_path, content_hash) in existing_hashes:
+                log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
+                continue
 
-                embed_start_time = time.time()
-                md_chunks = smart_markdown_chunking(processed_md, max_chars=12000, overlap_chars=1200)
+            parse_start_time = time.time()
 
-                for chunk_idx, md_chunk in enumerate(md_chunks):
-                    chunk_success = False
-                    retry_count = 0
-                    current_chars = len(md_chunk)
-
-                    while not chunk_success and retry_count < 3:
-                        try:
-                            chunk_ctx = calculate_dynamic_num_ctx(current_chars, max_limit=32768)
-
-                            embed_res = ollama_worker.embeddings(
-                                model=EMBED_MODEL, 
-                                prompt=md_chunk[:current_chars],
-                                options={"num_ctx": chunk_ctx}
-                            )
-
-                            vector = embed_res['embedding']
-                            ensure_qdrant_collection(qdrant_worker, target_collection, len(vector))
-
-                            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{rel_path}_chunk_{chunk_idx}"))
-
-                            qdrant_worker.upsert(
-                                collection_name=target_collection,
-                                points=[
-                                    PointStruct(
-                                        id=point_id,
-                                        vector=vector,
-                                        payload={
-                                            "filename": os.path.basename(rel_path),
-                                            "file_path": rel_path,
-                                            "content_hash": content_hash,
-                                            "category_tag": category_tag,
-                                            "chunk_index": chunk_idx,
-                                            "total_chunks": len(md_chunks),
-                                            "content": md_chunk[:current_chars]
-                                        }
-                                    )
-                                ]
-                            )
-                            chunk_success = True
-
-                        except Exception as embed_err:
-                            retry_count += 1
-                            log_msg(log_list, f"   ⚠️ Vulkan-Reset bei {rel_path} (Chunk {chunk_idx+1}/{len(md_chunks)}): {embed_err}")
-                            unload_ollama_model(ollama_worker, EMBED_MODEL)
-                            time.sleep(2.5)
-                            current_chars = int(current_chars * 0.85)
-
-                embed_dur = time.time() - embed_start_time
-                total_file_dur = parse_dur + embed_dur
-                log_msg(
-                    log_list, 
-                    f"[{global_idx}/{total_files}] ✅ Indiziert in {total_file_dur:.2f}s "
-                    f"({len(md_chunks)} Chunk(s) | Analyse: {parse_dur:.2f}s | Embed: {embed_dur:.2f}s) | **#{category_tag}**: {rel_path}"
+            try:
+                category_tag, processed_md = registry.dispatch_parse(
+                    rel_path, raw_text, active_model, ollama_worker, num_ctx, max_embed_chars, selected_category=category_key
                 )
 
-            log_msg(log_list, f"🔄 Phase B abgeschlossen. Entlade Embedding-Modell ({EMBED_MODEL}) aus dem VRAM...")
-            unload_ollama_model(ollama_worker, EMBED_MODEL)
-            time.sleep(1.5)
-            log_msg(log_list, f"✅ Batch {current_batch_num}/{total_batches} vollständig verankert!\n")
+                if processed_md == "SKIP" or not processed_md:
+                    log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Übersprungen (Irrelevant/Build-Doc): {rel_path}")
+                    continue
+
+                parse_duration = time.time() - parse_start_time
+                batch_prepared_items.append({
+                    "rel_path": rel_path,
+                    "content_hash": content_hash,
+                    "category_tag": category_tag,
+                    "processed_md": processed_md,
+                    "parse_duration": parse_duration,
+                    "global_idx": global_idx
+                })
+                used_llm_in_current_batch = True
+
+            except Exception as parse_err:
+                log_msg(log_list, f"   ❌ Analyse-Fehler bei {rel_path}: {str(parse_err)}")
+
+            # WENN DER PUFFER VOLL IST ODER DIE LETZTE DATEI ERREICHT WURDE:
+            is_last_file = (global_idx == total_files)
+            if len(batch_prepared_items) >= batch_size or (is_last_file and batch_prepared_items):
+                batch_count += 1
+                log_msg(log_list, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                log_msg(log_list, f"📦 VERARBEITE BATCH {batch_count} ({len(batch_prepared_items)} verarbeitungsbereite Dateien)")
+                log_msg(log_list, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+                if used_llm_in_current_batch:
+                    log_msg(log_list, f"🔄 Phase A abgeschlossen. Entlade Anwendungs-LLM ({active_model}) aus VRAM...")
+                    unload_ollama_model(ollama_worker, active_model)
+                    time.sleep(1.5)
+
+                # --- PHASE B: VEKTORISIERUNG MIT OVERLAP CHUNKING & SLIDER-GEBUNDENEM LIMIT ---
+                log_msg(log_list, f"📐 Phase B [Batch {batch_count}]: Erzeuge Embeddings ({EMBED_MODEL}) & speichere in Qdrant...")
+                overlap_val = max(200, int(max_embed_chars * 0.10))
+
+                for prep_item in batch_prepared_items:
+                    r_path = prep_item["rel_path"]
+                    c_hash = prep_item["content_hash"]
+                    c_tag = prep_item["category_tag"]
+                    p_md = prep_item["processed_md"]
+                    p_dur = prep_item["parse_duration"]
+                    g_idx = prep_item["global_idx"]
+
+                    embed_start_time = time.time()
+                    # DIRECT SLIDER BINDING: Nutzt exakt max_embed_chars aus der GUI
+                    md_chunks = smart_markdown_chunking(p_md, max_chars=max_embed_chars, overlap_chars=overlap_val)
+
+                    for chunk_idx, md_chunk in enumerate(md_chunks):
+                        chunk_success = False
+                        retry_count = 0
+                        current_chars = len(md_chunk)
+
+                        while not chunk_success and retry_count < 3:
+                            try:
+                                chunk_ctx = calculate_dynamic_num_ctx(current_chars, max_limit=32768)
+
+                                embed_res = ollama_worker.embeddings(
+                                    model=EMBED_MODEL, 
+                                    prompt=md_chunk[:current_chars],
+                                    options={"num_ctx": chunk_ctx}
+                                )
+
+                                vector = embed_res['embedding']
+                                ensure_qdrant_collection(qdrant_worker, target_collection, len(vector))
+
+                                point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{r_path}_chunk_{chunk_idx}"))
+
+                                qdrant_worker.upsert(
+                                    collection_name=target_collection,
+                                    points=[
+                                        PointStruct(
+                                            id=point_id,
+                                            vector=vector,
+                                            payload={
+                                                "filename": os.path.basename(r_path),
+                                                "file_path": r_path,
+                                                "content_hash": c_hash,
+                                                "category_tag": c_tag,
+                                                "chunk_index": chunk_idx,
+                                                "total_chunks": len(md_chunks),
+                                                "content": md_chunk[:current_chars]
+                                            }
+                                        )
+                                    ]
+                                )
+                                chunk_success = True
+
+                            except Exception as embed_err:
+                                retry_count += 1
+                                log_msg(log_list, f"   ⚠️ Vulkan-Reset bei {r_path} (Chunk {chunk_idx+1}/{len(md_chunks)}): {embed_err}")
+                                unload_ollama_model(ollama_worker, EMBED_MODEL)
+                                time.sleep(2.5)
+                                current_chars = int(current_chars * 0.80)
+
+                    embed_dur = time.time() - embed_start_time
+                    total_file_dur = p_dur + embed_dur
+                    log_msg(
+                        log_list, 
+                        f"[{g_idx}/{total_files}] ✅ Indiziert in {total_file_dur:.2f}s "
+                        f"({len(md_chunks)} Chunk(s) | Analyse: {p_dur:.2f}s | Embed: {embed_dur:.2f}s) | **#{c_tag}**: {r_path}"
+                    )
+
+                log_msg(log_list, f"🔄 Phase B abgeschlossen. Entlade Embedding-Modell ({EMBED_MODEL}) aus VRAM...\n")
+                unload_ollama_model(ollama_worker, EMBED_MODEL)
+                time.sleep(1.5)
+
+                batch_prepared_items.clear()
+                used_llm_in_current_batch = False
 
         log_msg(log_list, f"🎉 Ingestion erfolgreich beendet! Alle Dokumente sind in Collection '{target_collection}' verfügbar.")
         status_dict["header"] = f"✅ Status: ABGESCHLOSSEN ({total_files}/{total_files})"
@@ -702,7 +689,7 @@ initial_model_choices, initial_default_model = get_ollama_models()
 saved_cfg = load_config()
 initial_default_category = saved_cfg.get("last_category", list(CATEGORIES.keys())[0])
 initial_num_ctx = saved_cfg.get("last_num_ctx", 32768)
-initial_max_embed_chars = saved_cfg.get("last_max_embed_chars", 50000)
+initial_max_embed_chars = saved_cfg.get("last_max_embed_chars", 4000)
 initial_batch_size = saved_cfg.get("last_batch_size", 25)
 
 with gr.Blocks(title="Universal RAG Control Center") as demo:
@@ -738,8 +725,8 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     maximum=200, 
                     step=5, 
                     value=initial_batch_size, 
-                    label="Batch-Größe (Dateien pro Wechsel)",
-                    info="Legt fest, nach wie vielen analysierten Dateien VRAM entladen und Embeddings in Qdrant gespeichert werden."
+                    label="Batch-Größe (Gültig aufbereitete Dateien pro Wechsel)",
+                    info="Legt fest, nach wie vielen echten, verarbeiteten Dateien VRAM entladen und Embeddings in Qdrant gespeichert werden."
                 )
                 num_ctx_slider = gr.Slider(
                     minimum=4096, 
@@ -750,12 +737,12 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     info="Erhöht die max. Verarbeitungsmenge für LLM & Embedding (32.768 max für Qwen3)."
                 )
                 embed_chars_slider = gr.Slider(
-                    minimum=4000, 
-                    maximum=80000, 
-                    step=2000, 
+                    minimum=2000, 
+                    maximum=16000, 
+                    step=500, 
                     value=initial_max_embed_chars, 
-                    label="Max. Embedding Input Zeichen (Chars)",
-                    info="Regelt den Schnitt-Punkt vor der Einreichung beim Vektormodell."
+                    label="Max. Embedding Chunk-Größe (Zeichen)",
+                    info="Regelt die Chunk-Größe vor der Einreichung beim Vektormodell (4.000 Chars ideal für Vulkan)."
                 )
 
             with gr.Tabs():
