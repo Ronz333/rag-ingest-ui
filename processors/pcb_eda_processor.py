@@ -47,7 +47,7 @@ class PcbEdaProcessor(BaseProcessor):
         filename = os.path.basename(rel_path)
 
         if ext == ".dsn":
-            # SPECCTRA DSN: Struktur & Rules extrahieren, reine Koordinaten-Streams (placement, wiring) filtern
+            # SPECCTRA DSN: Struktur & Rules extrahieren, reine Koordinaten- & Polygon-Streams filtern
             cleaned_dsn = self._clean_dsn_content(raw_text)
             if not cleaned_dsn.strip():
                 return "IGNORED", "SKIP"
@@ -74,16 +74,16 @@ class PcbEdaProcessor(BaseProcessor):
 
     def _clean_dsn_content(self, dsn_text: str) -> str:
         """
-        Entfernt reine Koordinaten-Blöcke (placement, wire, via, network) aus DSN-Dateien,
+        Entfernt reine Koordinaten-Blöcke (placement, wire, via, network, plane polygons) aus DSN-Dateien,
         um nur relevante Struktur- und Regel-Spezifikationen (structure, rule, layer, resolution) zu behalten.
         """
-        # Entferne schwere Koordinaten-Blöcke
         cleaned = re.sub(r'\(placement\s*\(.*?\)\s*\)', '', dsn_text, flags=re.DOTALL)
+        cleaned = re.sub(r'\(plane\s+.*?\)', '', cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r'\(polygon\s+.*?\)', '', cleaned, flags=re.DOTALL)
         cleaned = re.sub(r'\(place\s+.*?\)', '', cleaned)
         cleaned = re.sub(r'\(wire\s+.*?\)', '', cleaned)
         cleaned = re.sub(r'\(path\s+.*?\)', '', cleaned)
         
-        # Mehrfache Leerzeilen bereinigen
         lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
         return "\n".join(lines)
 
