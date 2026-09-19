@@ -3,7 +3,7 @@ GENERAL DOCUMENTATION PROCESSOR
 -------------------------------
 Verarbeitet allgemeine Dokumentationsdateien (.md, .txt, .rst).
 Filtert Meta- und Verwaltungsdateien, generierte Sphinx/HTML-Build-Artefakte,
-Test-Fixtures sowie Entwickler- & CI/CD-Workflow-Dateien rigoros heraus.
+Test-Fixtures, Entwickler-Build-Dokus sowie CI/CD-Workflow-Dateien rigoros heraus.
 """
 
 import os
@@ -24,7 +24,8 @@ class GeneralDocumentProcessor(BaseProcessor):
         "/docs/api/", "/build/", "/dist/", "/.git/", "/site-packages/",
         "/.agents/", "/.github/", "/.gitlab/", "/.vscode/", "/.idea/",
         "/code-quality", "/skills/", "/pre-commit", "/hooks/",
-        "/fixtures/", "/tests/", "/test/", "/benchmarks/", "/scripts/benchmark/"
+        "/fixtures/", "/tests/", "/test/", "/benchmarks/", "/scripts/benchmark/",
+        "/docs/research/backlog", "/docs/reference/gradle"
     ]
 
     META_FILENAMES = {
@@ -35,7 +36,8 @@ class GeneralDocumentProcessor(BaseProcessor):
         "changelog", "changelog.md", "changelog.txt",
         "license", "license.md", "license.txt", "licence",
         "code_of_conduct", "code_of_conduct.md",
-        "security.md", "governance.md", "todo.md", "skill.md", "report.txt"
+        "security.md", "governance.md", "todo.md", "skill.md", "report.txt",
+        "developer.md", "gradle_quick_reference.md", "backlog_triage_and_investigation_notes.md"
     }
 
     PCB_KEYWORDS = {
@@ -66,7 +68,7 @@ class GeneralDocumentProcessor(BaseProcessor):
         if any(p in rel_lower for p in self.IGNORED_PATH_PARTS):
             return "IGNORED", "SKIP"
 
-        # 2. Meta-Verwaltungsdateien & Test-Reports ignorieren
+        # 2. Meta-Verwaltungsdateien & Test-Reports/Developer-Dokus ignorieren
         if filename in self.META_FILENAMES or any(meta in filename for meta in ["changelog", "contributing", "code_of_conduct"]):
             return "IGNORED", "SKIP"
 
