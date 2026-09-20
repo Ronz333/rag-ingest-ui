@@ -29,20 +29,18 @@ REPO_FILTERS_FILE = os.path.join(BASE_DIR, "repo_filters.json")
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# --- ERWEITERTE OSHW BEZUGSQUELLEN (14 REPOSITORIES) ---
+# --- GEPRÜFTE & EXAKTE OSHW BEZUGSQUELLEN ---
 OSHW_PRESET_REPOSITORIES = [
     ("⚡ Adafruit Feather M4 Express (Power, MCU, USB)", "https://github.com/adafruit/Adafruit-Feather-M4-Express-PCB"),
-    ("🧩 SparkFun MicroMod MainBoard (Modular Interfaces)", "https://github.com/sparkfun/SparkFun_MicroMod_MainBoard_Single"),
+    ("🧩 SparkFun MicroMod MainBoard (Modular Interfaces)", "https://github.com/sparkfun/SparkFun_MicroMod_MainBoard_Single_Hardware"),
     ("🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet)", "https://github.com/OLIMEX/ESP32-GATEWAY"),
     ("🔌 Olimex ESP32-EVB (Ethernet, Relays, CAN Bus)", "https://github.com/OLIMEX/ESP32-EVB"),
     ("📡 Seeed Studio KiCad Library (Sensor & Display Breakouts)", "https://github.com/Seeed-Studio/Seeed_KiCad_Lib"),
     ("⚙️ Arduino AVR Reference Boards (ATmega, Power, Serial)", "https://github.com/arduino/ArduinoCore-avr"),
     ("⚡ Adafruit ESP32-S3 Feather (LiPo Charging, USB-C, Power)", "https://github.com/adafruit/Adafruit-ESP32-S3-Feather-PCB"),
-    ("🔋 SparkFun RedBoard Qwiic (USB-C, Power & Logic Shifting)", "https://github.com/sparkfun/SparkFun_RedBoard_Qwiic"),
-    ("🔌 Pololu KiCad Library (Regulators & Drivers)", "https://github.com/pololu/pololu-kicad-library"),
-    ("🖥️ DFRobot Sensors & Display Drivers", "https://github.com/DFRobot/DFRobot_Sensors"),
+    ("🔋 SparkFun RedBoard Qwiic (USB-C, Power & Logic Shifting)", "https://github.com/sparkfun/SparkFun_RedBoard_Qwiic_Hardware"),
     ("🍇 Raspberry Pi Official HAT Specifications", "https://github.com/raspberrypi/hats"),
-    ("🔧 Pine64 Pinecil (USB-PD Power Electronics & Control)", "https://github.com/pine64/pinecil"),
+    ("🔧 Pine64 Pinecil (USB-PD Power Electronics & Control)", "https://github.com/pine64/Pinecil"),
     ("📡 Great Scott Gadgets HackRF One (RF & Analog Reference)", "https://github.com/greatscottgadgets/hackrf"),
     ("🦘 PocketBeagle (High-Density System Reference)", "https://github.com/beagleboard/pocketbeagle")
 ]
@@ -253,7 +251,7 @@ def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int
 
     return sanitized_chunks
 
-# --- PROZESS WORKER MIT SEQUENZIELLER MEHRFACH-REPOS-MINING UNTERSTÜTZUNG ---
+# --- PROZESS WORKER MIT NON-INTERACTIVE GIT ENVIRONMENT ---
 def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size, custom_filters_raw=""):
     temp_work_dir = None
     try:
@@ -281,6 +279,10 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
         os.makedirs(temp_work_dir, exist_ok=True)
 
+        # Non-interactive Git-Umgebung erzwingen (verhindert Username-Prompts)
+        git_env = os.environ.copy()
+        git_env["GIT_TERMINAL_PROMPT"] = "0"
+
         files_to_process = []
 
         if mode in ["repo_mining", "oshw_mining"]:
@@ -300,11 +302,11 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 
                 res = subprocess.run(
                     ["git", "clone", "--depth", "1", clean_repo_url, mined_repo_dir],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, env=git_env
                 )
 
                 if res.returncode != 0:
-                    log_msg(log_list, f"   ⚠️ Git-Clone fehlgeschlagen für {clean_repo_url}: {res.stderr[:200]}")
+                    log_msg(log_list, f"   ⚠️ Git-Clone fehlgeschlagen für {clean_repo_url}: {res.stderr.strip()[:200]}")
                     continue
 
                 repo_base_name = os.path.basename(clean_repo_url.rstrip("/"))
@@ -666,9 +668,12 @@ def scan_github_repository(github_url, old_scanned_repo):
     session_id = str(uuid.uuid4())[:8]
     repo_dir = os.path.join("/tmp", f"scan_repo_{session_id}")
 
+    git_env = os.environ.copy()
+    git_env["GIT_TERMINAL_PROMPT"] = "0"
+
     res = subprocess.run(
         ["git", "clone", "--depth", "1", clean_url, repo_dir],
-        capture_output=True, text=True
+        capture_output=True, text=True, env=git_env
     )
 
     if res.returncode != 0:
