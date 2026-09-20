@@ -1,0 +1,12 @@
+{
+  "default": [
+    "/fixtures/", "/tests/", "/test/", "/benchmarks/", "/.github/", "/.agents/"
+  ],
+  "freerouting": [
+    "/api/security/", "/api/dev/", "/analytics/", "/api/mcp/", "/util/gson/",
+    "Analytics", "RateLimit", "ApiKey", "ExceptionMapper", "MessageBody", "WebSocketConfigurator", "Mocked"
+  ],
+  "skidl": [
+    "/docs/api/html/_sources/", "test_*.py"
+  ]
+}
