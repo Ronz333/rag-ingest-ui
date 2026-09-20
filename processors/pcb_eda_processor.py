@@ -2,6 +2,7 @@
 PCB & EDA PROCESSOR
 -------------------
 Verarbeitet Hardware-, Layout- und EDA-Dateien (.dsn, .kicad_pcb, .kicad_mod, .kicad_sym, .sch, .pro).
+Entfernt Layout-Geometrie und Zeichenkoordinaten für optimale RAG-Synthese.
 """
 
 import os
@@ -35,7 +36,7 @@ class PcbEdaProcessor(BaseProcessor):
         num_ctx, 
         max_code_len: int,
         selected_category: str = "",
-        custom_filters: List[str] = None
+        custom_filters: Optional[List[str]] = None
     ) -> Tuple[Optional[str], Optional[str]]:
         rel_lower = rel_path.lower()
         filename = os.path.basename(rel_path)
@@ -50,6 +51,7 @@ class PcbEdaProcessor(BaseProcessor):
                 return "IGNORED", "SKIP"
 
         ext = os.path.splitext(rel_path)[1].lower()
+        bt = "```"
 
         if ext == ".dsn":
             cleaned_dsn = self._clean_dsn_content(raw_text)
@@ -58,20 +60,23 @@ class PcbEdaProcessor(BaseProcessor):
 
             md_content = f"# Specctra DSN Design-Regeln: {filename}\n\n"
             md_content += f"- **Dateipfad:** `{rel_path}`\n\n"
-            md_content += f"```lisp\n{cleaned_dsn[:max_code_len]}\n```"
+            md_content += f"{bt}lisp\n{cleaned_dsn[:max_code_len]}\n{bt}"
             return "SPECCTRA_DSN", md_content
 
         elif ext in {".kicad_pcb", ".kicad_mod", ".kicad_sym"}:
             rules_and_headers = self._extract_kicad_metadata(raw_text)
+            if not rules_and_headers.strip():
+                return "IGNORED", "SKIP"
+
             md_content = f"# KiCad EDA Definition: {filename}\n\n"
             md_content += f"- **Dateipfad:** `{rel_path}`\n\n"
-            md_content += f"```lisp\n{rules_and_headers[:max_code_len]}\n```"
+            md_content += f"{bt}lisp\n{rules_and_headers[:max_code_len]}\n{bt}"
             return "KICAD_EDA", md_content
 
         else:
             md_content = f"# PCB EDA Datei: {filename}\n\n"
             md_content += f"- **Dateipfad:** `{rel_path}`\n\n"
-            md_content += f"```text\n{raw_text[:max_code_len]}\n```"
+            md_content += f"{bt}text\n{raw_text[:max_code_len]}\n{bt}"
             return "PCB_EDA", md_content
 
     def _clean_dsn_content(self, dsn_text: str) -> str:
@@ -86,11 +91,29 @@ class PcbEdaProcessor(BaseProcessor):
         return "\n".join(lines)
 
     def _extract_kicad_metadata(self, kicad_text: str) -> str:
+        """
+        Extrahiert ausschließlich DRC-Regeln, Layer-Setups und Netzlisten.
+        Verwirft alle Footprints, Zeichenobjekte (fp_line, pad) und Trace-Koordinaten (segment, via).
+        """
         lines = []
         for line in kicad_text.splitlines():
             line_str = line.strip()
-            if any(kw in line_str for kw in ["(version", "(generator", "(setup", "(clearance", "(trace_min", "(via_size", "(layer", "(net"]):
+            
+            # Ignoriere Footprint-Zeichnungen, Pad-Definitionen & Traces vollständig
+            if any(line_str.startswith(kw) for kw in [
+                "(module", "(footprint", "(fp_line", "(fp_text", "(fp_circle", "(fp_arc", 
+                "(pad", "(segment", "(via", "(gr_line", "(gr_text", "(zone"
+            ]):
+                continue
+                
+            # Behalte nur Setup-, DRC- und Netlist-Informationen
+            if any(kw in line_str for kw in [
+                "(kicad_pcb", "(version", "(host", "(nets", "(layers", "(setup", 
+                "(trace_min", "(via_size", "(clearance", "(layerselection", "(net "
+            ]):
                 lines.append(line)
-            if len(lines) >= 150:
+                
+            if len(lines) >= 350:
                 break
-        return "\n".join(lines) if lines else kicad_text[:2000]
+                
+        return "\n".join(lines)
