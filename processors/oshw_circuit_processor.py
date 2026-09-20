@@ -61,6 +61,7 @@ class OshwCircuitProcessor(BaseProcessor):
 
         options_dict = num_ctx if isinstance(num_ctx, dict) else {"num_ctx": num_ctx}
 
+        bt = "```"
         enrichment_prompt = f"""Du bist ein Experte für Hardware-Synthese und SKiDL (Python for Circuit Design).
 Analysiere die folgende Netzliste / den Schaltplan aus einem Open-Source Hardware Projekt:
 
@@ -84,11 +85,52 @@ STRUKTUR DER ANTWORT:
 ---
 
 ## 2. SKiDL Sub-Circuit Code-Synthese
-```python
+{bt}python
 from skidl import *
 
 @subcircuit
 def power_esd_protection(v_in, v_out, gnd):
     # Beispiel mit KiCad Standard-Libs und Footprints
     d1 = Part('Diode', 'TVS', footprint='Diode_SMD:D_SMA')
-    ...
+    # Verbindungen herstellen...
+{bt}
+
+---
+
+## 3. Exaktes Pin- & Signal-Mapping
+| Bauteil | Pin | Funktion | Net |
+|---|---|---|---|
+| D1 | A | Anode | gnd |
+"""
+
+        try:
+            response = ollama_client.chat(
+                model=active_model,
+                messages=[{'role': 'user', 'content': enrichment_prompt}],
+                options=options_dict
+            )
+            processed_md = response['message']['content']
+            return "OSHW_SUBCIRCUIT", processed_md
+        except Exception:
+            return "OSHW_SUBCIRCUIT", f"# OSHW Schaltungs-Referenz: {filename}\n\n{bt}text\n{cleaned_circuit_data[:max_code_len]}\n{bt}"
+
+    def _clean_netlist_content(self, raw_text: str, ext: str) -> str:
+        """
+        Filtert grafische/Darstellungs-Informationen aus Netzlisten und Schaltplänen,
+        sodass nur noch logische Komponenten, Nets und Verbindungen übrig bleiben.
+        """
+        if ext in {".kicad_sch", ".sch"}:
+            lines = []
+            for line in raw_text.splitlines():
+                line_str = line.strip()
+                if any(kw in line_str for kw in ["(symbol", "(property", "(pin", "(instances", "(net", "(comp", "(value", "(footprint"]):
+                    if not any(skip in line_str for skip in ["(at ", "(effects", "(uuid", "(stroke", "(fill"]):
+                        lines.append(line)
+                if len(lines) >= 400:
+                    break
+            return "\n".join(lines) if lines else raw_text[:4000]
+        else:
+            cleaned = re.sub(r'<tstamp>.*?</tstamp>', '', raw_text)
+            cleaned = re.sub(r'\(sheetpath.*?\)', '', cleaned)
+            lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
+            return "\n".join(lines[:400])
