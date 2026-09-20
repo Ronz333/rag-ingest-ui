@@ -1,89 +1,51 @@
-"""
-AUTOMATIC PROCESSOR REGISTRY & PLUGIN DISCOVERER
------------------------------------------------
-Leitet die gewählte Kategorie an die Plugins weiter.
-"""
-
-import os
-import sys
-import importlib.util
-import inspect
-from typing import List, Set, Tuple, Optional, Dict
-from .base_processor import BaseProcessor
-
+from .general_processor import GeneralDocumentProcessor
+from .pcb_eda_processor import PcbEdaProcessor
+from .python_processor import PythonProcessor
+from .java_processor import JavaProcessor
+from .javascript_processor import JavascriptProcessor
+from .oshw_circuit_processor import OshwCircuitProcessor
 
 class ProcessorRegistry:
-    def __init__(self, processors_dir: Optional[str] = None):
-        self.processors: List[BaseProcessor] = []
-        if processors_dir is None:
-            processors_dir = os.path.dirname(os.path.abspath(__file__))
-        self.processors_dir = processors_dir
-        self.reload_processors()
+    def __init__(self):
+        # OshwCircuitProcessor steht vor PcbEdaProcessor
+        self.processors = [
+            OshwCircuitProcessor(),
+            PcbEdaProcessor(),
+            PythonProcessor(),
+            JavaProcessor(),
+            JavascriptProcessor(),
+            GeneralDocumentProcessor()
+        ]
 
-    def reload_processors(self):
-        self.processors.clear()
-        if self.processors_dir not in sys.path:
-            sys.path.insert(0, self.processors_dir)
-
-        for entry in os.listdir(self.processors_dir):
-            if entry.endswith('.py') and not entry.startswith('_') and entry not in ('base_processor.py', 'processor_registry.py'):
-                file_path = os.path.join(self.processors_dir, entry)
-                module_name = f"processors.{entry[:-3]}"
-
-                try:
-                    spec = importlib.util.spec_from_file_location(module_name, file_path)
-                    if spec and spec.loader:
-                        module = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(module)
-
-                        for _, obj in inspect.getmembers(module, inspect.isclass):
-                            if issubclass(obj, BaseProcessor) and obj is not BaseProcessor:
-                                instance = obj()
-                                self.processors.append(instance)
-                except Exception as e:
-                    print(f"⚠️ Fehler beim Laden des Processors '{entry}': {e}")
-
-    def get_categories_dict(self) -> Dict[str, dict]:
+    def get_categories_dict(self):
         categories = {}
         for p in self.processors:
-            categories[p.category_key] = {
-                "collection": p.collection_name,
-                "system_prompt": p.system_prompt,
-                "processor": p
-            }
-        if "📚 Allgemeines Wissen & Dokumente" not in categories:
-            categories["📚 Allgemeines Wissen & Dokumente"] = {
-                "collection": "general_knowledge_base",
-                "system_prompt": "Du bist ein allgemeiner Dokumenten-Ingestion-Agent.",
-                "processor": None
-            }
+            if p.category_key and p.category_key not in categories:
+                categories[p.category_key] = {
+                    "collection": p.collection_name
+                }
         return categories
 
-    def get_all_supported_extensions(self) -> Set[str]:
-        exts = {".md", ".txt", ".json", ".yaml", ".yml", ".pdf", ".csv", ".xml", ".ini", ".conf", ".sh"}
+    def get_all_supported_extensions(self):
+        exts = set()
         for p in self.processors:
             exts.update(p.supported_extensions)
         return exts
 
-    def dispatch_parse(
-        self, 
-        rel_path: str, 
-        raw_text: str, 
-        active_model: str, 
-        ollama_client, 
-        num_ctx: int, 
-        max_code_len: int,
-        selected_category: str = ""
-    ) -> Tuple[Optional[str], Optional[str]]:
-        ext = str(rel_path[rel_path.rfind('.'):]).lower() if '.' in rel_path else ""
+    def get_processor_for_file(self, rel_path: str, selected_category: str = ""):
+        ext = "." + rel_path.split(".")[-1].lower() if "." in rel_path else ""
+        for p in self.processors:
+            if p.can_handle(rel_path, ext, selected_category):
+                return p
+        return None
 
-        for processor in self.processors:
-            if processor.can_handle(rel_path, ext, selected_category=selected_category):
-                return processor.parse(
-                    rel_path, raw_text, active_model, ollama_client, num_ctx, max_code_len, selected_category=selected_category
-                )
-
-        return None, None
-
+    def dispatch_parse(self, rel_path, raw_text, active_model, ollama_client, num_ctx, max_code_len, selected_category="", custom_filters=None):
+        processor = self.get_processor_for_file(rel_path, selected_category)
+        if not processor:
+            return "GENERAL", raw_text
+        return processor.parse(
+            rel_path, raw_text, active_model, ollama_client, num_ctx, max_code_len,
+            selected_category=selected_category, custom_filters=custom_filters or []
+        )
 
 registry = ProcessorRegistry()
