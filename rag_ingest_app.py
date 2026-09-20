@@ -29,26 +29,36 @@ REPO_FILTERS_FILE = os.path.join(BASE_DIR, "repo_filters.json")
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# --- GEPRÜFTE & EXAKTE OSHW BEZUGSQUELLEN ---
+# --- GEPRÜFTE, ÖFFENTLICH ERREICHBARE & NÜTZLICHE OSHW BEZUGSQUELLEN ---
 OSHW_PRESET_REPOSITORIES = [
-    ("⚡ Adafruit Feather M4 Express (Power, MCU, USB)", "https://github.com/adafruit/Adafruit-Feather-M4-Express-PCB"),
+    ("🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet, Power)", "https://github.com/OLIMEX/ESP32-GATEWAY"),
+    ("🔌 Olimex ESP32-EVB (Ethernet, Relays, CAN Bus, Power)", "https://github.com/OLIMEX/ESP32-EVB"),
+    ("⚡ Olimex ESP32-PoE (Power-over-Ethernet, LiPo Charge)", "https://github.com/OLIMEX/ESP32-PoE"),
+    ("⚡ Adafruit Feather M4 Express (Power, MCU, USB, LiPo)", "https://github.com/adafruit/Adafruit-Feather-M4-Express-PCB"),
+    ("📡 Adafruit ESP32-S3 Feather (LiPo Charging, USB-C, Power)", "https://github.com/adafruit/Adafruit-ESP32-S3-Feather-PCB"),
     ("🧩 SparkFun MicroMod MainBoard (Modular Interfaces)", "https://github.com/sparkfun/SparkFun_MicroMod_MainBoard_Single_Hardware"),
-    ("🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet)", "https://github.com/OLIMEX/ESP32-GATEWAY"),
-    ("🔌 Olimex ESP32-EVB (Ethernet, Relays, CAN Bus)", "https://github.com/OLIMEX/ESP32-EVB"),
-    ("📡 Seeed Studio KiCad Library (Sensor & Display Breakouts)", "https://github.com/Seeed-Studio/Seeed_KiCad_Lib"),
-    ("⚙️ Arduino AVR Reference Boards (ATmega, Power, Serial)", "https://github.com/arduino/ArduinoCore-avr"),
-    ("⚡ Adafruit ESP32-S3 Feather (LiPo Charging, USB-C, Power)", "https://github.com/adafruit/Adafruit-ESP32-S3-Feather-PCB"),
     ("🔋 SparkFun RedBoard Qwiic (USB-C, Power & Logic Shifting)", "https://github.com/sparkfun/SparkFun_RedBoard_Qwiic_Hardware"),
-    ("🍇 Raspberry Pi Official HAT Specifications", "https://github.com/raspberrypi/hats"),
-    ("🔧 Pine64 Pinecil (USB-PD Power Electronics & Control)", "https://github.com/pine64/Pinecil"),
+    ("📶 SparkFun Thing Plus ESP32 WROOM (LiPo, USB-C, I2C)", "https://github.com/sparkfun/SparkFun_Thing_Plus_ESP32_WROOM_Hardware"),
+    ("📡 Seeed Studio KiCad Library (Sensor & Breakout Schematics)", "https://github.com/Seeed-Studio/Seeed_KiCad_Lib"),
+    ("⚙️ Arduino AVR Reference Boards (ATmega, Power, Serial)", "https://github.com/arduino/ArduinoCore-avr"),
+    ("🍇 Raspberry Pi Official HAT Specifications & Reference", "https://github.com/raspberrypi/hats"),
+    ("🔧 Pine64 Pinecil (USB-PD Power Electronics & DC/DC)", "https://github.com/pine64/Pinecil"),
     ("📡 Great Scott Gadgets HackRF One (RF & Analog Reference)", "https://github.com/greatscottgadgets/hackrf"),
-    ("🦘 PocketBeagle (High-Density System Reference)", "https://github.com/beagleboard/pocketbeagle")
+    ("🦘 PocketBeagle (High-Density System & Power Reference)", "https://github.com/beagleboard/pocketbeagle")
 ]
 
 # --- LOGGING HELPER MIT LOKALER ZEITZEILE ---
 def log_msg(log_list, text: str):
     timestamp = time.strftime("%H:%M:%S", time.localtime())
     log_list.append(f"[{timestamp}] {text}")
+
+# --- HELPER: NON-INTERACTIVE GIT ENVIRONMENT ---
+def get_git_env():
+    """Erstellt eine Prozessumgebung, die Git-Prompts (Username/Passwort) strikt unterbindet."""
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "echo"
+    return env
 
 # --- FILTER PRESETS MANAGEMENT ---
 def get_default_filter_presets() -> dict:
@@ -279,10 +289,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
         os.makedirs(temp_work_dir, exist_ok=True)
 
-        # Non-interactive Git-Umgebung erzwingen (verhindert Username-Prompts)
-        git_env = os.environ.copy()
-        git_env["GIT_TERMINAL_PROMPT"] = "0"
-
+        git_env = get_git_env()
         files_to_process = []
 
         if mode in ["repo_mining", "oshw_mining"]:
@@ -306,7 +313,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 )
 
                 if res.returncode != 0:
-                    log_msg(log_list, f"   ⚠️ Git-Clone fehlgeschlagen für {clean_repo_url}: {res.stderr.strip()[:200]}")
+                    err_brief = res.stderr.strip()[:200] if res.stderr else "Unbekannter Fehler"
+                    log_msg(log_list, f"   ⚠️ Git-Clone fehlgeschlagen für {clean_repo_url}: {err_brief}")
                     continue
 
                 repo_base_name = os.path.basename(clean_repo_url.rstrip("/"))
@@ -668,8 +676,7 @@ def scan_github_repository(github_url, old_scanned_repo):
     session_id = str(uuid.uuid4())[:8]
     repo_dir = os.path.join("/tmp", f"scan_repo_{session_id}")
 
-    git_env = os.environ.copy()
-    git_env["GIT_TERMINAL_PROMPT"] = "0"
+    git_env = get_git_env()
 
     res = subprocess.run(
         ["git", "clone", "--depth", "1", clean_url, repo_dir],
@@ -677,13 +684,14 @@ def scan_github_repository(github_url, old_scanned_repo):
     )
 
     if res.returncode != 0:
+        err_brief = res.stderr.strip()[:200] if res.stderr else "Unbekannter Fehler"
         task_manager.set_status("🔴 Status: SCAN FEHLGESCHLAGEN")
-        task_manager.append_log(f"❌ Git-Clone fehlgeschlagen: {res.stderr[:200]}")
+        task_manager.append_log(f"❌ Git-Clone fehlgeschlagen: {err_brief}")
         yield (
             gr.update(choices=[], value=[], visible=False),
             gr.update(choices=[], value=[], visible=False),
             "",
-            f"❌ Git-Clone fehlgeschlagen:\n{res.stderr[:300]}"
+            f"❌ Git-Clone fehlgeschlagen:\n{err_brief}"
         )
         return
 
@@ -863,7 +871,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     gr.Markdown("### 🏛️ Vorkonfigurierte Open-Source Hardware Repositories")
                     oshw_preset_dropdown = gr.Dropdown(
                         choices=OSHW_PRESET_REPOSITORIES,
-                        value=[OSHW_PRESET_REPOSITORIES[0][1], OSHW_PRESET_REPOSITORIES[2][1]],
+                        value=[OSHW_PRESET_REPOSITORIES[0][1], OSHW_PRESET_REPOSITORIES[1][1]],
                         label="Geprüfte OSHW-Bezugsquellen auswählen (Mehrfachauswahl möglich)",
                         multiselect=True,
                         interactive=True
