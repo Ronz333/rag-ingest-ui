@@ -18,12 +18,13 @@ from pypdf import PdfReader
 from processors.processor_registry import registry
 
 # --- KONFIGURATION & KONSTANTEN ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_1")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "hf.co/Qwen/Qwen3-Embedding-8B-GGUF:Q5_K_M")
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
-REPO_FILTERS_FILE = "/tmp/repo_filters.json"
+REPO_FILTERS_FILE = os.path.join(BASE_DIR, "repo_filters.json")
 
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
@@ -188,7 +189,6 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
     return collected
 
 def unload_ollama_model(ollama_client, model_name: str):
-    """Entlädt ein geladenes Modell umgehend aus dem VRAM."""
     try:
         ollama_client.chat(model=model_name, messages=[], keep_alive=0)
     except Exception:
@@ -361,12 +361,10 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
                 continue
 
-            # LOG START PHASE A ANALYSE
             log_msg(log_list, f"[{global_idx}/{total_files}] ⏳ Starte Phase A Analyse [Batch-Puffer: {current_buffer_count}/{batch_size}]: {rel_path}")
             parse_start_time = time.time()
 
             try:
-                # Übergibt custom_filters direkt an den Processor
                 category_tag, processed_md = registry.dispatch_parse(
                     rel_path, raw_text, active_model, ollama_worker, llm_options, max_embed_chars, 
                     selected_category=category_key, custom_filters=active_custom_filters
@@ -387,7 +385,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 })
                 used_llm_in_current_batch = True
 
-                # LOG END PHASE A ANALYSE
                 new_buffer_count = len(batch_prepared_items)
                 log_msg(
                     log_list, 
@@ -398,7 +395,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             except Exception as parse_err:
                 log_msg(log_list, f"   ❌ Analyse-Fehler bei {rel_path}: {str(parse_err)}")
 
-            # WENN DER PUFFER VOLL IST ODER DIE LETZTE DATEI ERREICHT WURDE:
             is_last_file = (global_idx == total_files)
             if len(batch_prepared_items) >= batch_size or (is_last_file and batch_prepared_items):
                 batch_count += 1
@@ -411,7 +407,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     unload_ollama_model(ollama_worker, active_model)
                     time.sleep(1.5)
 
-                # --- PHASE B: VEKTORISIERUNG MIT OVERLAP CHUNKING & SLIDER-GEBUNDENEM LIMIT ---
                 log_msg(log_list, f"📐 Phase B [Batch {batch_count}]: Erzeuge Embeddings ({EMBED_MODEL}) & speichere in Qdrant...")
                 overlap_val = max(200, int(max_embed_chars * 0.10))
 
@@ -423,7 +418,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     p_dur = prep_item["parse_duration"]
                     g_idx = prep_item["global_idx"]
 
-                    # LOG START PHASE B VEKTORISIERUNG
                     log_msg(log_list, f"[{g_idx}/{total_files}] ⏳ Starte Phase B Vektorisierung: {r_path}")
                     embed_start_time = time.time()
                     md_chunks = smart_markdown_chunking(p_md, max_chars=max_embed_chars, overlap_chars=overlap_val)
@@ -477,7 +471,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                     embed_dur = time.time() - embed_start_time
                     total_file_dur = p_dur + embed_dur
-                    # LOG END PHASE B VEKTORISIERUNG
                     log_msg(
                         log_list, 
                         f"[{g_idx}/{total_files}] ✅ Phase B Vektorisierung abgeschlossen in {embed_dur:.2f}s "
