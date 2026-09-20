@@ -29,16 +29,22 @@ REPO_FILTERS_FILE = os.path.join(BASE_DIR, "repo_filters.json")
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# --- VORKONFIGURIERTE OSHW BEZUGSQUELLEN ---
+# --- ERWEITERTE OSHW BEZUGSQUELLEN (14 REPOSITORIES) ---
 OSHW_PRESET_REPOSITORIES = [
     ("⚡ Adafruit Feather M4 Express (Power, MCU, USB)", "https://github.com/adafruit/Adafruit-Feather-M4-Express-PCB"),
     ("🧩 SparkFun MicroMod MainBoard (Modular Interfaces)", "https://github.com/sparkfun/SparkFun_MicroMod_MainBoard_Single"),
     ("🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet)", "https://github.com/OLIMEX/ESP32-GATEWAY"),
+    ("🔌 Olimex ESP32-EVB (Ethernet, Relays, CAN Bus)", "https://github.com/OLIMEX/ESP32-EVB"),
     ("📡 Seeed Studio KiCad Library (Sensor & Display Breakouts)", "https://github.com/Seeed-Studio/Seeed_KiCad_Lib"),
     ("⚙️ Arduino AVR Reference Boards (ATmega, Power, Serial)", "https://github.com/arduino/ArduinoCore-avr"),
+    ("⚡ Adafruit ESP32-S3 Feather (LiPo Charging, USB-C, Power)", "https://github.com/adafruit/Adafruit-ESP32-S3-Feather-PCB"),
+    ("🔋 SparkFun RedBoard Qwiic (USB-C, Power & Logic Shifting)", "https://github.com/sparkfun/SparkFun_RedBoard_Qwiic"),
     ("🔌 Pololu KiCad Library (Regulators & Drivers)", "https://github.com/pololu/pololu-kicad-library"),
     ("🖥️ DFRobot Sensors & Display Drivers", "https://github.com/DFRobot/DFRobot_Sensors"),
-    ("🍇 Raspberry Pi Official HAT Specifications", "https://github.com/raspberrypi/hats")
+    ("🍇 Raspberry Pi Official HAT Specifications", "https://github.com/raspberrypi/hats"),
+    ("🔧 Pine64 Pinecil (USB-PD Power Electronics & Control)", "https://github.com/pine64/pinecil"),
+    ("📡 Great Scott Gadgets HackRF One (RF & Analog Reference)", "https://github.com/greatscottgadgets/hackrf"),
+    ("🦘 PocketBeagle (High-Density System Reference)", "https://github.com/beagleboard/pocketbeagle")
 ]
 
 # --- LOGGING HELPER MIT LOKALER ZEITZEILE ---
@@ -73,12 +79,15 @@ def get_repo_filters_dict() -> dict:
             pass
     return get_default_filter_presets()
 
-def get_filter_preset_for_url(repo_url_or_path: str) -> str:
+def get_filter_preset_for_url(repo_url_or_path) -> str:
+    if isinstance(repo_url_or_path, list):
+        repo_url_or_path = repo_url_or_path[0] if repo_url_or_path else ""
+
     if not repo_url_or_path:
         return "\n".join(get_default_filter_presets()["default"])
         
     filters_dict = get_repo_filters_dict()
-    url_lower = repo_url_or_path.lower()
+    url_lower = str(repo_url_or_path).lower()
     
     for key, patterns in filters_dict.items():
         if key != "default" and key in url_lower:
@@ -202,10 +211,6 @@ def calculate_dynamic_num_ctx(text_len: int, max_limit: int = 32768) -> int:
     return min(num_ctx, max_limit)
 
 def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int = 400) -> list[str]:
-    """
-    Spaltet Markdown-Dokumente intelligent an Headern (##) und Trennlinien (---).
-    Stellt sicher, dass Code-Blöcke (```) nicht zerschnitten werden bzw. im Chunk sauber geschlossen werden.
-    """
     if len(text) <= max_chars:
         return [text]
 
@@ -248,7 +253,7 @@ def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int
 
     return sanitized_chunks
 
-# --- PROZESS WORKER MIT PRECISE Live LOGGING & DYNAMISCHEN FILTERN ---
+# --- PROZESS WORKER MIT SEQUENZIELLER MEHRFACH-REPOS-MINING UNTERSTÜTZUNG ---
 def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size, custom_filters_raw=""):
     temp_work_dir = None
     try:
@@ -279,36 +284,43 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         files_to_process = []
 
         if mode in ["repo_mining", "oshw_mining"]:
-            clean_repo_url = sanitize_url(mining_repo_url)
-            if not clean_repo_url:
-                log_msg(log_list, "❌ Keine valide Repository-URL für das Mining angegeben.")
+            repo_urls = mining_repo_url if isinstance(mining_repo_url, list) else [mining_repo_url]
+            clean_repo_urls = [sanitize_url(u) for u in repo_urls if sanitize_url(u)]
+
+            if not clean_repo_urls:
+                log_msg(log_list, "❌ Keine validen Repository-URLs für das Mining angegeben.")
                 status_dict["header"] = "🔴 Status: BEENDET (Ungültige URL)"
                 return
 
-            log_msg(log_list, f"⛏️ Starte Git-Mining [{mode.upper()}] via `git clone`: {clean_repo_url}")
-            mined_repo_dir = os.path.join(temp_work_dir, "mined_repo")
-            
-            res = subprocess.run(
-                ["git", "clone", "--depth", "1", clean_repo_url, mined_repo_dir],
-                capture_output=True, text=True
-            )
+            log_msg(log_list, f"⛏️ Starte Batch Git-Mining [{mode.upper()}] für {len(clean_repo_urls)} Repository/Repositories...")
 
-            if res.returncode != 0:
-                log_msg(log_list, f"❌ Git-Clone fehlgeschlagen: {res.stderr[:300]}")
-                status_dict["header"] = "🔴 Status: GIT CLONE FEHLER"
-                return
+            for repo_idx, clean_repo_url in enumerate(clean_repo_urls, 1):
+                log_msg(log_list, f"   [Repo {repo_idx}/{len(clean_repo_urls)}] Klone: {clean_repo_url}")
+                mined_repo_dir = os.path.join(temp_work_dir, f"mined_repo_{repo_idx}")
+                
+                res = subprocess.run(
+                    ["git", "clone", "--depth", "1", clean_repo_url, mined_repo_dir],
+                    capture_output=True, text=True
+                )
 
-            log_msg(log_list, "   ↳ Repository erfolgreich geklont. Scanne Dateien...")
-            for root, _, filenames in os.walk(mined_repo_dir):
-                if ".git" in root:
+                if res.returncode != 0:
+                    log_msg(log_list, f"   ⚠️ Git-Clone fehlgeschlagen für {clean_repo_url}: {res.stderr[:200]}")
                     continue
-                for f in filenames:
-                    ext = os.path.splitext(f)[1].lower()
-                    if ext in TEXT_EXTENSIONS:
-                        full_p = os.path.join(root, f)
-                        rel_p = os.path.relpath(full_p, mined_repo_dir)
-                        repo_base_name = os.path.basename(clean_repo_url.rstrip("/"))
-                        files_to_process.append((f"{repo_base_name}/{rel_p}", full_p))
+
+                repo_base_name = os.path.basename(clean_repo_url.rstrip("/"))
+                file_count = 0
+                for root, _, filenames in os.walk(mined_repo_dir):
+                    if ".git" in root:
+                        continue
+                    for f in filenames:
+                        ext = os.path.splitext(f)[1].lower()
+                        if ext in TEXT_EXTENSIONS:
+                            full_p = os.path.join(root, f)
+                            rel_p = os.path.relpath(full_p, mined_repo_dir)
+                            files_to_process.append((f"{repo_base_name}/{rel_p}", full_p))
+                            file_count += 1
+                
+                log_msg(log_list, f"   ↳ Repo '{repo_base_name}' geklont ({file_count} relevante Dateien).")
 
         else:
             if files:
@@ -345,7 +357,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         files_to_process = list({rel_p: full_p for rel_p, full_p in files_to_process}.items())
 
         if not files_to_process:
-            log_msg(log_list, "❌ Keine verwertbaren Dateien gefunden.")
+            log_msg(log_list, "❌ Keine verwertbaren Dateien in allen ausgewählten Quellen gefunden.")
             status_dict["header"] = "🔴 Status: BEENDET (Keine Dateien)"
             return
 
@@ -846,21 +858,21 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     gr.Markdown("### 🏛️ Vorkonfigurierte Open-Source Hardware Repositories")
                     oshw_preset_dropdown = gr.Dropdown(
                         choices=OSHW_PRESET_REPOSITORIES,
-                        value=OSHW_PRESET_REPOSITORIES[0][1],
-                        label="Geprüfte OSHW-Bezugsquelle auswählen",
-                        allow_custom_value=True,
+                        value=[OSHW_PRESET_REPOSITORIES[0][1], OSHW_PRESET_REPOSITORIES[2][1]],
+                        label="Geprüfte OSHW-Bezugsquellen auswählen (Mehrfachauswahl möglich)",
+                        multiselect=True,
                         interactive=True
                     )
-                    start_oshw_btn = gr.Button("🔌 OSHW Sub-Circuits Ingestieren", variant="primary")
+                    start_oshw_btn = gr.Button("🔌 OSHW Sub-Circuits Ingestieren (Batch)", variant="primary")
 
                 with gr.Tab("⭐ EDA & Rule Mining"):
                     mining_repo_input = gr.Dropdown(
                         choices=[
-                            ("SKiDL Haupt-Repository (Offiziell)", "[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)"),
-                            ("KiCad Python Action Plugins", "[https://github.com/KiCad/kicad-python](https://github.com/KiCad/kicad-python)"),
-                            ("Freerouting Java / Config Core", "[https://github.com/freerouting/freerouting](https://github.com/freerouting/freerouting)")
+                            ("SKiDL Haupt-Repository (Offiziell)", "https://github.com/xesscorp/skidl"),
+                            ("KiCad Python Action Plugins", "https://github.com/KiCad/kicad-python"),
+                            ("Freerouting Java / Config Core", "https://github.com/freerouting/freerouting")
                         ],
-                        value="[https://github.com/freerouting/freerouting](https://github.com/freerouting/freerouting)",
+                        value="https://github.com/freerouting/freerouting",
                         label="Ziel-Repository für EDA Mining",
                         allow_custom_value=True,
                         interactive=True
@@ -871,7 +883,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     with gr.Row(elem_classes=["row-stretch"]):
                         github_input = gr.Textbox(
                             label="Repository URL",
-                            placeholder="[https://gitlab.com/kicad/libraries/kicad-symbols.git](https://gitlab.com/kicad/libraries/kicad-symbols.git)",
+                            placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
                             scale=4
                         )
                         scan_repo_btn = gr.Button("🔍 Scannen", variant="secondary", scale=1, elem_classes=["full-height-btn"])
@@ -939,8 +951,8 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     )
 
     start_oshw_btn.click(
-        fn=lambda cat, mod, url, ctx, chars, batch, filters: task_manager.start_background_job(
-            None, None, None, None, "⚡ PCB & Hardware Design", mod, mode="oshw_mining", mining_repo_url=url, num_ctx=ctx, max_embed_chars=chars, batch_size=batch, custom_filters_raw=filters
+        fn=lambda cat, mod, urls, ctx, chars, batch, filters: task_manager.start_background_job(
+            None, None, None, None, "⚡ PCB & Hardware Design", mod, mode="oshw_mining", mining_repo_url=urls, num_ctx=ctx, max_embed_chars=chars, batch_size=batch, custom_filters_raw=filters
         ),
         inputs=[category_dropdown, model_dropdown, oshw_preset_dropdown, num_ctx_slider, embed_chars_slider, batch_size_slider, custom_filters_input],
         outputs=[status_banner]
