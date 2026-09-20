@@ -2,12 +2,10 @@
 GENERAL DOCUMENTATION PROCESSOR
 -------------------------------
 Verarbeitet allgemeine Dokumentationsdateien (.md, .txt, .rst).
-Filtert Meta- und Verwaltungsdateien, generierte Sphinx/HTML-Build-Artefakte,
-Test-Fixtures, Entwickler-Build-Dokus sowie CI/CD-Workflow-Dateien rigoros heraus.
 """
 
 import os
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from .base_processor import BaseProcessor
 
 
@@ -18,7 +16,6 @@ class GeneralDocumentProcessor(BaseProcessor):
 
     PCB_CATEGORY = "⚡ PCB & Hardware Design"
 
-    # Verzeichnisse von generierten Dokumentationen, Build-Artefakten, Test-Fixtures & Repo-Meta/CI-Workflows
     IGNORED_PATH_PARTS = [
         "/_sources/", "/html/", "/_static/", "/_templates/", 
         "/docs/api/", "/build/", "/dist/", "/.git/", "/site-packages/",
@@ -59,20 +56,28 @@ class GeneralDocumentProcessor(BaseProcessor):
         ollama_client, 
         num_ctx,
         max_code_len: int,
-        selected_category: str = ""
+        selected_category: str = "",
+        custom_filters: List[str] = None
     ) -> Tuple[Optional[str], Optional[str]]:
         filename = os.path.basename(rel_path).lower()
         rel_lower = rel_path.lower()
+        custom_filters = custom_filters or []
 
-        # 1. Build-Artefakte, Fixtures, Doku-Quellen und Entwickler-Meta-Ordner ignorieren
+        # 1. Standard-Ausschlüsse
         if any(p in rel_lower for p in self.IGNORED_PATH_PARTS):
             return "IGNORED", "SKIP"
 
-        # 2. Meta-Verwaltungsdateien & Test-Reports/Developer-Dokus ignorieren
+        # 2. Meta-Verwaltungsdateien & Developer-Dokus
         if filename in self.META_FILENAMES or any(meta in filename for meta in ["changelog", "contributing", "code_of_conduct"]):
             return "IGNORED", "SKIP"
 
-        # 3. Im PCB-Modus: Nur verarbeiten, wenn echter PCB-/API-Bezug vorliegt
+        # 3. Dynamische Webpanel-Filter prüfen
+        for rule in custom_filters:
+            rule_lower = rule.lower()
+            if rule_lower in rel_lower or rule_lower in filename:
+                return "IGNORED", "SKIP"
+
+        # 4. Im PCB-Modus: Relevant-Prüfung
         if selected_category == self.PCB_CATEGORY:
             text_snippet = raw_text[:3000].lower()
             is_relevant = any(kw in rel_lower for kw in self.PCB_KEYWORDS) or any(kw in text_snippet for kw in self.PCB_KEYWORDS)
