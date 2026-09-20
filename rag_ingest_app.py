@@ -18,34 +18,91 @@ from pypdf import PdfReader
 from processors.processor_registry import registry
 
 # --- KONFIGURATION & KONSTANTEN ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.abspath(__file__))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_1")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "hf.co/Qwen/Qwen3-Embedding-8B-GGUF:Q5_K_M")
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
 REPO_FILTERS_FILE = os.path.join(BASE_DIR, "repo_filters.json")
+OSHW_SOURCES_FILE = os.path.join(BASE_DIR, "oshw_sources.json")
 
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# --- GEPRÜFTE, ÖFFENTLICH ERREICHBARE & NÜTZLICHE OSHW BEZUGSQUELLEN ---
-OSHW_PRESET_REPOSITORIES = [
-    ("🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet, Power)", "https://github.com/OLIMEX/ESP32-GATEWAY"),
-    ("🔌 Olimex ESP32-EVB (Ethernet, Relays, CAN Bus, Power)", "https://github.com/OLIMEX/ESP32-EVB"),
-    ("⚡ Olimex ESP32-PoE (Power-over-Ethernet, LiPo Charge)", "https://github.com/OLIMEX/ESP32-PoE"),
-    ("⚡ Adafruit Feather M4 Express (Power, MCU, USB, LiPo)", "https://github.com/adafruit/Adafruit-Feather-M4-Express-PCB"),
-    ("📡 Adafruit ESP32-S3 Feather (LiPo Charging, USB-C, Power)", "https://github.com/adafruit/Adafruit-ESP32-S3-Feather-PCB"),
-    ("🧩 SparkFun MicroMod MainBoard (Modular Interfaces)", "https://github.com/sparkfun/SparkFun_MicroMod_MainBoard_Single_Hardware"),
-    ("🔋 SparkFun RedBoard Qwiic (USB-C, Power & Logic Shifting)", "https://github.com/sparkfun/SparkFun_RedBoard_Qwiic_Hardware"),
-    ("📶 SparkFun Thing Plus ESP32 WROOM (LiPo, USB-C, I2C)", "https://github.com/sparkfun/SparkFun_Thing_Plus_ESP32_WROOM_Hardware"),
-    ("📡 Seeed Studio KiCad Library (Sensor & Breakout Schematics)", "https://github.com/Seeed-Studio/Seeed_KiCad_Lib"),
-    ("⚙️ Arduino AVR Reference Boards (ATmega, Power, Serial)", "https://github.com/arduino/ArduinoCore-avr"),
-    ("🍇 Raspberry Pi Official HAT Specifications & Reference", "https://github.com/raspberrypi/hats"),
-    ("🔧 Pine64 Pinecil (USB-PD Power Electronics & DC/DC)", "https://github.com/pine64/Pinecil"),
-    ("📡 Great Scott Gadgets HackRF One (RF & Analog Reference)", "https://github.com/greatscottgadgets/hackrf"),
-    ("🦘 PocketBeagle (High-Density System & Power Reference)", "https://github.com/beagleboard/pocketbeagle")
+# --- DEFAULT OSHW BEZUGSQUELLEN ---
+DEFAULT_OSHW_SOURCES = [
+    {"name": "🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet, Power)", "url": "https://github.com/OLIMEX/ESP32-GATEWAY"},
+    {"name": "🔌 Olimex ESP32-EVB (Ethernet, Relays, CAN Bus, Power)", "url": "https://github.com/OLIMEX/ESP32-EVB"},
+    {"name": "⚡ Olimex ESP32-PoE (Power-over-Ethernet, LiPo Charge)", "url": "https://github.com/OLIMEX/ESP32-PoE"},
+    {"name": "⚡ Adafruit Feather M4 Express (Power, MCU, USB, LiPo)", "url": "https://github.com/adafruit/Adafruit-Feather-M4-Express-PCB"},
+    {"name": "📡 Adafruit ESP32-S3 Feather (LiPo Charging, USB-C, Power)", "url": "https://github.com/adafruit/Adafruit-ESP32-S3-Feather-PCB"},
+    {"name": "🧩 SparkFun MicroMod MainBoard (Modular Interfaces)", "url": "https://github.com/sparkfun/SparkFun_MicroMod_MainBoard_Single_Hardware"},
+    {"name": "🔋 SparkFun RedBoard Qwiic (USB-C, Power & Logic Shifting)", "url": "https://github.com/sparkfun/SparkFun_RedBoard_Qwiic_Hardware"},
+    {"name": "📶 SparkFun Thing Plus ESP32 WROOM (LiPo, USB-C, I2C)", "url": "https://github.com/sparkfun/SparkFun_Thing_Plus_ESP32_WROOM_Hardware"},
+    {"name": "📡 Seeed Studio KiCad Library (Sensor & Breakout Schematics)", "url": "https://github.com/Seeed-Studio/Seeed_KiCad_Lib"},
+    {"name": "⚙️ Arduino AVR Reference Boards (ATmega, Power, Serial)", "url": "https://github.com/arduino/ArduinoCore-avr"},
+    {"name": "🍇 Raspberry Pi Official HAT Specifications & Reference", "url": "https://github.com/raspberrypi/hats"},
+    {"name": "🔧 Pine64 Pinecil (USB-PD Power Electronics & DC/DC)", "url": "https://github.com/pine64/Pinecil"},
+    {"name": "📡 Great Scott Gadgets HackRF One (RF & Analog Reference)", "url": "https://github.com/greatscottgadgets/hackrf"},
+    {"name": "🦘 PocketBeagle (High-Density System & Power Reference)", "url": "https://github.com/beagleboard/pocketbeagle"}
 ]
+
+# --- PERSISTENT OSHW SOURCES MANAGEMENT ---
+def load_oshw_sources() -> list[dict]:
+    if os.path.exists(OSHW_SOURCES_FILE):
+        try:
+            with open(OSHW_SOURCES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list) and len(data) > 0:
+                    return data
+        except Exception as e:
+            print(f"Fehler beim Laden von oshw_sources.json: {e}")
+    return DEFAULT_OSHW_SOURCES
+
+def save_oshw_sources(sources_list: list[dict]):
+    try:
+        with open(OSHW_SOURCES_FILE, "w", encoding="utf-8") as f:
+            json.dump(sources_list, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Fehler beim Speichern der OSHW-Quellen: {e}")
+
+def get_oshw_dropdown_choices() -> list[tuple[str, str]]:
+    sources = load_oshw_sources()
+    return [(s.get("name", s.get("url")), s.get("url")) for s in sources if s.get("url")]
+
+def oshw_sources_to_text(sources_list: list[dict]) -> str:
+    lines = []
+    for s in sources_list:
+        lines.append(f"{s.get('name', '')} | {s.get('url', '')}")
+    return "\n".join(lines)
+
+def text_to_oshw_sources(text: str) -> list[dict]:
+    sources = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" in line:
+            parts = line.split("|", 1)
+            name = parts[0].strip()
+            url = parts[1].strip()
+        else:
+            url = line.strip()
+            name = url.split("/")[-1]
+        if url:
+            sources.append({"name": name, "url": url})
+    return sources
+
+def handle_save_oshw_editor(raw_text: str):
+    new_sources = text_to_oshw_sources(raw_text)
+    save_oshw_sources(new_sources)
+    choices = get_oshw_dropdown_choices()
+    default_vals = [c[1] for c in choices[:2]] if len(choices) >= 2 else ([c[1] for c in choices] if choices else [])
+    return (
+        gr.update(choices=choices, value=default_vals),
+        f"✅ {len(new_sources)} Quellen erfolgreich gespeichert und Menü aktualisiert!"
+    )
 
 # --- LOGGING HELPER MIT LOKALER ZEITZEILE ---
 def log_msg(log_list, text: str):
@@ -804,6 +861,9 @@ initial_num_ctx = saved_cfg.get("last_num_ctx", 32768)
 initial_max_embed_chars = saved_cfg.get("last_max_embed_chars", 4000)
 initial_batch_size = saved_cfg.get("last_batch_size", 25)
 
+initial_oshw_choices = get_oshw_dropdown_choices()
+initial_oshw_defaults = [c[1] for c in initial_oshw_choices[:2]] if len(initial_oshw_choices) >= 2 else ([c[1] for c in initial_oshw_choices] if initial_oshw_choices else [])
+
 with gr.Blocks(title="Universal RAG Control Center") as demo:
     repo_state = gr.State("")
     status_timer = gr.Timer(value=2.0)
@@ -870,13 +930,24 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                 with gr.Tab("🔌 OSHW Library Mining"):
                     gr.Markdown("### 🏛️ Vorkonfigurierte Open-Source Hardware Repositories")
                     oshw_preset_dropdown = gr.Dropdown(
-                        choices=OSHW_PRESET_REPOSITORIES,
-                        value=[OSHW_PRESET_REPOSITORIES[0][1], OSHW_PRESET_REPOSITORIES[1][1]],
-                        label="Geprüfte OSHW-Bezugsquellen auswählen (Mehrfachauswahl möglich)",
+                        choices=initial_oshw_choices,
+                        value=initial_oshw_defaults,
+                        label="OSHW-Bezugsquellen auswählen (Mehrfachauswahl möglich)",
                         multiselect=True,
                         interactive=True
                     )
                     start_oshw_btn = gr.Button("🔌 OSHW Sub-Circuits Ingestieren (Batch)", variant="primary")
+
+                    with gr.Accordion("📝 OSHW-Quellen verwalten & speichern (Persistent)", open=False):
+                        gr.Markdown("Format pro Zeile: `Anzeigename | Repository-URL` oder nur `Repository-URL`")
+                        oshw_editor_input = gr.Textbox(
+                            label="OSHW Quellen-Liste (Bearbeitbar)",
+                            value=oshw_sources_to_text(load_oshw_sources()),
+                            lines=10,
+                            interactive=True
+                        )
+                        save_oshw_sources_btn = gr.Button("💾 Quellen-Liste speichern", variant="secondary")
+                        oshw_save_status = gr.Markdown("")
 
                 with gr.Tab("⭐ EDA & Rule Mining"):
                     mining_repo_input = gr.Dropdown(
@@ -933,6 +1004,13 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     model_dropdown.change(fn=update_model_preference, inputs=[model_dropdown])
     category_dropdown.change(fn=update_category_preference, inputs=[category_dropdown])
     refresh_models_btn.click(fn=lambda: gr.Dropdown(choices=get_ollama_models()[0]), outputs=[model_dropdown])
+
+    # Persistent OSHW Editor Callbacks
+    save_oshw_sources_btn.click(
+        fn=handle_save_oshw_editor,
+        inputs=[oshw_editor_input],
+        outputs=[oshw_preset_dropdown, oshw_save_status]
+    )
 
     # Dynamic Filter Presets beim Wechsel von Repositories laden
     mining_repo_input.change(fn=get_filter_preset_for_url, inputs=[mining_repo_input], outputs=[custom_filters_input])
