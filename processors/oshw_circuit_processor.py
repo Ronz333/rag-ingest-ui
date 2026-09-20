@@ -36,7 +36,7 @@ class OshwCircuitProcessor(BaseProcessor):
         num_ctx, 
         max_code_len: int,
         selected_category: str = "",
-        custom_filters: List[str] = None
+        custom_filters: Optional[List[str]] = None
     ) -> Tuple[Optional[str], Optional[str]]:
         
         rel_lower = rel_path.lower()
@@ -68,50 +68,27 @@ DATEIPFAD: {rel_path}
 SCHALTUNGS-DATEN:
 {cleaned_circuit_data[:max_code_len]}
 
-Erstelle daraus eine hochgradig strukturierte Wissenseinheit für ein PCB-Agenten-System auf Deutsch:
+Erstelle daraus eine hochgradig strukturierte Wissenseinheit für ein PCB-Agenten-System auf Deutsch.
 
-1. **Funktionale Sub-Circuits (Bausteine)**:
-   - Identifiziere alle isolierbaren Schaltungsmodule (z. B. Power Supply / Step-Down, USB-C ESD Protection, MCU Crystal Oscillator, Sensor Interface, Status-LEDs).
-   - Benenne die Kern-Bauteile (RefDes & Werte, z. B. U1: AMS1117-3.3, C1: 10uF, C2: 100nF).
+WICHTIGE STRUKTUR- UND REGEL-VORGABEN FÜR DEN AGENTEN-CODE:
+1. **KiCad Standard-Bibliotheken nutzen**: Verwende für `Part()` NIEMALS projektspezifische oder proprietäre Bibliotheksnamen (wie 'OLIMEX_RCL' oder '{filename}'). Nutze AUSSCHLIESSLICH offizielle KiCad-Standardbibliotheken wie 'Device', 'Regulator_Linear', 'Regulator_Switching', 'Diode', 'Switch', 'Interface_Ethernet', 'Connector', 'Power_Protection'.
+2. **Standard SMD-Footprints deklarieren**: Jedes Bauteil MUSS nach Möglichkeit ein explizites `footprint='...'` Attribut enthalten (z. B. `footprint='Resistor_SMD:R_0603_1608Metric'`, `footprint='Capacitor_SMD:C_0603_1608Metric'`, `footprint='Package_TO_SOT_SMD:SOT-23-5'`).
+3. **Modulare `@subcircuit`-Funktionen**: Erstelle für jeden isolierbaren Baustein eine eigene, saubere Python-Funktion mit `@subcircuit`.
+4. **Header & Trennlinien**: Trenne Abschnitte strikt mit horizontalen Linien (`---`), damit das RAG-System die Chunks verlustfrei schneiden kann.
 
-2. **SKiDL Sub-Circuit Code-Synthese**:
-   - Generiere für jedes identifizierte Modul einen voll funktionsfähigen, syntaktisch korrekten SKiDL Python-Code mit dem `@subcircuit` Decorator.
-   - Definiere klare Eingangs- und Ausgangs-Nets (z. B. `v_in`, `v_out`, `gnd`).
+STRUKTUR DER ANTWORT:
 
-3. **Exaktes Pin- & Signal-Mapping**:
-   - Erstelle eine übersichtliche Markdown-Tabelle mit den Pin-Verbindungen für den Agenten.
-"""
+## 1. Funktionale Sub-Circuits (Bausteine)
+- Liste der Sub-Circuits mit Zweck und Hauptbauteilen.
 
-        try:
-            response = ollama_client.chat(
-                model=active_model,
-                messages=[{'role': 'user', 'content': enrichment_prompt}],
-                options=options_dict
-            )
-            processed_md = response['message']['content']
-            return "OSHW_SUBCIRCUIT", processed_md
-        except Exception:
-            return "OSHW_SUBCIRCUIT", f"# OSHW Schaltungs-Referenz: {filename}\n\n```text\n{cleaned_circuit_data[:max_code_len]}\n```"
+---
 
-    def _clean_netlist_content(self, raw_text: str, ext: str) -> str:
-        """
-        Filtert grafische/Darstellungs-Informationen aus Netzlisten und Schaltplänen,
-        sodass nur noch logische Komponenten, Nets und Verbindungen übrig bleiben.
-        """
-        if ext in {".kicad_sch", ".sch"}:
-            # KiCad Schematic S-Expressionen: Entferne reine Zeichen- und Positionsbefehle (fill, stroke, uuid, at, effects)
-            lines = []
-            for line in raw_text.splitlines():
-                line_str = line.strip()
-                if any(kw in line_str for kw in ["(symbol", "(property", "(pin", "(instances", "(net", "(comp", "(value", "(footprint"]):
-                    if not any(skip in line_str for skip in ["(at ", "(effects", "(uuid", "(stroke", "(fill"]):
-                        lines.append(line)
-                if len(lines) >= 400:
-                    break
-            return "\n".join(lines) if lines else raw_text[:4000]
-        else:
-            # Netzlisten (.net, .xml): Behalte Bauteile (components) und Verbindungen (nets)
-            cleaned = re.sub(r'<tstamp>.*?</tstamp>', '', raw_text)
-            cleaned = re.sub(r'\(sheetpath.*?\)', '', cleaned)
-            lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
-            return "\n".join(lines[:400])
+## 2. SKiDL Sub-Circuit Code-Synthese
+```python
+from skidl import *
+
+@subcircuit
+def power_esd_protection(v_in, v_out, gnd):
+    # Beispiel mit KiCad Standard-Libs und Footprints
+    d1 = Part('Diode', 'TVS', footprint='Diode_SMD:D_SMA')
+    ...
