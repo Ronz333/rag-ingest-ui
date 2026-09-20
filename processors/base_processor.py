@@ -1,22 +1,13 @@
-"""
-BASE INGESTION PROCESSOR PLUGIN TEMPLATE
-----------------------------------------
-Abstrakte Basisklasse mit erweiterter Relevanz-Prüfung für GUI-Kategorien.
-"""
-
 from abc import ABC, abstractmethod
-from typing import Tuple, Set, Optional
-
+from typing import Tuple, Optional, List
 
 class BaseProcessor(ABC):
-    category_key: str = "Allgemeines Wissen"
-    collection_name = "general_knowledge_base"
-    system_prompt: str = ""
-    supported_extensions: Set[str] = set()
+    category_key: str = ""
+    collection_name: str = ""
+    supported_extensions: set = set()
 
     @abstractmethod
     def can_handle(self, rel_path: str, ext: str, selected_category: str = "") -> bool:
-        """Prüft, ob dieser Processor für Dateiendung und gewählte Kategorie zuständig ist."""
         pass
 
     @abstractmethod
@@ -26,15 +17,9 @@ class BaseProcessor(ABC):
         raw_text: str, 
         active_model: str, 
         ollama_client, 
-        num_ctx: int, 
+        num_ctx, 
         max_code_len: int,
-        selected_category: str = ""
+        selected_category: str = "",
+        custom_filters: Optional[List[str]] = None
     ) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Analysiert die Datei.
-        Rückgabe-Optionen:
-        - (category_tag, markdown_content) bei Erfolg.
-        - ("IGNORED", "SKIP") wenn die Datei für die gewählte Kategorie irrelevant ist.
-        - (None, None) wenn die Datei nicht verarbeitet werden kann.
-        """
         pass
