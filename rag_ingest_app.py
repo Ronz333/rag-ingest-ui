@@ -23,14 +23,67 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_1")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "hf.co/Qwen/Qwen3-Embedding-8B-GGUF:Q5_K_M")
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
+REPO_FILTERS_FILE = "/tmp/repo_filters.json"
 
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
+
+# --- VORKONFIGURIERTE OSHW BEZUGSQUELLEN ---
+OSHW_PRESET_REPOSITORIES = [
+    ("⚡ Adafruit Feather M4 Express (Power, MCU, USB)", "https://github.com/adafruit/Adafruit-Feather-M4-Express-PCB"),
+    ("🧩 SparkFun MicroMod MainBoard (Modular Interfaces)", "https://github.com/sparkfun/SparkFun_MicroMod_MainBoard_Single"),
+    ("🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet)", "https://github.com/OLIMEX/ESP32-GATEWAY"),
+    ("📡 Seeed Studio KiCad Library (Sensor & Display Breakouts)", "https://github.com/Seeed-Studio/Seeed_KiCad_Lib"),
+    ("⚙️ Arduino AVR Reference Boards (ATmega, Power, Serial)", "https://github.com/arduino/ArduinoCore-avr"),
+    ("🔌 Pololu KiCad Library (Regulators & Drivers)", "https://github.com/pololu/pololu-kicad-library"),
+    ("🖥️ DFRobot Sensors & Display Drivers", "https://github.com/DFRobot/DFRobot_Sensors"),
+    ("🍇 Raspberry Pi Official HAT Specifications", "https://github.com/raspberrypi/hats")
+]
 
 # --- LOGGING HELPER MIT LOKALER ZEITZEILE ---
 def log_msg(log_list, text: str):
     timestamp = time.strftime("%H:%M:%S", time.localtime())
     log_list.append(f"[{timestamp}] {text}")
+
+# --- FILTER PRESETS MANAGEMENT ---
+def get_default_filter_presets() -> dict:
+    return {
+        "default": [
+            "/fixtures/", "/tests/", "/test/", "/benchmarks/", "/.github/", "/.agents/"
+        ],
+        "freerouting": [
+            "/api/security/", "/api/dev/", "/analytics/", "/api/mcp/", "/util/gson/",
+            "Analytics", "RateLimit", "ApiKey", "ExceptionMapper", "MessageBody", "WebSocketConfigurator", "Mocked"
+        ],
+        "adafruit": [
+            "/.github/", "/build/", "README.md"
+        ],
+        "sparkfun": [
+            "/.github/", "/Firmware/", "/Software/"
+        ]
+    }
+
+def get_repo_filters_dict() -> dict:
+    if os.path.exists(REPO_FILTERS_FILE):
+        try:
+            with open(REPO_FILTERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return get_default_filter_presets()
+
+def get_filter_preset_for_url(repo_url_or_path: str) -> str:
+    if not repo_url_or_path:
+        return "\n".join(get_default_filter_presets()["default"])
+        
+    filters_dict = get_repo_filters_dict()
+    url_lower = repo_url_or_path.lower()
+    
+    for key, patterns in filters_dict.items():
+        if key != "default" and key in url_lower:
+            return "\n".join(patterns)
+            
+    return "\n".join(filters_dict.get("default", []))
 
 # --- SANITIZATION & CONFIG HELPERS ---
 def sanitize_url(raw_url: str) -> str:
@@ -142,7 +195,6 @@ def unload_ollama_model(ollama_client, model_name: str):
         pass
 
 def calculate_dynamic_num_ctx(text_len: int, max_limit: int = 32768) -> int:
-    """Berechnet ein optimales Kontextfenster (Power of 2) basierend auf der Textlänge."""
     estimated_tokens = int(text_len / 3.0) + 512
     num_ctx = 2048
     while num_ctx < estimated_tokens and num_ctx < max_limit:
@@ -150,7 +202,6 @@ def calculate_dynamic_num_ctx(text_len: int, max_limit: int = 32768) -> int:
     return min(num_ctx, max_limit)
 
 def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int = 400) -> list[str]:
-    """Trennt Markdown strukturbewusst an Überschriften/Absätzen und hält Kontext via Overlap."""
     if len(text) <= max_chars:
         return [text]
 
@@ -183,8 +234,8 @@ def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int
 
     return chunks
 
-# --- PROZESS WORKER MIT PRECISE REAL-TIME LOGGING & QWEN3-CODER OPTIMIERUNG ---
-def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size):
+# --- PROZESS WORKER MIT PRECISE Live LOGGING & DYNAMISCHEN FILTERN ---
+def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size, custom_filters_raw=""):
     temp_work_dir = None
     try:
         ollama_worker = ollama.Client(host=OLLAMA_HOST)
@@ -194,7 +245,12 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         target_collection = category_info["collection"]
         active_model = selected_model if selected_model else DEFAULT_MODEL
 
-        # Optimierte Parameter für Qwen3-Coder (Unsloth Recommendation)
+        # Parse Custom Filter aus der UI
+        active_custom_filters = [
+            line.strip() for line in (custom_filters_raw or "").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
         llm_options = {
             "num_ctx": num_ctx,
             "temperature": 0.7,
@@ -209,14 +265,14 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
         files_to_process = []
 
-        if mode == "repo_mining":
+        if mode in ["repo_mining", "oshw_mining"]:
             clean_repo_url = sanitize_url(mining_repo_url)
             if not clean_repo_url:
                 log_msg(log_list, "❌ Keine valide Repository-URL für das Mining angegeben.")
                 status_dict["header"] = "🔴 Status: BEENDET (Ungültige URL)"
                 return
 
-            log_msg(log_list, f"⛏️ Starte Git-Mining via `git clone`: {clean_repo_url}")
+            log_msg(log_list, f"⛏️ Starte Git-Mining [{mode.upper()}] via `git clone`: {clean_repo_url}")
             mined_repo_dir = os.path.join(temp_work_dir, "mined_repo")
             
             res = subprocess.run(
@@ -283,7 +339,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         total_files = len(files_to_process)
         log_msg(log_list, f"📊 Gesamt: {total_files} Datei(en) bereit zur Prüfung.")
         log_msg(log_list, f"⚙️ Konfiguration: Target Batch Size = {batch_size} verarbeitete Dateien | Max Embed Chars = {max_embed_chars}")
-        log_msg(log_list, f"⚙️ Qwen3-Coder Parameter: temp=0.7 | top_p=0.8 | top_k=20 | repeat_penalty=1.05")
+        log_msg(log_list, f"🛡️ Aktive Webpanel-Filter: {len(active_custom_filters)} Regel(n) geladen.")
         
         existing_hashes = get_indexed_hashes_set(qdrant_worker, target_collection)
         log_msg(log_list, f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
@@ -310,13 +366,14 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             parse_start_time = time.time()
 
             try:
-                # Übergibt llm_options direkt an die Processoren
+                # Übergibt custom_filters direkt an den Processor
                 category_tag, processed_md = registry.dispatch_parse(
-                    rel_path, raw_text, active_model, ollama_worker, llm_options, max_embed_chars, selected_category=category_key
+                    rel_path, raw_text, active_model, ollama_worker, llm_options, max_embed_chars, 
+                    selected_category=category_key, custom_filters=active_custom_filters
                 )
 
                 if processed_md == "SKIP" or not processed_md:
-                    log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Übersprungen (Irrelevant/Build-Doc): {rel_path}")
+                    log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Übersprungen (Gefiltert/Build-Doc): {rel_path}")
                     continue
 
                 parse_duration = time.time() - parse_start_time
@@ -487,7 +544,7 @@ class IngestProcessManager:
 
         return "\n".join(list(self.log_list)), f"### {self.status_dict['header']}"
 
-    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url="", num_ctx=32768, max_embed_chars=50000, batch_size=25):
+    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url="", num_ctx=32768, max_embed_chars=50000, batch_size=25, custom_filters_raw=""):
         if self.is_alive():
             log_msg(self.log_list, "⚠️ Ein Ingestion-Job läuft derzeit noch. Bitte erst abbrechen...")
             return f"### {self.status_dict['header']}"
@@ -509,7 +566,7 @@ class IngestProcessManager:
             args=(
                 self.log_list, self.status_dict, files, scanned_repo_path, 
                 selected_folders, selected_exts, category_key, selected_model, 
-                mode, mining_repo_url, num_ctx, max_embed_chars, batch_size
+                mode, mining_repo_url, num_ctx, max_embed_chars, batch_size, custom_filters_raw
             ),
             daemon=True
         )
@@ -769,25 +826,26 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     info="Regelt die Chunk-Größe vor der Einreichung beim Vektormodell (4.000 Chars ideal für Vulkan)."
                 )
 
+            with gr.Accordion("🛡️ Dynamic Repository Filter-Rules (Live Edit)", open=False):
+                custom_filters_input = gr.Textbox(
+                    label="Ausschlussmuster & Keywords (Ein Muster pro Zeile)",
+                    placeholder="/api/security/\nRateLimit\n/fixtures/",
+                    lines=6,
+                    value=get_filter_preset_for_url("freerouting"),
+                    info="Dateien, deren Pfad oder Name ein solches Muster enthält, werden im Ingest sofort übersprungen."
+                )
+
             with gr.Tabs():
-                with gr.Tab("📁 Dateiupload / ZIP"):
-                    file_input = gr.File(
-                        label="Dateien oder ZIP-Archiv hochladen", 
-                        file_count="multiple"
+                with gr.Tab("🔌 OSHW Library Mining"):
+                    gr.Markdown("### 🏛️ Vorkonfigurierte Open-Source Hardware Repositories")
+                    oshw_preset_dropdown = gr.Dropdown(
+                        choices=OSHW_PRESET_REPOSITORIES,
+                        value=OSHW_PRESET_REPOSITORIES[0][1],
+                        label="Geprüfte OSHW-Bezugsquelle auswählen",
+                        allow_custom_value=True,
+                        interactive=True
                     )
-
-                with gr.Tab("🌐 Git Repository Crawler"):
-                    with gr.Row(elem_classes=["row-stretch"]):
-                        github_input = gr.Textbox(
-                            label="Repository URL",
-                            placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
-                            scale=4
-                        )
-                        scan_repo_btn = gr.Button("🔍 Scannen", variant="secondary", scale=1, elem_classes=["full-height-btn"])
-
-                    with gr.Row():
-                        folder_checkboxes = gr.CheckboxGroup(label="Ordnerstruktur", choices=[], visible=False, interactive=True, scale=1)
-                        ext_checkboxes = gr.CheckboxGroup(label="Dateiformate Filter", choices=[], visible=False, interactive=True, scale=1)
+                    start_oshw_btn = gr.Button("🔌 OSHW Sub-Circuits Ingestieren", variant="primary")
 
                 with gr.Tab("⭐ EDA & Rule Mining"):
                     mining_repo_input = gr.Dropdown(
@@ -802,6 +860,25 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                         interactive=True
                     )
                     start_mining_btn = gr.Button("⛏️ Mining & Hybrid Ingestion Starten", variant="primary")
+
+                with gr.Tab("🌐 Git Repository Crawler"):
+                    with gr.Row(elem_classes=["row-stretch"]):
+                        github_input = gr.Textbox(
+                            label="Repository URL",
+                            placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
+                            scale=4
+                        )
+                        scan_repo_btn = gr.Button("🔍 Scannen", variant="secondary", scale=1, elem_classes=["full-height-btn"])
+
+                    with gr.Row():
+                        folder_checkboxes = gr.CheckboxGroup(label="Ordnerstruktur", choices=[], visible=False, interactive=True, scale=1)
+                        ext_checkboxes = gr.CheckboxGroup(label="Dateiformate Filter", choices=[], visible=False, interactive=True, scale=1)
+
+                with gr.Tab("📁 Dateiupload / ZIP"):
+                    file_input = gr.File(
+                        label="Dateien oder ZIP-Archiv hochladen", 
+                        file_count="multiple"
+                    )
 
         with gr.Column(scale=1):
             status_output = gr.Textbox(
@@ -826,6 +903,11 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     category_dropdown.change(fn=update_category_preference, inputs=[category_dropdown])
     refresh_models_btn.click(fn=lambda: gr.Dropdown(choices=get_ollama_models()[0]), outputs=[model_dropdown])
 
+    # Dynamic Filter Presets beim Wechsel von Repositories laden
+    mining_repo_input.change(fn=get_filter_preset_for_url, inputs=[mining_repo_input], outputs=[custom_filters_input])
+    oshw_preset_dropdown.change(fn=get_filter_preset_for_url, inputs=[oshw_preset_dropdown], outputs=[custom_filters_input])
+    github_input.change(fn=get_filter_preset_for_url, inputs=[github_input], outputs=[custom_filters_input])
+
     scan_repo_btn.click(
         fn=scan_github_repository,
         inputs=[github_input, repo_state],
@@ -835,18 +917,26 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     folder_checkboxes.change(fn=handle_folder_selection, inputs=[folder_checkboxes], outputs=[folder_checkboxes])
 
     start_btn.click(
-        fn=lambda files, repo, f_cb, e_cb, cat, mod, ctx, chars, batch: task_manager.start_background_job(
-            files, repo, f_cb, e_cb, cat, mod, mode="standard", num_ctx=ctx, max_embed_chars=chars, batch_size=batch
+        fn=lambda files, repo, f_cb, e_cb, cat, mod, ctx, chars, batch, filters: task_manager.start_background_job(
+            files, repo, f_cb, e_cb, cat, mod, mode="standard", num_ctx=ctx, max_embed_chars=chars, batch_size=batch, custom_filters_raw=filters
         ),
-        inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown, num_ctx_slider, embed_chars_slider, batch_size_slider],
+        inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown, num_ctx_slider, embed_chars_slider, batch_size_slider, custom_filters_input],
         outputs=[status_banner]
     )
 
     start_mining_btn.click(
-        fn=lambda cat, mod, url, ctx, chars, batch: task_manager.start_background_job(
-            None, None, None, None, cat, mod, mode="repo_mining", mining_repo_url=url, num_ctx=ctx, max_embed_chars=chars, batch_size=batch
+        fn=lambda cat, mod, url, ctx, chars, batch, filters: task_manager.start_background_job(
+            None, None, None, None, cat, mod, mode="repo_mining", mining_repo_url=url, num_ctx=ctx, max_embed_chars=chars, batch_size=batch, custom_filters_raw=filters
         ),
-        inputs=[category_dropdown, model_dropdown, mining_repo_input, num_ctx_slider, embed_chars_slider, batch_size_slider],
+        inputs=[category_dropdown, model_dropdown, mining_repo_input, num_ctx_slider, embed_chars_slider, batch_size_slider, custom_filters_input],
+        outputs=[status_banner]
+    )
+
+    start_oshw_btn.click(
+        fn=lambda cat, mod, url, ctx, chars, batch, filters: task_manager.start_background_job(
+            None, None, None, None, "⚡ PCB & Hardware Design", mod, mode="oshw_mining", mining_repo_url=url, num_ctx=ctx, max_embed_chars=chars, batch_size=batch, custom_filters_raw=filters
+        ),
+        inputs=[category_dropdown, model_dropdown, oshw_preset_dropdown, num_ctx_slider, embed_chars_slider, batch_size_slider, custom_filters_input],
         outputs=[status_banner]
     )
 
