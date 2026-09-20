@@ -2,12 +2,11 @@
 PCB & EDA PROCESSOR
 -------------------
 Verarbeitet Hardware-, Layout- und EDA-Dateien (.dsn, .kicad_pcb, .kicad_mod, .kicad_sym, .sch, .pro).
-Filtert Test-Fixtures (/fixtures/, /tests/) heraus und bereinigt DSN-Dateien von unbrauchbaren Koordinaten-Streams.
 """
 
 import os
 import re
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from .base_processor import BaseProcessor
 
 
@@ -35,19 +34,24 @@ class PcbEdaProcessor(BaseProcessor):
         ollama_client, 
         num_ctx, 
         max_code_len: int,
-        selected_category: str = ""
+        selected_category: str = "",
+        custom_filters: List[str] = None
     ) -> Tuple[Optional[str], Optional[str]]:
         rel_lower = rel_path.lower()
+        filename = os.path.basename(rel_path)
+        custom_filters = custom_filters or []
 
-        # 1. Test-Fixtures und Test-Ordner direkt ignorieren
         if any(p in rel_lower for p in self.IGNORED_PATH_PARTS):
             return "IGNORED", "SKIP"
 
+        for rule in custom_filters:
+            rule_lower = rule.lower()
+            if rule_lower in rel_lower or rule_lower in filename.lower():
+                return "IGNORED", "SKIP"
+
         ext = os.path.splitext(rel_path)[1].lower()
-        filename = os.path.basename(rel_path)
 
         if ext == ".dsn":
-            # SPECCTRA DSN: Struktur & Rules extrahieren, reine Koordinaten- & Polygon-Streams filtern
             cleaned_dsn = self._clean_dsn_content(raw_text)
             if not cleaned_dsn.strip():
                 return "IGNORED", "SKIP"
@@ -58,7 +62,6 @@ class PcbEdaProcessor(BaseProcessor):
             return "SPECCTRA_DSN", md_content
 
         elif ext in {".kicad_pcb", ".kicad_mod", ".kicad_sym"}:
-            # KiCad S-Expressionen: Metadaten & Setup filtern
             rules_and_headers = self._extract_kicad_metadata(raw_text)
             md_content = f"# KiCad EDA Definition: {filename}\n\n"
             md_content += f"- **Dateipfad:** `{rel_path}`\n\n"
@@ -66,17 +69,12 @@ class PcbEdaProcessor(BaseProcessor):
             return "KICAD_EDA", md_content
 
         else:
-            # Sonstige Schematics / Pro-Dateien
             md_content = f"# PCB EDA Datei: {filename}\n\n"
             md_content += f"- **Dateipfad:** `{rel_path}`\n\n"
             md_content += f"```text\n{raw_text[:max_code_len]}\n```"
             return "PCB_EDA", md_content
 
     def _clean_dsn_content(self, dsn_text: str) -> str:
-        """
-        Entfernt reine Koordinaten-Blöcke (placement, wire, via, network, plane polygons) aus DSN-Dateien,
-        um nur relevante Struktur- und Regel-Spezifikationen (structure, rule, layer, resolution) zu behalten.
-        """
         cleaned = re.sub(r'\(placement\s*\(.*?\)\s*\)', '', dsn_text, flags=re.DOTALL)
         cleaned = re.sub(r'\(plane\s+.*?\)', '', cleaned, flags=re.DOTALL)
         cleaned = re.sub(r'\(polygon\s+.*?\)', '', cleaned, flags=re.DOTALL)
@@ -88,7 +86,6 @@ class PcbEdaProcessor(BaseProcessor):
         return "\n".join(lines)
 
     def _extract_kicad_metadata(self, kicad_text: str) -> str:
-        """Filtert wesentliche Header und Design-Regeln aus KiCad-Dateien."""
         lines = []
         for line in kicad_text.splitlines():
             line_str = line.strip()
