@@ -202,37 +202,51 @@ def calculate_dynamic_num_ctx(text_len: int, max_limit: int = 32768) -> int:
     return min(num_ctx, max_limit)
 
 def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int = 400) -> list[str]:
+    """
+    Spaltet Markdown-Dokumente intelligent an Headern (##) und Trennlinien (---).
+    Stellt sicher, dass Code-Blöcke (```) nicht zerschnitten werden bzw. im Chunk sauber geschlossen werden.
+    """
     if len(text) <= max_chars:
         return [text]
 
-    paragraphs = re.split(r'(\n(?=#{1,4} )|\n\n+)', text)
+    blocks = re.split(r'(\n(?=#{1,4}\s)|\n(?=---\n)|\n\n+)', text)
     chunks = []
     current_chunk = ""
 
-    for p in paragraphs:
-        if not p:
+    for b in blocks:
+        if not b:
             continue
-        if len(current_chunk) + len(p) <= max_chars:
-            current_chunk += p
+        if len(current_chunk) + len(b) <= max_chars:
+            current_chunk += b
         else:
             if current_chunk.strip():
                 chunks.append(current_chunk.strip())
             
-            overlap_start = max(0, len(current_chunk) - overlap_chars)
-            overlap_text = current_chunk[overlap_start:]
-            
-            if len(p) > max_chars:
-                p_chunks = [p[i:i + max_chars] for i in range(0, len(p), max_chars - overlap_chars)]
-                for pc in p_chunks:
-                    chunks.append(pc.strip())
-                current_chunk = ""
+            if len(b) > max_chars:
+                lines = b.splitlines(keepends=True)
+                sub_chunk = ""
+                for line in lines:
+                    if len(sub_chunk) + len(line) <= max_chars:
+                        sub_chunk += line
+                    else:
+                        if sub_chunk.strip():
+                            chunks.append(sub_chunk.strip())
+                        sub_chunk = line
+                current_chunk = sub_chunk
             else:
-                current_chunk = overlap_text + p
+                current_chunk = b
 
     if current_chunk.strip():
         chunks.append(current_chunk.strip())
 
-    return chunks
+    sanitized_chunks = []
+    for chunk in chunks:
+        backtick_matches = re.findall(r'```', chunk)
+        if len(backtick_matches) % 2 != 0:
+            chunk += "\n```"
+        sanitized_chunks.append(chunk)
+
+    return sanitized_chunks
 
 # --- PROZESS WORKER MIT PRECISE Live LOGGING & DYNAMISCHEN FILTERN ---
 def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size, custom_filters_raw=""):
@@ -245,7 +259,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         target_collection = category_info["collection"]
         active_model = selected_model if selected_model else DEFAULT_MODEL
 
-        # Parse Custom Filter aus der UI
         active_custom_filters = [
             line.strip() for line in (custom_filters_raw or "").splitlines()
             if line.strip() and not line.strip().startswith("#")
@@ -843,11 +856,11 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                 with gr.Tab("⭐ EDA & Rule Mining"):
                     mining_repo_input = gr.Dropdown(
                         choices=[
-                            ("SKiDL Haupt-Repository (Offiziell)", "https://github.com/xesscorp/skidl"),
-                            ("KiCad Python Action Plugins", "https://github.com/KiCad/kicad-python"),
-                            ("Freerouting Java / Config Core", "https://github.com/freerouting/freerouting")
+                            ("SKiDL Haupt-Repository (Offiziell)", "[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)"),
+                            ("KiCad Python Action Plugins", "[https://github.com/KiCad/kicad-python](https://github.com/KiCad/kicad-python)"),
+                            ("Freerouting Java / Config Core", "[https://github.com/freerouting/freerouting](https://github.com/freerouting/freerouting)")
                         ],
-                        value="https://github.com/freerouting/freerouting",
+                        value="[https://github.com/freerouting/freerouting](https://github.com/freerouting/freerouting)",
                         label="Ziel-Repository für EDA Mining",
                         allow_custom_value=True,
                         interactive=True
@@ -858,7 +871,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     with gr.Row(elem_classes=["row-stretch"]):
                         github_input = gr.Textbox(
                             label="Repository URL",
-                            placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
+                            placeholder="[https://gitlab.com/kicad/libraries/kicad-symbols.git](https://gitlab.com/kicad/libraries/kicad-symbols.git)",
                             scale=4
                         )
                         scan_repo_btn = gr.Button("🔍 Scannen", variant="secondary", scale=1, elem_classes=["full-height-btn"])
