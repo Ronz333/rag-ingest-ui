@@ -534,6 +534,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                                 point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{r_path}_chunk_{chunk_idx}"))
 
+                                # --- AKTUALISIERTER PAYLOAD FÜR OPEN WEBUI KOMPATIBILITÄT ---
                                 qdrant_worker.upsert(
                                     collection_name=target_collection,
                                     points=[
@@ -541,6 +542,9 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                                             id=point_id,
                                             vector=vector,
                                             payload={
+                                                "text": md_chunk[:current_chars],               # Standard-Klartext für Open WebUI RAG
+                                                "document": md_chunk[:current_chars],           # Fallback-Klartext für Open WebUI
+                                                "title": os.path.basename(r_path),              # Dokumententitel
                                                 "filename": os.path.basename(r_path),
                                                 "file_path": r_path,
                                                 "content_hash": c_hash,
