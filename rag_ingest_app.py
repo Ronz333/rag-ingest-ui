@@ -1,6 +1,6 @@
 import os
 import json
-import Streamlit as st
+import streamlit as st
 from typing import List, Dict, Any
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, VectorParams, Distance
