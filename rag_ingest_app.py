@@ -30,26 +30,9 @@ OSHW_SOURCES_FILE = os.path.join(BASE_DIR, "oshw_sources.json")
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# --- DEFAULT OSHW BEZUGSQUELLEN ---
-DEFAULT_OSHW_SOURCES = [
-    {"name": "🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet, Power)", "url": "https://github.com/OLIMEX/ESP32-GATEWAY"},
-    {"name": "🔌 Olimex ESP32-EVB (Ethernet, Relays, CAN Bus, Power)", "url": "https://github.com/OLIMEX/ESP32-EVB"},
-    {"name": "⚡ Olimex ESP32-PoE (Power-over-Ethernet, LiPo Charge)", "url": "https://github.com/OLIMEX/ESP32-PoE"},
-    {"name": "⚡ Adafruit Feather M4 Express (Power, MCU, USB, LiPo)", "url": "https://github.com/adafruit/Adafruit-Feather-M4-Express-PCB"},
-    {"name": "📡 Adafruit ESP32-S3 Feather (LiPo Charging, USB-C, Power)", "url": "https://github.com/adafruit/Adafruit-ESP32-S3-Feather-PCB"},
-    {"name": "🧩 SparkFun MicroMod MainBoard (Modular Interfaces)", "url": "https://github.com/sparkfun/SparkFun_MicroMod_MainBoard_Single_Hardware"},
-    {"name": "🔋 SparkFun RedBoard Qwiic (USB-C, Power & Logic Shifting)", "url": "https://github.com/sparkfun/SparkFun_RedBoard_Qwiic_Hardware"},
-    {"name": "📶 SparkFun Thing Plus ESP32 WROOM (LiPo, USB-C, I2C)", "url": "https://github.com/sparkfun/SparkFun_Thing_Plus_ESP32_WROOM_Hardware"},
-    {"name": "📡 Seeed Studio KiCad Library (Sensor & Breakout Schematics)", "url": "https://github.com/Seeed-Studio/Seeed_KiCad_Lib"},
-    {"name": "⚙️ Arduino AVR Reference Boards (ATmega, Power, Serial)", "url": "https://github.com/arduino/ArduinoCore-avr"},
-    {"name": "🍇 Raspberry Pi Official HAT Specifications & Reference", "url": "https://github.com/raspberrypi/hats"},
-    {"name": "🔧 Pine64 Pinecil (USB-PD Power Electronics & DC/DC)", "url": "https://github.com/pine64/Pinecil"},
-    {"name": "📡 Great Scott Gadgets HackRF One (RF & Analog Reference)", "url": "https://github.com/greatscottgadgets/hackrf"},
-    {"name": "🦘 PocketBeagle (High-Density System & Power Reference)", "url": "https://github.com/beagleboard/pocketbeagle"}
-]
-
 # --- PERSISTENT OSHW SOURCES MANAGEMENT ---
 def load_oshw_sources() -> list[dict]:
+    """Lädt die OSHW-Quellen aus der externen JSON-Datei. Falls nicht vorhanden, wird sie initial angelegt."""
     if os.path.exists(OSHW_SOURCES_FILE):
         try:
             with open(OSHW_SOURCES_FILE, "r", encoding="utf-8") as f:
@@ -58,7 +41,7 @@ def load_oshw_sources() -> list[dict]:
                     return data
         except Exception as e:
             print(f"Fehler beim Laden von oshw_sources.json: {e}")
-    return DEFAULT_OSHW_SOURCES
+    return []
 
 def save_oshw_sources(sources_list: list[dict]):
     try:
