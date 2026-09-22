@@ -21,19 +21,19 @@
   },
   {
     "name": "🧩 SparkFun MicroMod MainBoard (Modular Interfaces)",
-    "url": "https://github.com/sparkfun/SparkFun_MicroMod_MainBoard_Single_Hardware"
+    "url": "https://github.com/sparkfun/SparkFun_MicroMod_Main_Board_Double.git"
   },
   {
     "name": "🔋 SparkFun RedBoard Qwiic (USB-C, Power & Logic Shifting)",
-    "url": "https://github.com/sparkfun/SparkFun_RedBoard_Qwiic_Hardware"
+    "url": "https://github.com/sparkfun/RedBoard_Plus.git"
   },
   {
     "name": "📶 SparkFun Thing Plus ESP32 WROOM (LiPo, USB-C, I2C)",
-    "url": "https://github.com/sparkfun/SparkFun_Thing_Plus_ESP32_WROOM_Hardware"
+    "url": "https://github.com/sparkfun/SparkFun_Thing_Plus_ESP32_WROOM_C.git"
   },
   {
     "name": "📡 Seeed Studio KiCad Library (Sensor & Breakout Schematics)",
-    "url": "https://github.com/Seeed-Studio/Seeed_KiCad_Lib"
+    "url": "https://github.com/Seeed-Studio/OPL_Kicad_Library.git"
   },
   {
     "name": "⚙️ Arduino AVR Reference Boards (ATmega, Power, Serial)",
@@ -42,10 +42,6 @@
   {
     "name": "🍇 Raspberry Pi Official HAT Specifications & Reference",
     "url": "https://github.com/raspberrypi/hats"
-  },
-  {
-    "name": "🔧 Pine64 Pinecil (USB-PD Power Electronics & DC/DC)",
-    "url": "https://github.com/pine64/Pinecil"
   },
   {
     "name": "📡 Great Scott Gadgets HackRF One (RF & Analog Reference)",
