@@ -22,4 +22,15 @@
     ".txt",
     ".kicad_pcb"
   ]
+  "freerouting": [
+    "/gui/",
+    "/swing/",
+    "/display/",
+    "/board/graphics/",
+    "/view/",
+    "/fixtures/",
+    "/tests/",
+    "/.github/",
+    "README.md"
+  ]
 }
