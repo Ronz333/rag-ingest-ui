@@ -90,7 +90,44 @@ def save_oshw_sources(sources_list: list[dict]):
         print(f"[SUCCESS] {len(sources_list)} Quellen in {OSHW_SOURCES_FILE} gespeichert.")
     except Exception as e:
         print(f"[ERROR] Fehler beim Speichern der OSHW-Quellen: {e}")
-        
+
+def get_oshw_dropdown_choices() -> list[tuple[str, str]]:
+    sources = load_oshw_sources()
+    return [(s.get("name", s.get("url")), s.get("url")) for s in sources if s.get("url")]
+
+def oshw_sources_to_text(sources_list: list[dict]) -> str:
+    lines = []
+    for s in sources_list:
+        lines.append(f"{s.get('name', '')} | {s.get('url', '')}")
+    return "\n".join(lines)
+
+def text_to_oshw_sources(text: str) -> list[dict]:
+    sources = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" in line:
+            parts = line.split("|", 1)
+            name = parts[0].strip()
+            url = parts[1].strip()
+        else:
+            url = line.strip()
+            name = url.split("/")[-1]
+        if url:
+            sources.append({"name": name, "url": url})
+    return sources
+
+def handle_save_oshw_editor(raw_text: str):
+    new_sources = text_to_oshw_sources(raw_text)
+    save_oshw_sources(new_sources)
+    choices = get_oshw_dropdown_choices()
+    default_vals = [c[1] for c in choices[:2]] if len(choices) >= 2 else ([c[1] for c in choices] if choices else [])
+    return (
+        gr.update(choices=choices, value=default_vals),
+        f"✅ {len(new_sources)} Quellen erfolgreich gespeichert und Menü aktualisiert!"
+    )
+
 # --- LOGGING HELPER MIT LOKALER ZEITZEILE ---
 def log_msg(log_list, text: str):
     timestamp = time.strftime("%H:%M:%S", time.localtime())
