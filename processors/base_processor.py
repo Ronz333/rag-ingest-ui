@@ -1,25 +1,25 @@
 from abc import ABC, abstractmethod
-from typing import Tuple, Optional, List
+
 
 class BaseProcessor(ABC):
-    category_key: str = ""
-    collection_name: str = ""
-    supported_extensions: set = set()
 
-    @abstractmethod
-    def can_handle(self, rel_path: str, ext: str, selected_category: str = "") -> bool:
-        pass
+  def __init__(self):
+    self.category_key = "General"
+    self.supported_extensions = []
 
-    @abstractmethod
-    def parse(
-        self, 
-        rel_path: str, 
-        raw_text: str, 
-        active_model: str, 
-        ollama_client, 
-        num_ctx, 
-        max_code_len: int,
-        selected_category: str = "",
-        custom_filters: Optional[List[str]] = None
-    ) -> Tuple[Optional[str], Optional[str]]:
-        pass
+  @abstractmethod
+  def can_handle(self, file_path: str) -> bool:
+    pass
+
+  @abstractmethod
+  def parse(
+      self,
+      file_path: str,
+      raw_content: str,
+      model_name: str,
+      ollama_client,
+      llm_options: dict,
+      max_embed_chars: int,
+      custom_filters: list = None,
+  ) -> tuple[str, str]:
+    pass
