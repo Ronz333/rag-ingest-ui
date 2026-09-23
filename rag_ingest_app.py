@@ -30,63 +30,67 @@ OSHW_SOURCES_FILE = os.path.join(BASE_DIR, "oshw_sources.json")
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
+# --- DEFAULT OSHW BEZUGSQUELLEN (FALLBACK) ---
+DEFAULT_OSHW_SOURCES = [
+    {"name": "🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet, Power)", "url": "https://github.com/OLIMEX/ESP32-GATEWAY"},
+    {"name": "🔌 Olimex ESP32-EVB (Ethernet, Relays, CAN Bus, Power)", "url": "https://github.com/OLIMEX/ESP32-EVB"},
+    {"name": "⚡ Olimex ESP32-PoE (Power-over-Ethernet, LiPo Charge)", "url": "https://github.com/OLIMEX/ESP32-PoE"},
+    {"name": "⚡ Adafruit Feather M4 Express (Power, MCU, USB, LiPo)", "url": "https://github.com/adafruit/Adafruit-Feather-M4-Express-PCB"},
+    {"name": "📡 Adafruit ESP32-S3 Feather (LiPo Charging, USB-C, Power)", "url": "https://github.com/adafruit/Adafruit-ESP32-S3-Feather-PCB"},
+    {"name": "🧩 SparkFun MicroMod MainBoard (Modular Interfaces)", "url": "https://github.com/sparkfun/SparkFun_MicroMod_MainBoard_Single_Hardware"},
+    {"name": "🔋 SparkFun RedBoard Qwiic (USB-C, Power & Logic Shifting)", "url": "https://github.com/sparkfun/SparkFun_RedBoard_Qwiic_Hardware"},
+    {"name": "📶 SparkFun Thing Plus ESP32 WROOM (LiPo, USB-C, I2C)", "url": "https://github.com/sparkfun/SparkFun_Thing_Plus_ESP32_WROOM_Hardware"},
+    {"name": "📡 Seeed Studio KiCad Library (Sensor & Breakout Schematics)", "url": "https://github.com/Seeed-Studio/Seeed_KiCad_Lib"},
+    {"name": "⚙️ Arduino AVR Reference Boards (ATmega, Power, Serial)", "url": "https://github.com/arduino/ArduinoCore-avr"},
+    {"name": "🍇 Raspberry Pi Official HAT Specifications & Reference", "url": "https://github.com/raspberrypi/hats"},
+    {"name": "🔧 Pine64 Pinecil (USB-PD Power Electronics & DC/DC)", "url": "https://github.com/pine64/Pinecil"},
+    {"name": "📡 Great Scott Gadgets HackRF One (RF & Analog Reference)", "url": "https://github.com/greatscottgadgets/hackrf"},
+    {"name": "🦘 PocketBeagle (High-Density System & Power Reference)", "url": "https://github.com/beagleboard/pocketbeagle"},
+    {"name": "🐍 SKiDL Circuits As Code (Offizielle SKiDL Subcircuit-Bibliothek)", "url": "https://github.com/devbisme/circuitsascode"},
+    {"name": "🏗️ Atopile Language & Hardware Library (Deklarative PCB-Module)", "url": "https://github.com/atopile/atopile"},
+    {"name": "🤖 KiCad Tools für LLM Agenten (Pure Python Parser, DRC & Router)", "url": "https://github.com/rjwalters/kicad-tools"},
+    {"name": "🐍 PyKiCad (Python-Bibliothek für KiCad PCB-Generierung)", "url": "https://github.com/dvc94ch/pykicad"},
+    {"name": "🔌 KiCad Python IPC API Bindings", "url": "https://github.com/atopile/kicad-python"},
+    {"name": "🔥 Procedural PCB Geometry Generator (KiCad Trace Generierung)", "url": "https://github.com/Trilys/PCB_Heater_KiCad"},
+    {"name": "⚡ OrthoRoute (GPU-Beschleunigter KiCad Autorouter)", "url": "https://github.com/bbenchoff/OrthoRoute"},
+    {"name": "🤖 KiBot Automated KiCad Preflights & DRC Verification", "url": "https://github.com/MicroType-Engineering/KiBot"}
+]
+
 # --- PERSISTENT OSHW SOURCES MANAGEMENT ---
 def load_oshw_sources() -> list[dict]:
-    """Lädt die OSHW-Quellen aus der externen JSON-Datei. Falls nicht vorhanden, wird sie initial angelegt."""
+    """Lädt die OSHW-Quellen aus der JSON-Datei. Bei Lesefehlern oder leerer Datei greift das DEFAULT-Fallback."""
     if os.path.exists(OSHW_SOURCES_FILE):
+        if not os.path.isfile(OSHW_SOURCES_FILE):
+            print(f"[ERROR] {OSHW_SOURCES_FILE} existiert, ist aber ein ORDNER anstelle einer Datei!")
+            return DEFAULT_OSHW_SOURCES
+
         try:
-            with open(OSHW_SOURCES_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list) and len(data) > 0:
-                    return data
+            with open(OSHW_SOURCES_FILE, "r", encoding="utf-8-sig") as f:
+                content = f.read().strip()
+                if content:
+                    data = json.loads(content)
+                    if isinstance(data, list) and len(data) > 0:
+                        print(f"[SUCCESS] {len(data)} OSHW-Quellen erfolgreich geladen.")
+                        return data
+                    else:
+                        print(f"[WARN] {OSHW_SOURCES_FILE} enthält kein gültiges JSON-Array oder ist leer.")
         except Exception as e:
-            print(f"Fehler beim Laden von oshw_sources.json: {e}")
-    return []
+            print(f"[ERROR] Fehler beim Lesen von {OSHW_SOURCES_FILE}: {e}")
+    else:
+        print(f"[WARN] Datei nicht gefunden unter: {OSHW_SOURCES_FILE}")
+
+    print("[INFO] Nutze DEFAULT_OSHW_SOURCES als Fallback.")
+    return DEFAULT_OSHW_SOURCES
 
 def save_oshw_sources(sources_list: list[dict]):
     try:
+        os.makedirs(os.path.dirname(OSHW_SOURCES_FILE), exist_ok=True)
         with open(OSHW_SOURCES_FILE, "w", encoding="utf-8") as f:
             json.dump(sources_list, f, ensure_ascii=False, indent=2)
+        print(f"[SUCCESS] {len(sources_list)} Quellen in {OSHW_SOURCES_FILE} gespeichert.")
     except Exception as e:
-        print(f"Fehler beim Speichern der OSHW-Quellen: {e}")
-
-def get_oshw_dropdown_choices() -> list[tuple[str, str]]:
-    sources = load_oshw_sources()
-    return [(s.get("name", s.get("url")), s.get("url")) for s in sources if s.get("url")]
-
-def oshw_sources_to_text(sources_list: list[dict]) -> str:
-    lines = []
-    for s in sources_list:
-        lines.append(f"{s.get('name', '')} | {s.get('url', '')}")
-    return "\n".join(lines)
-
-def text_to_oshw_sources(text: str) -> list[dict]:
-    sources = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "|" in line:
-            parts = line.split("|", 1)
-            name = parts[0].strip()
-            url = parts[1].strip()
-        else:
-            url = line.strip()
-            name = url.split("/")[-1]
-        if url:
-            sources.append({"name": name, "url": url})
-    return sources
-
-def handle_save_oshw_editor(raw_text: str):
-    new_sources = text_to_oshw_sources(raw_text)
-    save_oshw_sources(new_sources)
-    choices = get_oshw_dropdown_choices()
-    default_vals = [c[1] for c in choices[:2]] if len(choices) >= 2 else ([c[1] for c in choices] if choices else [])
-    return (
-        gr.update(choices=choices, value=default_vals),
-        f"✅ {len(new_sources)} Quellen erfolgreich gespeichert und Menü aktualisiert!"
-    )
-
+        print(f"[ERROR] Fehler beim Speichern der OSHW-Quellen: {e}")
+        
 # --- LOGGING HELPER MIT LOKALER ZEITZEILE ---
 def log_msg(log_list, text: str):
     timestamp = time.strftime("%H:%M:%S", time.localtime())
