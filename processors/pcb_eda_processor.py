@@ -1,119 +1,112 @@
-"""
-PCB & EDA PROCESSOR
--------------------
-Verarbeitet Hardware-, Layout- und EDA-Dateien (.dsn, .kicad_pcb, .kicad_mod, .kicad_sym, .sch, .pro).
-Entfernt Layout-Geometrie und Zeichenkoordinaten für optimale RAG-Synthese.
-"""
-
 import os
 import re
-from typing import Tuple, Optional, List
 from .base_processor import BaseProcessor
 
 
 class PcbEdaProcessor(BaseProcessor):
-    category_key = "⚡ PCB & Hardware Design"
-    collection_name = "pcb_knowledge_base"
-    supported_extensions = {".dsn", ".kicad_pcb", ".kicad_mod", ".kicad_sym", ".sch", ".pro"}
+    """
+    Processor für PCB-EDA-, Specctra DSN- und Freerouting-Dateien.
+    Extrahiert ausschließlich Design-Regeln, Netclasses, Layer-Setups und Routing-Constraints.
+    Filtert physische Trassen-Koordinaten und Bauteil-Platzierungen heraus.
+    """
 
-    IGNORED_PATH_PARTS = [
-        "/fixtures/", "/tests/", "/test/", "/benchmarks/", "/scripts/benchmark/",
-        "/.git/", "/build/", "/dist/", "/.agents/", "/.github/"
-    ]
+    def __init__(self):
+        super().__init__()
+        self.category_key = "⚡ PCB & Hardware Design"
+        self.supported_extensions = [".dsn", ".rules", ".kicad_pcb"]
 
-    def can_handle(self, rel_path: str, ext: str, selected_category: str = "") -> bool:
-        rel_lower = rel_path.lower()
-        if any(p in rel_lower for p in self.IGNORED_PATH_PARTS):
-            return False
+    def can_handle(self, file_path: str) -> bool:
+        ext = os.path.splitext(file_path)[1].lower()
         return ext in self.supported_extensions
 
     def parse(
         self, 
-        rel_path: str, 
-        raw_text: str, 
-        active_model: str, 
+        file_path: str, 
+        raw_content: str, 
+        model_name: str, 
         ollama_client, 
-        num_ctx, 
-        max_code_len: int,
-        selected_category: str = "",
-        custom_filters: Optional[List[str]] = None
-    ) -> Tuple[Optional[str], Optional[str]]:
-        rel_lower = rel_path.lower()
-        filename = os.path.basename(rel_path)
-        custom_filters = custom_filters or []
+        llm_options: dict, 
+        max_embed_chars: int, 
+        custom_filters: list = None
+    ) -> tuple[str, str]:
+        # Custom Filter Check
+        if custom_filters:
+            fp_clean = file_path.replace("\\", "/")
+            for pattern in custom_filters:
+                if pattern and pattern in fp_clean:
+                    return "PCB_EDA", "SKIP"
 
-        if any(p in rel_lower for p in self.IGNORED_PATH_PARTS):
-            return "IGNORED", "SKIP"
-
-        for rule in custom_filters:
-            rule_lower = rule.lower()
-            if rule_lower in rel_lower or rule_lower in filename.lower():
-                return "IGNORED", "SKIP"
-
-        ext = os.path.splitext(rel_path)[1].lower()
-        bt = "```"
+        ext = os.path.splitext(file_path)[1].lower()
+        filename = os.path.basename(file_path)
 
         if ext == ".dsn":
-            cleaned_dsn = self._clean_dsn_content(raw_text)
+            cleaned_dsn = self._extract_dsn_rules(raw_content)
             if not cleaned_dsn.strip():
-                return "IGNORED", "SKIP"
+                return "PCB_EDA", "SKIP"
 
-            md_content = f"# Specctra DSN Design-Regeln: {filename}\n\n"
-            md_content += f"- **Dateipfad:** `{rel_path}`\n\n"
-            md_content += f"{bt}lisp\n{cleaned_dsn[:max_code_len]}\n{bt}"
-            return "SPECCTRA_DSN", md_content
+            md_content = f"# Specctra DSN & Freerouting Design-Regeln: {filename}\n\n"
+            md_content += f"- **Dateipfad:** `{file_path}`\n\n"
+            md_content += f"```lisp\n{cleaned_dsn[:max_embed_chars]}\n```"
+            return "FREEROUTING_DSN", md_content
 
-        elif ext in {".kicad_pcb", ".kicad_mod", ".kicad_sym"}:
-            rules_and_headers = self._extract_kicad_metadata(raw_text)
-            if not rules_and_headers.strip():
-                return "IGNORED", "SKIP"
+        elif ext == ".rules":
+            # Direct Freerouting Rules File
+            md_content = f"# Freerouting Rules Definition: {filename}\n\n"
+            md_content += f"- **Dateipfad:** `{file_path}`\n\n"
+            md_content += f"```text\n{raw_content[:max_embed_chars]}\n```"
+            return "FREEROUTING_RULES", md_content
 
-            md_content = f"# KiCad EDA Definition: {filename}\n\n"
-            md_content += f"- **Dateipfad:** `{rel_path}`\n\n"
-            md_content += f"{bt}lisp\n{rules_and_headers[:max_code_len]}\n{bt}"
-            return "KICAD_EDA", md_content
+        elif ext == ".kicad_pcb":
+            drc_metadata = self._extract_kicad_drc_rules(raw_content)
+            if not drc_metadata.strip():
+                return "PCB_EDA", "SKIP"
 
-        else:
-            md_content = f"# PCB EDA Datei: {filename}\n\n"
-            md_content += f"- **Dateipfad:** `{rel_path}`\n\n"
-            md_content += f"{bt}text\n{raw_text[:max_code_len]}\n{bt}"
-            return "PCB_EDA", md_content
+            md_content = f"# KiCad DRC & Netclass Rules: {filename}\n\n"
+            md_content += f"- **Dateipfad:** `{file_path}`\n\n"
+            md_content += f"```lisp\n{drc_metadata[:max_embed_chars]}\n```"
+            return "KICAD_DRC", md_content
 
-    def _clean_dsn_content(self, dsn_text: str) -> str:
+        return "PCB_EDA", "SKIP"
+
+    def _extract_dsn_rules(self, dsn_text: str) -> str:
+        """
+        Extrahiert aus DSN-Dateien nur die logischen Abschnitte (parser, resolution, structure, 
+        placement-rules, netclasses, rules). Entsorgt alle physischen Koordinaten (placement, wiring, path).
+        """
+        # Entferne explizite Routing-Pfade und Platzierungskoordinaten
         cleaned = re.sub(r'\(placement\s*\(.*?\)\s*\)', '', dsn_text, flags=re.DOTALL)
-        cleaned = re.sub(r'\(plane\s+.*?\)', '', cleaned, flags=re.DOTALL)
-        cleaned = re.sub(r'\(polygon\s+.*?\)', '', cleaned, flags=re.DOTALL)
-        cleaned = re.sub(r'\(place\s+.*?\)', '', cleaned)
+        cleaned = re.sub(r'\(wiring\s*\(.*?\)\s*\)', '', cleaned, flags=re.DOTALL)
         cleaned = re.sub(r'\(wire\s+.*?\)', '', cleaned)
         cleaned = re.sub(r'\(path\s+.*?\)', '', cleaned)
-        
+        cleaned = re.sub(r'\(place\s+.*?\)', '', cleaned)
+        cleaned = re.sub(r'\(polygon\s+.*?\)', '', cleaned)
+
         lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
         return "\n".join(lines)
 
-    def _extract_kicad_metadata(self, kicad_text: str) -> str:
+    def _extract_kicad_drc_rules(self, kicad_text: str) -> str:
         """
-        Extrahiert ausschließlich DRC-Regeln, Layer-Setups und Netzlisten.
-        Verwirft alle Footprints, Zeichenobjekte (fp_line, pad) und Trace-Koordinaten (segment, via).
+        Extrahiert aus .kicad_pcb ausschließlich DRC-Regeln, Netclasses und Setup-Einstellungen.
         """
-        lines = []
+        retained_lines = []
         for line in kicad_text.splitlines():
             line_str = line.strip()
             
-            # Ignoriere Footprint-Zeichnungen, Pad-Definitionen & Traces vollständig
+            # Ignoriere Footprints, Pads, Traces & Zonen-Koordinaten
             if any(line_str.startswith(kw) for kw in [
                 "(module", "(footprint", "(fp_line", "(fp_text", "(fp_circle", "(fp_arc", 
                 "(pad", "(segment", "(via", "(gr_line", "(gr_text", "(zone"
             ]):
                 continue
                 
-            # Behalte nur Setup-, DRC- und Netlist-Informationen
+            # Behalte DRC-Setups, Netclasses & Abstandsregeln
             if any(kw in line_str for kw in [
-                "(kicad_pcb", "(version", "(host", "(nets", "(layers", "(setup", 
-                "(trace_min", "(via_size", "(clearance", "(layerselection", "(net "
+                "(kicad_pcb", "(version", "(setup", "(trace_min", "(via_size", 
+                "(clearance", "(netclass", "(uvia", "(tracks", "(vias"
             ]):
-                lines.append(line)
+                retained_lines.append(line)
                 
-            if len(lines) >= 350:
+            if len(retained_lines) >= 300:
                 break
                 
-        return "\n".join(lines)
+        return "\n".join(retained_lines)
