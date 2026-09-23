@@ -4,7 +4,7 @@ from .pcb_eda_processor import PcbEdaProcessor
 from .python_processor import PythonProcessor
 from .java_processor import JavaProcessor
 from .javascript_processor import JavascriptProcessor
-from .oshw_circuit_processor import OshwCircuitProcessor
+from .oshw_circuit_processor import OSHWCircuitProcessor
 from .processor_registry import registry
 
 __all__ = [
