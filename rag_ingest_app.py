@@ -24,8 +24,11 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_1")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "hf.co/Qwen/Qwen3-Embedding-8B-GGUF:Q5_K_M")
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
-REPO_FILTERS_FILE = os.path.join(BASE_DIR, "repo_filters.json")
-OSHW_SOURCES_FILE = os.path.join(BASE_DIR, "oshw_sources.json")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+REPO_FILTERS_FILE = os.path.join(DATA_DIR, "repo_filters.json")
+OSHW_SOURCES_FILE = os.path.join(DATA_DIR, "oshw_sources.json")
 
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
