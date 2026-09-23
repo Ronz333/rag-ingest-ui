@@ -1,0 +1,25 @@
+{
+  "default": [
+    "/api/security/",
+    "/api/dev/",
+    "/analytics/",
+    "/api/mcp/",
+    "/util/gson/",
+    "Analytics",
+    "RateLimit",
+    "ApiKey",
+    "ExceptionMapper",
+    "MessageBody",
+    "WebSocketConfigurator",
+    "Mocked",
+    "/build/",
+    "/CMakeFiles/",
+    "/.git/",
+    ".pro",
+    ".kicad_pro",
+    "CMakeCache.txt",
+    ".ninja",
+    ".txt",
+    ".kicad_pcb"
+  ]
+}
