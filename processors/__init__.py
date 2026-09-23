@@ -1,19 +1,23 @@
 from .base_processor import BaseProcessor
-from .general_processor import GeneralDocumentProcessor
-from .pcb_eda_processor import PcbEdaProcessor
+from .general_processor import GeneralProcessor
 from .python_processor import PythonProcessor
 from .java_processor import JavaProcessor
 from .javascript_processor import JavascriptProcessor
 from .oshw_circuit_processor import OSHWCircuitProcessor
-from .processor_registry import registry
+from .pcb_eda_processor import PcbEdaProcessor
+from .kicad_sym_processor import KiCadSymProcessor
+
+# Alias für Abwärtskompatibilität bei unterschiedlicher Schreibweise
+OshwCircuitProcessor = OSHWCircuitProcessor
 
 __all__ = [
     "BaseProcessor",
-    "GeneralDocumentProcessor",
-    "PcbEdaProcessor",
+    "GeneralProcessor",
     "PythonProcessor",
     "JavaProcessor",
     "JavascriptProcessor",
+    "OSHWCircuitProcessor",
     "OshwCircuitProcessor",
-    "registry"
+    "PcbEdaProcessor",
+    "KiCadSymProcessor",
 ]
