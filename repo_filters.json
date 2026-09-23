@@ -21,7 +21,7 @@
     ".ninja",
     ".txt",
     ".kicad_pcb"
-  ]
+  ],
   "freerouting": [
     "/gui/",
     "/swing/",
@@ -32,5 +32,34 @@
     "/tests/",
     "/.github/",
     "README.md"
+  ],
+  "kibot": [
+    "/tests/",
+    "/docs/",
+    "/images/",
+    "/.github/",
+    "setup.py"
+  ],
+  "skidl": [
+    "/doc/",
+    "/tests/",
+    "/.github/",
+    "setup.py"
+  ],
+  "adafruit": [
+    "/.github/",
+    "/build/",
+    "README.md"
+  ],
+  "sparkfun": [
+    "/.github/",
+    "/Firmware/",
+    "/Software/"
+  ],
+  "atopile": [
+    "/docs/",
+    "/tests/",
+    "/.github/",
+    "/frontend/"
   ]
 }
