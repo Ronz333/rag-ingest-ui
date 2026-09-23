@@ -50,5 +50,53 @@
   {
     "name": "🦘 PocketBeagle (High-Density System & Power Reference)",
     "url": "https://github.com/beagleboard/pocketbeagle"
+  },
+  {
+    "name": "⚙️ SKiDL Core Engine (Python Circuit Synthesis & Pattern Reference)",
+    "url": "https://github.com/xesscorp/skidl"
+  },
+  {
+    "name": "🐍 SKiDL Circuits As Code (Offizielle SKiDL Subcircuit-Bibliothek)",
+    "url": "https://github.com/devbisme/circuitsascode"
+  },
+  {
+    "name": "🏗️ Atopile Language & Hardware Library (Deklarative PCB-Module)",
+    "url": "https://github.com/atopile/atopile"
+  },
+  {
+    "name": "🤖 KiCad Tools für LLM Agenten (Pure Python Parser, DRC & Router)",
+    "url": "https://github.com/rjwalters/kicad-tools"
+  },
+  {
+    "name": "🐍 PyKiCad (Python-Bibliothek für KiCad PCB-Generierung)",
+    "url": "https://github.com/dvc94ch/pykicad"
+  },
+  {
+    "name": "🔌 KiCad Python IPC API Bindings",
+    "url": "https://github.com/atopile/kicad-python"
+  },
+  {
+    "name": "🔥 Procedural PCB Geometry Generator (KiCad Trace Generierung)",
+    "url": "https://github.com/Trilys/PCB_Heater_KiCad"
+  },
+  {
+    "name": "⚡ OrthoRoute (GPU-Beschleunigter KiCad Autorouter)",
+    "url": "https://github.com/bbenchoff/OrthoRoute"
+  },
+  {
+    "name": "🤖 KiBot Main Framework (Official KiCad Automation & DSN Pipelines)",
+    "url": "https://github.com/INTI-CMNB/KiBot"
+  },
+  {
+    "name": "🤖 KiBot Action Configs (KiCad Preflights & DRC Verification)",
+    "url": "https://github.com/MicroType-Engineering/KiBot"
+  },
+  {
+    "name": "🚦 Freerouting Core (Routing Engine & DSN/Rules Grammar)",
+    "url": "https://github.com/freerouting/freerouting.git"
+  },
+  {
+    "name": "🔌 Freerouting Plugin (DSN Export & SES Import Workflow)",
+    "url": "https://github.com/freerouting/freerouting-plugin"
   }
 ]
