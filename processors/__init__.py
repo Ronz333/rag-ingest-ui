@@ -1,13 +1,13 @@
 from .base_processor import BaseProcessor
 from .general_processor import GeneralProcessor
-from .python_processor import PythonProcessor
 from .java_processor import JavaProcessor
 from .javascript_processor import JavascriptProcessor
+from .kicad_sym_processor import KiCadSymProcessor
 from .oshw_circuit_processor import OSHWCircuitProcessor
 from .pcb_eda_processor import PcbEdaProcessor
-from .kicad_sym_processor import KiCadSymProcessor
+from .python_processor import PythonProcessor
 
-# Alias für Abwärtskompatibilität bei unterschiedlicher Schreibweise
+# Alias für Abwärtskompatibilität
 OshwCircuitProcessor = OSHWCircuitProcessor
 
 __all__ = [
