@@ -1,136 +1,63 @@
-"""
-OSHW CIRCUIT & SUBCIRCUIT PROCESSOR
------------------------------------
-Verarbeitet Open-Source Hardware Netzlisten und KiCad-Schaltpläne (.net, .xml, .kicad_sch, .sch).
-Extrahiert funktional zusammenhängende Bauteilgruppen (z. B. Spannungsregler, Quarz-Oszillatoren, 
-USB-Interfaces, Sensorschnittstellen) und synthetisiert daraus modulare SKiDL-Sub-Circuits.
-"""
-
 import os
 import re
-from typing import Tuple, Optional, List
-from .base_processor import BaseProcessor
+from processors.base_processor import BaseProcessor
 
 
-class OshwCircuitProcessor(BaseProcessor):
-    category_key = "⚡ PCB & Hardware Design"
-    collection_name = "pcb_knowledge_base"
-    supported_extensions = {".net", ".xml", ".kicad_sch", ".sch"}
+class OSHWCircuitProcessor(BaseProcessor):
+    """
+    Processor für OSHW-Schaltpläne. Generiert kanonische SKiDL Few-Shot Muster (Säule 2).
+    """
 
-    GENERAL_IGNORED_PARTS = [
-        "/.git/", "/build/", "/dist/", "/fixtures/", "/tests/", "/test/", "/benchmarks/"
-    ]
+    def __init__(self):
+        super().__init__()
+        self.category_key = "⚡ PCB & Hardware Design"
+        self.supported_extensions = [".sch", ".kicad_sch", ".net"]
 
-    def can_handle(self, rel_path: str, ext: str, selected_category: str = "") -> bool:
-        rel_lower = rel_path.lower()
-        if any(p in rel_lower for p in self.GENERAL_IGNORED_PARTS):
-            return False
+    def can_handle(self, file_path: str) -> bool:
+        ext = os.path.splitext(file_path)[1].lower()
         return ext in self.supported_extensions
 
-    def parse(
-        self, 
-        rel_path: str, 
-        raw_text: str, 
-        active_model: str, 
-        ollama_client, 
-        num_ctx, 
-        max_code_len: int,
-        selected_category: str = "",
-        custom_filters: Optional[List[str]] = None
-    ) -> Tuple[Optional[str], Optional[str]]:
-        
-        rel_lower = rel_path.lower()
-        filename = os.path.basename(rel_path)
-        custom_filters = custom_filters or []
+    def parse(self, file_path: str, raw_content: str, model_name: str, ollama_client, llm_options: dict, max_embed_chars: int, custom_filters: list = None) -> tuple[str, str]:
+        # Filter-Prüfung
+        if custom_filters:
+            fp_clean = file_path.replace("\\", "/")
+            for pattern in custom_filters:
+                if pattern and pattern in fp_clean:
+                    return "OSHW_SUBCIRCUIT", "SKIP"
 
-        # 1. Allgemeine Ignorier-Pfade prüfen
-        if any(p in rel_lower for p in self.GENERAL_IGNORED_PARTS):
-            return "IGNORED", "SKIP"
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in [".kicad_pcb", ".pro", ".kicad_pro", ".txt", ".ninja"]:
+            return "OSHW_SUBCIRCUIT", "SKIP"
 
-        # 2. Dynamische Webpanel-Filter anwenden
-        for rule in custom_filters:
-            rule_lower = rule.lower()
-            if rule_lower in rel_lower or rule_lower in filename.lower():
-                return "IGNORED", "SKIP"
+        system_prompt = (
+            "Du bist ein Senior PCB Electronics Architect.\n"
+            "Analysiere den Schaltplan/Netzliste und erstelle eine hochreine SKiDL-Referenzvorlage.\n\n"
+            "REGELN FÜR DIE CODE-SYNTHESE:\n"
+            "1. Kapselung: Erstelle für logische Blöcke (Power, MCU, PHY, ESD) wiederverwendbare Funktionen mit @subcircuit.\n"
+            "2. Bibliotheken: Verwende für Passivbauteile ausschließlich 'Device' (z.B. Part('Device', 'R', ...), Part('Device', 'LED', ...)).\n"
+            "3. Topologie: Achte auf korrekt in Reihe geschaltete LED-Vorwiderstände und antiparallel geschaltete TVS-Dioden.\n\n"
+            "FORMAT-VORGABE:\n"
+            "## 1. Funktionale Beschreibung\n"
+            "- Kurze Stichpunkte\n\n"
+            "## 2. SKiDL Sub-Circuit Code\n"
+            "```python\n"
+            "# Valider SKiDL Code\n"
+            "```\n\n"
+            "## 3. Signal-Mapping\n"
+            "| Bauteil | Pin | Funktion | Net |\n"
+        )
 
-        ext = os.path.splitext(rel_path)[1].lower()
-        cleaned_circuit_data = self._clean_netlist_content(raw_text, ext)
-
-        if not cleaned_circuit_data.strip():
-            return "IGNORED", "SKIP"
-
-        options_dict = num_ctx if isinstance(num_ctx, dict) else {"num_ctx": num_ctx}
-
-        bt = "```"
-        enrichment_prompt = f"""Du bist ein Experte für Hardware-Synthese und SKiDL (Python for Circuit Design).
-Analysiere die folgende Netzliste / den Schaltplan aus einem Open-Source Hardware Projekt:
-
-DATEIPFAD: {rel_path}
-SCHALTUNGS-DATEN:
-{cleaned_circuit_data[:max_code_len]}
-
-Erstelle daraus eine hochgradig strukturierte Wissenseinheit für ein PCB-Agenten-System auf Deutsch.
-
-WICHTIGE STRUKTUR- UND REGEL-VORGABEN FÜR DEN AGENTEN-CODE:
-1. **KiCad Standard-Bibliotheken nutzen**: Verwende für `Part()` NIEMALS projektspezifische oder proprietäre Bibliotheksnamen (wie 'OLIMEX_RCL' oder '{filename}'). Nutze AUSSCHLIESSLICH offizielle KiCad-Standardbibliotheken wie 'Device', 'Regulator_Linear', 'Regulator_Switching', 'Diode', 'Switch', 'Interface_Ethernet', 'Connector', 'Power_Protection'.
-2. **Standard SMD-Footprints deklarieren**: Jedes Bauteil MUSS nach Möglichkeit ein explizites `footprint='...'` Attribut enthalten (z. B. `footprint='Resistor_SMD:R_0603_1608Metric'`, `footprint='Capacitor_SMD:C_0603_1608Metric'`, `footprint='Package_TO_SOT_SMD:SOT-23-5'`).
-3. **Modulare `@subcircuit`-Funktionen**: Erstelle für jeden isolierbaren Baustein eine eigene, saubere Python-Funktion mit `@subcircuit`.
-4. **Header & Trennlinien**: Trenne Abschnitte strikt mit horizontalen Linien (`---`), damit das RAG-System die Chunks verlustfrei schneiden kann.
-
-STRUKTUR DER ANTWORT:
-
-## 1. Funktionale Sub-Circuits (Bausteine)
-- Liste der Sub-Circuits mit Zweck und Hauptbauteilen.
-
----
-
-## 2. SKiDL Sub-Circuit Code-Synthese
-{bt}python
-from skidl import *
-
-@subcircuit
-def power_esd_protection(v_in, v_out, gnd):
-    # Beispiel mit KiCad Standard-Libs und Footprints
-    d1 = Part('Diode', 'TVS', footprint='Diode_SMD:D_SMA')
-    # Verbindungen herstellen...
-{bt}
-
----
-
-## 3. Exaktes Pin- & Signal-Mapping
-| Bauteil | Pin | Funktion | Net |
-|---|---|---|---|
-| D1 | A | Anode | gnd |
-"""
+        user_message = f"Schaltplan: {file_path}\n\nInhalt:\n{raw_content[:max_embed_chars]}"
 
         try:
             response = ollama_client.chat(
-                model=active_model,
-                messages=[{'role': 'user', 'content': enrichment_prompt}],
-                options=options_dict
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ],
+                options=llm_options
             )
-            processed_md = response['message']['content']
-            return "OSHW_SUBCIRCUIT", processed_md
-        except Exception:
-            return "OSHW_SUBCIRCUIT", f"# OSHW Schaltungs-Referenz: {filename}\n\n{bt}text\n{cleaned_circuit_data[:max_code_len]}\n{bt}"
-
-    def _clean_netlist_content(self, raw_text: str, ext: str) -> str:
-        """
-        Filtert grafische/Darstellungs-Informationen aus Netzlisten und Schaltplänen,
-        sodass nur noch logische Komponenten, Nets und Verbindungen übrig bleiben.
-        """
-        if ext in {".kicad_sch", ".sch"}:
-            lines = []
-            for line in raw_text.splitlines():
-                line_str = line.strip()
-                if any(kw in line_str for kw in ["(symbol", "(property", "(pin", "(instances", "(net", "(comp", "(value", "(footprint"]):
-                    if not any(skip in line_str for skip in ["(at ", "(effects", "(uuid", "(stroke", "(fill"]):
-                        lines.append(line)
-                if len(lines) >= 400:
-                    break
-            return "\n".join(lines) if lines else raw_text[:4000]
-        else:
-            cleaned = re.sub(r'<tstamp>.*?</tstamp>', '', raw_text)
-            cleaned = re.sub(r'\(sheetpath.*?\)', '', cleaned)
-            lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
-            return "\n".join(lines[:400])
+            return "OSHW_SUBCIRCUIT", response['message']['content'].strip()
+        except Exception as e:
+            raise RuntimeError(f"Fehler in OSHWCircuitProcessor ({file_path}): {str(e)}")
