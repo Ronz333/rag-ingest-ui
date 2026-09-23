@@ -7,6 +7,8 @@ services:
       - OLLAMA_HOST=http://ollama:11434
       - QDRANT_HOST=http://qdrant:6333
       - OLLAMA_MODEL=hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_1
+    volumes:
+      - ./data:/app/data
     networks:
       - coolify
 
