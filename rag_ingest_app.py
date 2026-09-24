@@ -24,75 +24,40 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_1")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "hf.co/Qwen/Qwen3-Embedding-8B-GGUF:Q5_K_M")
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
-DATA_DIR = os.path.join(BASE_DIR, "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-REPO_FILTERS_FILE = os.path.join(DATA_DIR, "repo_filters.json")
-OSHW_SOURCES_FILE = os.path.join(DATA_DIR, "oshw_sources.json")
+REPO_FILTERS_FILE = os.path.join(BASE_DIR, "repo_filters.json")
+OSHW_SOURCES_FILE = os.path.join(BASE_DIR, "oshw_sources.json")
 
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# --- DEFAULT OSHW BEZUGSQUELLEN (FALLBACK) ---
+# --- DEFAULT OSHW BEZUGSQUELLEN ---
 DEFAULT_OSHW_SOURCES = [
     {"name": "🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet, Power)", "url": "https://github.com/OLIMEX/ESP32-GATEWAY"},
     {"name": "🔌 Olimex ESP32-EVB (Ethernet, Relays, CAN Bus, Power)", "url": "https://github.com/OLIMEX/ESP32-EVB"},
     {"name": "⚡ Olimex ESP32-PoE (Power-over-Ethernet, LiPo Charge)", "url": "https://github.com/OLIMEX/ESP32-PoE"},
-    {"name": "⚡ Adafruit Feather M4 Express (Power, MCU, USB, LiPo)", "url": "https://github.com/adafruit/Adafruit-Feather-M4-Express-PCB"},
-    {"name": "📡 Adafruit ESP32-S3 Feather (LiPo Charging, USB-C, Power)", "url": "https://github.com/adafruit/Adafruit-ESP32-S3-Feather-PCB"},
-    {"name": "🧩 SparkFun MicroMod MainBoard (Modular Interfaces)", "url": "https://github.com/sparkfun/SparkFun_MicroMod_MainBoard_Single_Hardware"},
-    {"name": "🔋 SparkFun RedBoard Qwiic (USB-C, Power & Logic Shifting)", "url": "https://github.com/sparkfun/SparkFun_RedBoard_Qwiic_Hardware"},
-    {"name": "📶 SparkFun Thing Plus ESP32 WROOM (LiPo, USB-C, I2C)", "url": "https://github.com/sparkfun/SparkFun_Thing_Plus_ESP32_WROOM_Hardware"},
-    {"name": "📡 Seeed Studio KiCad Library (Sensor & Breakout Schematics)", "url": "https://github.com/Seeed-Studio/Seeed_KiCad_Lib"},
-    {"name": "⚙️ Arduino AVR Reference Boards (ATmega, Power, Serial)", "url": "https://github.com/arduino/ArduinoCore-avr"},
-    {"name": "🍇 Raspberry Pi Official HAT Specifications & Reference", "url": "https://github.com/raspberrypi/hats"},
-    {"name": "🔧 Pine64 Pinecil (USB-PD Power Electronics & DC/DC)", "url": "https://github.com/pine64/Pinecil"},
-    {"name": "📡 Great Scott Gadgets HackRF One (RF & Analog Reference)", "url": "https://github.com/greatscottgadgets/hackrf"},
-    {"name": "🦘 PocketBeagle (High-Density System & Power Reference)", "url": "https://github.com/beagleboard/pocketbeagle"},
-    {"name": "🐍 SKiDL Circuits As Code (Offizielle SKiDL Subcircuit-Bibliothek)", "url": "https://github.com/devbisme/circuitsascode"},
-    {"name": "🏗️ Atopile Language & Hardware Library (Deklarative PCB-Module)", "url": "https://github.com/atopile/atopile"},
-    {"name": "🤖 KiCad Tools für LLM Agenten (Pure Python Parser, DRC & Router)", "url": "https://github.com/rjwalters/kicad-tools"},
-    {"name": "🐍 PyKiCad (Python-Bibliothek für KiCad PCB-Generierung)", "url": "https://github.com/dvc94ch/pykicad"},
-    {"name": "🔌 KiCad Python IPC API Bindings", "url": "https://github.com/atopile/kicad-python"},
-    {"name": "🔥 Procedural PCB Geometry Generator (KiCad Trace Generierung)", "url": "https://github.com/Trilys/PCB_Heater_KiCad"},
-    {"name": "⚡ OrthoRoute (GPU-Beschleunigter KiCad Autorouter)", "url": "https://github.com/bbenchoff/OrthoRoute"},
-    {"name": "🤖 KiBot Automated KiCad Preflights & DRC Verification", "url": "https://github.com/MicroType-Engineering/KiBot"}
+    {"name": "⚙️ SKiDL Core Engine (Python Circuit Synthesis & Pattern Reference)", "url": "https://github.com/xesscorp/skidl"},
+    {"name": "🤖 KiBot Main Framework (Official KiCad Automation & DSN Pipelines)", "url": "https://github.com/INTI-CMNB/KiBot"},
+    {"name": "🚦 Freerouting Core (Routing Engine & DSN/Rules Grammar)", "url": "https://github.com/freerouting/freerouting.git"}
 ]
 
 # --- PERSISTENT OSHW SOURCES MANAGEMENT ---
 def load_oshw_sources() -> list[dict]:
-    """Lädt die OSHW-Quellen aus der JSON-Datei. Bei Lesefehlern oder leerer Datei greift das DEFAULT-Fallback."""
     if os.path.exists(OSHW_SOURCES_FILE):
-        if not os.path.isfile(OSHW_SOURCES_FILE):
-            print(f"[ERROR] {OSHW_SOURCES_FILE} existiert, ist aber ein ORDNER anstelle einer Datei!")
-            return DEFAULT_OSHW_SOURCES
-
         try:
-            with open(OSHW_SOURCES_FILE, "r", encoding="utf-8-sig") as f:
-                content = f.read().strip()
-                if content:
-                    data = json.loads(content)
-                    if isinstance(data, list) and len(data) > 0:
-                        print(f"[SUCCESS] {len(data)} OSHW-Quellen erfolgreich geladen.")
-                        return data
-                    else:
-                        print(f"[WARN] {OSHW_SOURCES_FILE} enthält kein gültiges JSON-Array oder ist leer.")
+            with open(OSHW_SOURCES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list) and len(data) > 0:
+                    return data
         except Exception as e:
-            print(f"[ERROR] Fehler beim Lesen von {OSHW_SOURCES_FILE}: {e}")
-    else:
-        print(f"[WARN] Datei nicht gefunden unter: {OSHW_SOURCES_FILE}")
-
-    print("[INFO] Nutze DEFAULT_OSHW_SOURCES als Fallback.")
+            print(f"Fehler beim Laden von oshw_sources.json: {e}")
     return DEFAULT_OSHW_SOURCES
 
 def save_oshw_sources(sources_list: list[dict]):
     try:
-        os.makedirs(os.path.dirname(OSHW_SOURCES_FILE), exist_ok=True)
         with open(OSHW_SOURCES_FILE, "w", encoding="utf-8") as f:
             json.dump(sources_list, f, ensure_ascii=False, indent=2)
-        print(f"[SUCCESS] {len(sources_list)} Quellen in {OSHW_SOURCES_FILE} gespeichert.")
     except Exception as e:
-        print(f"[ERROR] Fehler beim Speichern der OSHW-Quellen: {e}")
+        print(f"Fehler beim Speichern der OSHW-Quellen: {e}")
 
 def get_oshw_dropdown_choices() -> list[tuple[str, str]]:
     sources = load_oshw_sources()
@@ -131,38 +96,33 @@ def handle_save_oshw_editor(raw_text: str):
         f"✅ {len(new_sources)} Quellen erfolgreich gespeichert und Menü aktualisiert!"
     )
 
-# --- LOGGING HELPER MIT LOKALER ZEITZEILE ---
-def log_msg(log_list, text: str):
-    timestamp = time.strftime("%H:%M:%S", time.localtime())
-    log_list.append(f"[{timestamp}] {text}")
-
-# --- HELPER: NON-INTERACTIVE GIT ENVIRONMENT ---
-def get_git_env():
-    """Erstellt eine Prozessumgebung, die Git-Prompts (Username/Passwort) strikt unterbindet."""
-    env = os.environ.copy()
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_ASKPASS"] = "echo"
-    return env
-
-# --- FILTER PRESETS MANAGEMENT (ERWEITERT UM BUILD-ARTEFAKTE UND EDA-RAW-FILTER) ---
+# --- REPO FILTERS PERSISTENT MANAGEMENT ---
 def get_default_filter_presets() -> dict:
     return {
         "default": [
-            "/fixtures/", "/tests/", "/test/", "/benchmarks/", "/.github/", "/.agents/",
-            "/build/", "/CMakeFiles/", "TargetDirectories.txt", "CMakeCache.txt",
-            ".kicad_pcb", ".pro", ".kicad_sch", ".net"
+            "/api/security/", "/api/dev/", "/analytics/", "/api/mcp/", "/util/gson/",
+            "Analytics", "RateLimit", "ApiKey", "ExceptionMapper", "MessageBody", 
+            "WebSocketConfigurator", "Mocked", "/build/", "/CMakeFiles/", "/.git/",
+            ".pro", ".kicad_pro", "CMakeCache.txt", ".ninja", ".txt", ".kicad_pcb"
         ],
         "freerouting": [
-            "/api/security/", "/api/dev/", "/analytics/", "/api/mcp/", "/util/gson/",
-            "Analytics", "RateLimit", "ApiKey", "ExceptionMapper", "MessageBody", "WebSocketConfigurator", "Mocked",
-            "/build/", "/CMakeFiles/", "TargetDirectories.txt", "CMakeCache.txt",
-            ".kicad_pcb", ".pro", ".kicad_sch", ".net"
+            "/gui/", "/swing/", "/display/", "/board/graphics/", "/view/", 
+            "/fixtures/", "/tests/", "/.github/", "README.md"
+        ],
+        "kibot": [
+            "/tests/", "/docs/", "/images/", "/.github/", "setup.py"
+        ],
+        "skidl": [
+            "/doc/", "/tests/", "/.github/", "setup.py"
         ],
         "adafruit": [
-            "/.github/", "/build/", "README.md", ".kicad_pcb", ".pro", ".kicad_sch", ".net"
+            "/.github/", "/build/", "README.md"
         ],
         "sparkfun": [
-            "/.github/", "/Firmware/", "/Software/", ".kicad_pcb", ".pro", ".kicad_sch", ".net"
+            "/.github/", "/Firmware/", "/Software/"
+        ],
+        "atopile": [
+            "/docs/", "/tests/", "/.github/", "/frontend/"
         ]
     }
 
@@ -175,23 +135,72 @@ def get_repo_filters_dict() -> dict:
             pass
     return get_default_filter_presets()
 
-def get_filter_preset_for_url(repo_url_or_path) -> str:
+def save_repo_filters_dict(filters_dict: dict):
+    try:
+        with open(REPO_FILTERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(filters_dict, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Fehler beim Speichern der repo_filters.json: {e}")
+
+def get_preset_choices() -> list[str]:
+    filters = get_repo_filters_dict()
+    return list(filters.keys())
+
+def get_rules_for_preset(preset_key: str) -> str:
+    filters = get_repo_filters_dict()
+    rules = filters.get(preset_key, filters.get("default", []))
+    return "\n".join(rules)
+
+def handle_preset_dropdown_change(preset_key: str):
+    return get_rules_for_preset(preset_key)
+
+def handle_save_preset(preset_key: str, rules_text: str):
+    filters = get_repo_filters_dict()
+    rules_list = [line.strip() for line in rules_text.splitlines() if line.strip()]
+    filters[preset_key] = rules_list
+    save_repo_filters_dict(filters)
+    return gr.update(choices=list(filters.keys()), value=preset_key), f"✅ Filter-Preset '{preset_key}' gespeichert!"
+
+def handle_add_new_preset(new_key: str, rules_text: str):
+    clean_key = new_key.strip().lower()
+    if not clean_key:
+        return gr.update(), "❌ Bitte einen gültigen Preset-Namen eingeben."
+    
+    filters = get_repo_filters_dict()
+    rules_list = [line.strip() for line in rules_text.splitlines() if line.strip()]
+    filters[clean_key] = rules_list
+    save_repo_filters_dict(filters)
+    
+    choices = list(filters.keys())
+    return gr.update(choices=choices, value=clean_key), f"✅ Neues Preset '{clean_key}' erstellt und ausgewählt!"
+
+def get_filter_preset_and_key_for_url(repo_url_or_path):
     if isinstance(repo_url_or_path, list):
         repo_url_or_path = repo_url_or_path[0] if repo_url_or_path else ""
 
     if not repo_url_or_path:
-        return "\n".join(get_default_filter_presets()["default"])
+        return "default", get_rules_for_preset("default")
         
     filters_dict = get_repo_filters_dict()
     url_lower = str(repo_url_or_path).lower()
     
     for key, patterns in filters_dict.items():
         if key != "default" and key in url_lower:
-            return "\n".join(patterns)
+            return key, "\n".join(patterns)
             
-    return "\n".join(filters_dict.get("default", []))
+    return "default", "\n".join(filters_dict.get("default", []))
 
-# --- SANITIZATION & CONFIG HELPERS ---
+# --- LOGGING HELPER MIT LOKALER ZEITZEILE ---
+def log_msg(log_list, text: str):
+    timestamp = time.strftime("%H:%M:%S", time.localtime())
+    log_list.append(f"[{timestamp}] {text}")
+
+def get_git_env():
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "echo"
+    return env
+
 def sanitize_url(raw_url: str) -> str:
     if not raw_url:
         return ""
@@ -349,7 +358,7 @@ def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int
 
     return sanitized_chunks
 
-# --- PROZESS WORKER MIT NON-INTERACTIVE GIT ENVIRONMENT ---
+# --- PROZESS WORKER ---
 def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size, custom_filters_raw=""):
     temp_work_dir = None
     try:
@@ -543,21 +552,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                     log_msg(log_list, f"[{g_idx}/{total_files}] ⏳ Starte Phase B Vektorisierung: {r_path}")
                     embed_start_time = time.time()
-                    raw_md_chunks = smart_markdown_chunking(p_md, max_chars=max_embed_chars, overlap_chars=overlap_val)
-
-                    # --- QUALITÄTSFILTER FÜR PCB-GENERATOR (MIN-LÄNGE & NOISE-FILTER) ---
-                    md_chunks = []
-                    for chk in raw_md_chunks:
-                        cleaned_chk = chk.strip()
-                        if len(cleaned_chk) < 60:
-                            continue
-                        if cleaned_chk.startswith("(") and cleaned_chk.endswith(")") and len(cleaned_chk.split()) <= 2:
-                            continue
-                        md_chunks.append(chk)
-
-                    if not md_chunks:
-                        log_msg(log_list, f"[{g_idx}/{total_files}] ⏭️ Keine qualifizierten Chunks nach Längen- & Müllfilterung: {r_path}")
-                        continue
+                    md_chunks = smart_markdown_chunking(p_md, max_chars=max_embed_chars, overlap_chars=overlap_val)
 
                     for chunk_idx, md_chunk in enumerate(md_chunks):
                         chunk_success = False
@@ -579,7 +574,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                                 point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{r_path}_chunk_{chunk_idx}"))
 
-                                # --- OPTIMIERTER PAYLOAD OHNE SPEICHERVERSCHWENDUNG (NUR 'content', KEINE REDUNDANTEN REPLIKATE) ---
                                 qdrant_worker.upsert(
                                     collection_name=target_collection,
                                     points=[
@@ -587,6 +581,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                                             id=point_id,
                                             vector=vector,
                                             payload={
+                                                "text": md_chunk[:current_chars],
+                                                "document": md_chunk[:current_chars],
                                                 "title": os.path.basename(r_path),
                                                 "filename": os.path.basename(r_path),
                                                 "file_path": r_path,
@@ -964,14 +960,34 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     info="Regelt die Chunk-Größe vor der Einreichung beim Vektormodell (4.000 Chars ideal für Vulkan)."
                 )
 
-            with gr.Accordion("🛡️ Dynamic Repository Filter-Rules (Live Edit)", open=False):
+            with gr.Accordion("🛡️ Dynamic Repository Filter-Rules (Live Edit & Presets)", open=False):
+                with gr.Row():
+                    filter_preset_dropdown = gr.Dropdown(
+                        choices=get_preset_choices(),
+                        value="default",
+                        label="Filter-Preset wählen (aus repo_filters.json)",
+                        interactive=True,
+                        scale=3
+                    )
+                    save_preset_btn = gr.Button("💾 Preset Speichern", variant="secondary", scale=2)
+
                 custom_filters_input = gr.Textbox(
                     label="Ausschlussmuster & Keywords (Ein Muster pro Zeile)",
                     placeholder="/api/security/\nRateLimit\n/fixtures/",
-                    lines=6,
-                    value=get_filter_preset_for_url("freerouting"),
+                    lines=8,
+                    value=get_rules_for_preset("default"),
                     info="Dateien, deren Pfad oder Name ein solches Muster enthält, werden im Ingest sofort übersprungen."
                 )
+
+                with gr.Row():
+                    new_preset_name_input = gr.Textbox(
+                        label="Neues Filter-Preset anlegen",
+                        placeholder="z.B. my_custom_repo",
+                        scale=3
+                    )
+                    add_preset_btn = gr.Button("➕ Preset Erstellen", variant="secondary", scale=2)
+
+                filter_status_msg = gr.Markdown("")
 
             with gr.Tabs():
                 with gr.Tab("🔌 OSHW Library Mining"):
@@ -1001,9 +1017,9 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                         choices=[
                             ("SKiDL Haupt-Repository (Offiziell)", "https://github.com/xesscorp/skidl"),
                             ("KiCad Python Action Plugins", "https://github.com/KiCad/kicad-python"),
-                            ("Freerouting Java / Config Core", "https://github.com/freerouting/freerouting")
+                            ("Freerouting Java / Config Core", "https://github.com/freerouting/freerouting.git")
                         ],
-                        value="https://github.com/freerouting/freerouting",
+                        value="https://github.com/freerouting/freerouting.git",
                         label="Ziel-Repository für EDA Mining",
                         allow_custom_value=True,
                         interactive=True
@@ -1052,6 +1068,23 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     category_dropdown.change(fn=update_category_preference, inputs=[category_dropdown])
     refresh_models_btn.click(fn=lambda: gr.Dropdown(choices=get_ollama_models()[0]), outputs=[model_dropdown])
 
+    # Filter Management Callbacks
+    filter_preset_dropdown.change(
+        fn=handle_preset_dropdown_change,
+        inputs=[filter_preset_dropdown],
+        outputs=[custom_filters_input]
+    )
+    save_preset_btn.click(
+        fn=handle_save_preset,
+        inputs=[filter_preset_dropdown, custom_filters_input],
+        outputs=[filter_preset_dropdown, filter_status_msg]
+    )
+    add_preset_btn.click(
+        fn=handle_add_new_preset,
+        inputs=[new_preset_name_input, custom_filters_input],
+        outputs=[filter_preset_dropdown, filter_status_msg]
+    )
+
     # Persistent OSHW Editor Callbacks
     save_oshw_sources_btn.click(
         fn=handle_save_oshw_editor,
@@ -1059,10 +1092,22 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
         outputs=[oshw_preset_dropdown, oshw_save_status]
     )
 
-    # Dynamic Filter Presets beim Wechsel von Repositories laden
-    mining_repo_input.change(fn=get_filter_preset_for_url, inputs=[mining_repo_input], outputs=[custom_filters_input])
-    oshw_preset_dropdown.change(fn=get_filter_preset_for_url, inputs=[oshw_preset_dropdown], outputs=[custom_filters_input])
-    github_input.change(fn=get_filter_preset_for_url, inputs=[github_input], outputs=[custom_filters_input])
+    # Dynamic Filter Presets + Key Sync beim Wechsel von Repositories
+    mining_repo_input.change(
+        fn=get_filter_preset_and_key_for_url,
+        inputs=[mining_repo_input],
+        outputs=[filter_preset_dropdown, custom_filters_input]
+    )
+    oshw_preset_dropdown.change(
+        fn=get_filter_preset_and_key_for_url,
+        inputs=[oshw_preset_dropdown],
+        outputs=[filter_preset_dropdown, custom_filters_input]
+    )
+    github_input.change(
+        fn=get_filter_preset_and_key_for_url,
+        inputs=[github_input],
+        outputs=[filter_preset_dropdown, custom_filters_input]
+    )
 
     scan_repo_btn.click(
         fn=scan_github_repository,
