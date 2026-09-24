@@ -11,9 +11,9 @@ class ProcessorRegistry:
 
   def __init__(self):
     self.processors = [
-        KiCadSymProcessor(),
-        OSHWCircuitProcessor(),
-        PcbEdaProcessor(),
+        KiCadSymProcessor(),  # -> kicad_sym_kb
+        OSHWCircuitProcessor(),  # -> skidl_patterns_kb
+        PcbEdaProcessor(),  # -> freerouting_rules_kb
         PythonProcessor(),
         JavaProcessor(),
         JavascriptProcessor(),
@@ -23,15 +23,21 @@ class ProcessorRegistry:
   def get_categories_dict(self) -> dict:
     categories = {}
     for p in self.processors:
+      # Ziel-Collection direkt aus dem Processor auslesen oder dynamisch zuweisen
+      if isinstance(p, KiCadSymProcessor):
+        coll_name = "kicad_sym_kb"
+      elif isinstance(p, OSHWCircuitProcessor):
+        coll_name = "skidl_patterns_kb"
+      elif isinstance(p, PcbEdaProcessor):
+        coll_name = "freerouting_rules_kb"
+      else:
+        coll_name = "general_knowledge_base"
+
       if p.category_key not in categories:
-        coll_name = (
-            "pcb_knowledge_base"
-            if "PCB" in p.category_key
-            else "general_knowledge_base"
-        )
         categories[p.category_key] = {
             "collection": coll_name,
-            "description": f"Collection for {p.category_key}",
+            "description": f"Dedicated collection {coll_name} for"
+            f" {p.category_key}",
         }
     return categories
 
