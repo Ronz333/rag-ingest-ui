@@ -1,99 +1,115 @@
-import ast
+import os
 import re
-import sys
-import io
+from .base_processor import BaseProcessor
 
 
-class QualityControl:
+class OSHWCircuitProcessor(BaseProcessor):
     """
-    Gatekeeper-Modul: Prüft synthetisierte Markdown-Chunks und führt 
-    SKiDL-Code zur Laufzeit aus, um Ausführungsfehler und Pin-Exceptions zu fangen.
+    Processor für OSHW-Schaltpläne (.sch, .kicad_sch, .pdf).
+    Generiert SKiDL-Subcircuits mit einem 3-stufigen Selbstkorrektur-Loop bei Laufzeitfehlern.
     """
 
-    @staticmethod
-    def validate(category_tag: str, processed_md: str, rel_path: str) -> tuple[bool, str]:
-        if not processed_md or not processed_md.strip():
-            return False, "Empty Chunk (Inhalt ist leer)"
+    def __init__(self):
+        super().__init__()
+        self.category_key = "⚡ PCB & Hardware Design"
+        self.supported_extensions = [".sch", ".kicad_sch", ".pdf"]
 
-        if len(processed_md) < 50:
-            return False, "Inhalt zu kurz (< 50 Zeichen)"
+    def can_handle(self, file_path: str) -> bool:
+        ext = os.path.splitext(file_path)[1].lower()
+        return ext in self.supported_extensions
 
-        if category_tag == "SKIDL_SUBCIRCUIT":
-            return QualityControl.validate_skidl_runtime(processed_md)
+    def parse(
+        self,
+        file_path: str,
+        raw_content: str,
+        model_name: str,
+        ollama_client,
+        llm_options: dict,
+        max_embed_chars: int,
+        custom_filters: list = None,
+    ) -> tuple[str, str]:
+        # Lazy Import zur Vermeidung von zirkulären Import-Abhängigkeiten
+        from quality_control import QualityControl
 
-        elif category_tag == "DATASHEET_PINOUT":
-            return QualityControl._validate_pinout(processed_md)
+        ext = os.path.splitext(file_path)[1].lower()
+        filename = os.path.basename(file_path)
 
-        elif category_tag == "DESIGN_RULE":
-            return QualityControl._validate_design_rules(processed_md)
+        # Blacklist Filter-Check
+        if custom_filters:
+            fp_clean = file_path.replace("\\", "/")
+            for pattern in custom_filters:
+                if pattern and pattern in fp_clean:
+                    return "SKIDL_SUBCIRCUIT", "SKIP"
 
-        return True, "OK"
+        if ext in [".kicad_pcb", ".pro", ".kicad_pro", ".txt", ".ninja", ".o", ".obj", ".elf", ".log", ".cmakecache.txt"]:
+            return "SKIDL_SUBCIRCUIT", "SKIP"
 
-    @staticmethod
-    def validate_skidl_runtime(md_text: str) -> tuple[bool, str]:
-        # 1. Codeblock extrahieren
-        code_blocks = re.findall(r"```python(.*?)```", md_text, re.DOTALL)
-        if not code_blocks:
-            return False, "Kein ```python Codeblock im SKiDL-Markdown gefunden."
+        base_system_prompt = (
+            "Du bist ein Senior PCB Electronics Architect und SKiDL-Code-Synthesizer.\n"
+            "Deine Aufgabe ist es, aus dem Schaltplan/BOM/Dokument ein wiederverwendbares, hochpräzises SKiDL Entwurfsmuster (Subcircuit) zu extrahieren.\n\n"
+            "WICHTIGE ANFORDERUNGEN FÜR FREEROUTING & KICAD WORKFLOW:\n"
+            "1. ZWINGENDE FOOTPRINT-ZUWEISUNG:\n"
+            "   Jedes Bauteil MUSS ein explizites 'footprint=' Attribut enthalten (z. B. footprint='Package_TO_SOT_SMD:SOT-23-5' oder part.footprint = 'Resistor_SMD:R_0603_1608Metric').\n"
+            "2. SCHALTUNGSKAPSELUNG:\n"
+            "   Verwende stets den @subcircuit Dekorator für modulare Funktionsblöcke.\n"
+            "3. DEVICE-BIBLIOTHEKEN:\n"
+            "   Nutze für Passivbauteile ausschließlich 'Device' (Part('Device', 'R', ...), Part('Device', 'C', ...), Part('Device', 'D_TVS', ...)).\n\n"
+            "FORMAT-VORGABE:\n"
+            "## 1. Entwurfsmuster / Teilschaltung\n"
+            "- **Name & Funktion:** [Name]\n\n"
+            "## 2. Vollständiger SKiDL Python-Block\n"
+            "```python\n"
+            "from skidl import *\n\n"
+            "@subcircuit\n"
+            "def my_subcircuit(v_in, v_out, gnd):\n"
+            "    # Code\n"
+            "```\n\n"
+            "## 3. KiCad Footprint-Zuordnungen\n"
+            "| Bauteil | Ref / Typ | KiCad Footprint Library & Name | Pinning |\n"
+        )
 
-        python_code = code_blocks[0].strip()
+        user_message = f"Schaltplan/Dokument: {filename}\nPfad: {file_path}\n\nInhalt:\n{raw_content[:max_embed_chars]}"
 
-        # 2. Statische AST-Syntaxprüfung
-        try:
-            ast.parse(python_code)
-        except SyntaxError as e:
-            return False, f"Python SyntaxError in Zeile {e.lineno}: {e.msg}"
+        max_attempts = 3
+        last_error = ""
 
-        # 3. Zwingende Footprint-Zuweisung prüfen (Freerouting / DSN Anforderung)
-        has_footprint = "footprint=" in python_code or ".footprint =" in python_code or ".footprint=" in python_code
-        if not has_footprint:
-            return False, "SKiDL-Code enthält keine expliziten Footprint-Zuweisungen (footprint='...')."
+        # --- SELBSTKORREKTUR-SCHLEIFE (UP TO 3 ATTEMPTS) ---
+        for attempt in range(1, max_attempts + 1):
+            system_prompt = base_system_prompt
 
-        # 4. Der Königsweg: Echte SKiDL Laufzeit-Ausführung im isolierten Scope
-        exec_scope = {}
-        wrapper_code = f"""
-from skidl import *
-default_circuit.reset() # SKiDL Zustand zurücksetzen
+            if last_error:
+                system_prompt += (
+                    f"\n\n⚠️ KORREKTUR-AUFFORDERUNG (VERSUCH {attempt}/{max_attempts}):\n"
+                    f"Dein vorheriger SKiDL-Code-Entwurf schlug bei der SKiDL-Laufzeitprüfung fehl mit folgendem Fehler:\n"
+                    f"-> {last_error}\n\n"
+                    f"Bitte korrigiere den SKiDL-Code und stelle sicher, dass alle Bibliotheken und Pins korrekt deklariert sind!"
+                )
 
-{python_code}
-"""
-        # stdout/stderr abfangen, um Konsole während Ingest sauber zu halten
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        sys.stdout = io.StringIO()
-        sys.stderr = io.StringIO()
+            try:
+                response = ollama_client.chat(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    options=llm_options,
+                )
+                generated_md = response["message"]["content"].strip()
 
-        try:
-            exec(wrapper_code, exec_scope)
-        except Exception as ex:
-            error_type = type(ex).__name__
-            error_msg = str(ex)
-            return False, f"SKiDL Laufzeit-Fehler ({error_type}): {error_msg}"
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
+                # Laufzeit-Validierung des generierten Chunks
+                is_valid, err_msg = QualityControl.validate_skidl_runtime(generated_md)
 
-        return True, "OK"
+                if is_valid:
+                    return "SKIDL_SUBCIRCUIT", generated_md
 
-    @staticmethod
-    def _validate_pinout(md_text: str) -> tuple[bool, str]:
-        if "| Pin Number |" not in md_text and "| Pin |" not in md_text:
-            return False, "Keine valide Markdown-Pin-Tabelle gefunden."
+                last_error = err_msg
 
-        table_lines = [
-            line for line in md_text.splitlines() 
-            if line.startswith("|") and "---" not in line
-        ]
-        if len(table_lines) < 2:
-            return False, "Pin-Tabelle enthält keine Datenzeilen."
+            except Exception as e:
+                last_error = str(e)
 
-        return True, "OK"
+        # Wenn auch nach 3 Versuchen kein ausführbarer SKiDL-Code entstand: Verwerfen
+        return "SKIDL_SUBCIRCUIT", "SKIP"
 
-    @staticmethod
-    def _validate_design_rules(md_text: str) -> tuple[bool, str]:
-        forbidden_terms = ["(path ", "(wire ", "(placement "]
-        for term in forbidden_terms:
-            if term in md_text:
-                return False, f"Verbotene Trace-Geometrie '{term}' im DRC/DSN-Chunk enthalten."
 
-        return True, "OK"
+# Alias bereitstellen, damit alle Import-Schreibweisen abgedeckt sind
+OshwCircuitProcessor = OSHWCircuitProcessor
