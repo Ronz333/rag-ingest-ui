@@ -18,9 +18,16 @@
     ".pro",
     ".kicad_pro",
     "CMakeCache.txt",
+    "TargetDirectories.txt",
     ".ninja",
     ".txt",
-    ".kicad_pcb"
+    ".kicad_pcb",
+    ".o",
+    ".obj",
+    ".elf",
+    ".log",
+    ".bin",
+    ".hex"
   ],
   "freerouting": [
     "/gui/",
