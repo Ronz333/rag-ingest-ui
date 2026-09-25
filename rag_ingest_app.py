@@ -14,8 +14,9 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from pypdf import PdfReader
 
-# Dynamisches Plugin-System importieren
+# Dynamisches Plugin-System & Quality Control Modul importieren
 from processors.processor_registry import registry
+from quality_control import QualityControl
 
 # --- KONFIGURATION & KONSTANTEN ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -300,7 +301,7 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
             if ext in STRICT_EXCLUDE_EXTS or f_lower in STRICT_EXCLUDE_NAMES:
                 continue
 
-            # JSON Sonderprüfung: Nur verarbeiten, wenn es sich um KiCad/SKiDL/Hardware Configs handelt
+            # JSON Sonderprüfung: Nur verarbeiten, wenn es sich um Hardware/KiCad Configs handelt
             if ext == ".json":
                 if not any(k in f_lower for k in ["skidl", "kicad", "component", "oshw", "symbol", "footprint", "sources"]):
                     continue
@@ -510,6 +511,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             parse_start_time = time.time()
 
             try:
+                # Analyse & Vorverarbeitung durch Processor (inkl. OSHW-Korrektur-Schleife)
                 category_tag, processed_md = registry.dispatch_parse(
                     rel_path, raw_text, active_model, ollama_worker, llm_options, max_embed_chars, 
                     selected_category=category_key, custom_filters=active_custom_filters
@@ -517,6 +519,12 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                 if processed_md == "SKIP" or not processed_md:
                     log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Übersprungen (Gefiltert/Build-Doc): {rel_path}")
+                    continue
+
+                # 🛡️ STRIKTE QUALITÄTSKONTROLLE (QC) VOR DEM EMBEDDING
+                is_valid, qc_reason = QualityControl.validate(category_tag, processed_md, rel_path)
+                if not is_valid:
+                    log_msg(log_list, f"[{global_idx}/{total_files}] ⚠️ QC FAILED ({qc_reason}): {rel_path} -> Verworfen!")
                     continue
 
                 parse_duration = time.time() - parse_start_time
@@ -533,7 +541,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 new_buffer_count = len(batch_prepared_items)
                 log_msg(
                     log_list, 
-                    f"[{global_idx}/{total_files}] ✅ Phase A Analyse abgeschlossen in {parse_duration:.2f}s "
+                    f"[{global_idx}/{total_files}] ✅ Phase A Analyse & QC erfolgreich in {parse_duration:.2f}s "
                     f"[Batch-Puffer: {new_buffer_count}/{batch_size}] | **#{category_tag}**: {rel_path}"
                 )
 
@@ -587,7 +595,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                                 point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{r_path}_chunk_{chunk_idx}"))
 
-                                # Ergänzter Payload mit den geforderten spezifischen Tags
                                 qdrant_worker.upsert(
                                     collection_name=target_collection,
                                     points=[
@@ -601,7 +608,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                                                 "filename": os.path.basename(r_path),
                                                 "file_path": r_path,
                                                 "content_hash": c_hash,
-                                                "category_tag": c_tag,  # SKIDL_SUBCIRCUIT, FOOTPRINT_MAPPING, DESIGN_RULE, DATASHEET_PINOUT
+                                                "category_tag": c_tag,
                                                 "chunk_index": chunk_idx,
                                                 "total_chunks": len(md_chunks),
                                                 "content": md_chunk[:current_chars]
