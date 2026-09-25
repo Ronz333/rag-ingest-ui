@@ -30,6 +30,10 @@ OSHW_SOURCES_FILE = os.path.join(BASE_DIR, "oshw_sources.json")
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
+# Strikte Ausschlusslisten für den File-Collector
+STRICT_EXCLUDE_EXTS = {".o", ".obj", ".elf", ".log", ".bin", ".hex", ".ninja", ".cmakecache.txt"}
+STRICT_EXCLUDE_NAMES = {"cmakecache.txt", "targetdirectories.txt", "package-lock.json"}
+
 # --- DEFAULT OSHW BEZUGSQUELLEN ---
 DEFAULT_OSHW_SOURCES = [
     {"name": "🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet, Power)", "url": "https://github.com/OLIMEX/ESP32-GATEWAY"},
@@ -103,7 +107,8 @@ def get_default_filter_presets() -> dict:
             "/api/security/", "/api/dev/", "/analytics/", "/api/mcp/", "/util/gson/",
             "Analytics", "RateLimit", "ApiKey", "ExceptionMapper", "MessageBody", 
             "WebSocketConfigurator", "Mocked", "/build/", "/CMakeFiles/", "/.git/",
-            ".pro", ".kicad_pro", "CMakeCache.txt", ".ninja", ".txt", ".kicad_pcb"
+            ".pro", ".kicad_pro", "CMakeCache.txt", "TargetDirectories.txt", ".ninja", 
+            ".txt", ".kicad_pcb", ".o", ".obj", ".elf", ".log"
         ],
         "freerouting": [
             "/gui/", "/swing/", "/display/", "/board/graphics/", "/view/", 
@@ -114,15 +119,6 @@ def get_default_filter_presets() -> dict:
         ],
         "skidl": [
             "/doc/", "/tests/", "/.github/", "setup.py"
-        ],
-        "adafruit": [
-            "/.github/", "/build/", "README.md"
-        ],
-        "sparkfun": [
-            "/.github/", "/Firmware/", "/Software/"
-        ],
-        "atopile": [
-            "/docs/", "/tests/", "/.github/", "/frontend/"
         ]
     }
 
@@ -292,10 +288,23 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
         return collected
 
     for root, _, files in os.walk(base_search_path):
-        if ".git" in root:
+        root_lower = root.lower().replace("\\", "/")
+        if "/.git" in root_lower or "/build" in root_lower or "/cmakefiles" in root_lower:
             continue
+            
         for f in files:
+            f_lower = f.lower()
             ext = os.path.splitext(f)[1].lower()
+            
+            # Strikter Ausschluss von Binär- und Build-Dateien
+            if ext in STRICT_EXCLUDE_EXTS or f_lower in STRICT_EXCLUDE_NAMES:
+                continue
+
+            # JSON Sonderprüfung: Nur verarbeiten, wenn es sich um KiCad/SKiDL/Hardware Configs handelt
+            if ext == ".json":
+                if not any(k in f_lower for k in ["skidl", "kicad", "component", "oshw", "symbol", "footprint", "sources"]):
+                    continue
+
             if ext in TEXT_EXTENSIONS:
                 full_path = os.path.join(root, f)
                 rel_path = os.path.relpath(full_path, directory)
@@ -417,10 +426,14 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 repo_base_name = os.path.basename(clean_repo_url.rstrip("/"))
                 file_count = 0
                 for root, _, filenames in os.walk(mined_repo_dir):
-                    if ".git" in root:
+                    root_lower = root.lower().replace("\\", "/")
+                    if "/.git" in root_lower or "/build" in root_lower or "/cmakefiles" in root_lower:
                         continue
                     for f in filenames:
+                        f_lower = f.lower()
                         ext = os.path.splitext(f)[1].lower()
+                        if ext in STRICT_EXCLUDE_EXTS or f_lower in STRICT_EXCLUDE_NAMES:
+                            continue
                         if ext in TEXT_EXTENSIONS:
                             full_p = os.path.join(root, f)
                             rel_p = os.path.relpath(full_p, mined_repo_dir)
@@ -443,7 +456,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                             zip_ref.extractall(zip_extract_dir)
                         extracted = collect_files_from_dir(zip_extract_dir)
                         files_to_process.extend(extracted)
-                    elif ext in TEXT_EXTENSIONS:
+                    elif ext in TEXT_EXTENSIONS and ext not in STRICT_EXCLUDE_EXTS:
                         files_to_process.append((fname, fpath))
 
             if scanned_repo_path and os.path.exists(scanned_repo_path) and selected_folders:
@@ -574,6 +587,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                                 point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{r_path}_chunk_{chunk_idx}"))
 
+                                # Ergänzter Payload mit den geforderten spezifischen Tags
                                 qdrant_worker.upsert(
                                     collection_name=target_collection,
                                     points=[
@@ -587,7 +601,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                                                 "filename": os.path.basename(r_path),
                                                 "file_path": r_path,
                                                 "content_hash": c_hash,
-                                                "category_tag": c_tag,
+                                                "category_tag": c_tag,  # SKIDL_SUBCIRCUIT, FOOTPRINT_MAPPING, DESIGN_RULE, DATASHEET_PINOUT
                                                 "chunk_index": chunk_idx,
                                                 "total_chunks": len(md_chunks),
                                                 "content": md_chunk[:current_chars]
@@ -799,11 +813,15 @@ def scan_github_repository(github_url, old_scanned_repo):
     ext_counts = {}
 
     for root, _, files in os.walk(repo_dir):
-        if ".git" in root:
+        root_lower = root.lower().replace("\\", "/")
+        if "/.git" in root_lower or "/build" in root_lower or "/cmakefiles" in root_lower:
             continue
         has_valid = False
         for f in files:
+            f_lower = f.lower()
             ext = os.path.splitext(f)[1].lower()
+            if ext in STRICT_EXCLUDE_EXTS or f_lower in STRICT_EXCLUDE_NAMES:
+                continue
             if ext in TEXT_EXTENSIONS:
                 has_valid = True
                 ext_counts[ext] = ext_counts.get(ext, 0) + 1
@@ -1092,7 +1110,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
         outputs=[oshw_preset_dropdown, oshw_save_status]
     )
 
-    # Dynamic Filter Presets + Key Sync beim Wechsel von Repositories
+    # Dynamic Filter Presets + Key Sync
     mining_repo_input.change(
         fn=get_filter_preset_and_key_for_url,
         inputs=[mining_repo_input],
