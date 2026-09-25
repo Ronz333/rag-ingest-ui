@@ -1,88 +1,99 @@
-import os
+import ast
 import re
-from .base_processor import BaseProcessor
+import sys
+import io
 
 
-class OSHWCircuitProcessor(BaseProcessor):
+class QualityControl:
     """
-    Processor für OSHW-Schaltpläne (.sch, .kicad_sch, .pdf).
-    Generiert strukturierte SKiDL-Teilschaltungen mit ZWINGENDEN KiCad Footprint-Zuordnungen.
-    Vergibt den Payload-Tag 'SKIDL_SUBCIRCUIT'.
+    Gatekeeper-Modul: Prüft synthetisierte Markdown-Chunks und führt 
+    SKiDL-Code zur Laufzeit aus, um Ausführungsfehler und Pin-Exceptions zu fangen.
     """
 
-    def __init__(self):
-        super().__init__()
-        self.category_key = "⚡ PCB & Hardware Design"
-        self.supported_extensions = [".sch", ".kicad_sch", ".pdf"]
+    @staticmethod
+    def validate(category_tag: str, processed_md: str, rel_path: str) -> tuple[bool, str]:
+        if not processed_md or not processed_md.strip():
+            return False, "Empty Chunk (Inhalt ist leer)"
 
-    def can_handle(self, file_path: str) -> bool:
-        ext = os.path.splitext(file_path)[1].lower()
-        return ext in self.supported_extensions
+        if len(processed_md) < 50:
+            return False, "Inhalt zu kurz (< 50 Zeichen)"
 
-    def parse(
-        self,
-        file_path: str,
-        raw_content: str,
-        model_name: str,
-        ollama_client,
-        llm_options: dict,
-        max_embed_chars: int,
-        custom_filters: list = None,
-    ) -> tuple[str, str]:
-        ext = os.path.splitext(file_path)[1].lower()
-        filename = os.path.basename(file_path)
+        if category_tag == "SKIDL_SUBCIRCUIT":
+            return QualityControl.validate_skidl_runtime(processed_md)
 
-        # Blacklist Filter-Check
-        if custom_filters:
-            fp_clean = file_path.replace("\\", "/")
-            for pattern in custom_filters:
-                if pattern and pattern in fp_clean:
-                    return "SKIDL_SUBCIRCUIT", "SKIP"
+        elif category_tag == "DATASHEET_PINOUT":
+            return QualityControl._validate_pinout(processed_md)
 
-        # Strikte Dateiendungs-Ausschlüsse
-        if ext in [".kicad_pcb", ".pro", ".kicad_pro", ".txt", ".ninja", ".o", ".obj", ".elf", ".log", ".cmakecache.txt"]:
-            return "SKIDL_SUBCIRCUIT", "SKIP"
+        elif category_tag == "DESIGN_RULE":
+            return QualityControl._validate_design_rules(processed_md)
 
-        system_prompt = (
-            "Du bist ein Senior PCB Electronics Architect und SKiDL-Code-Synthesizer.\n"
-            "Deine Aufgabe ist es, aus dem Schaltplan/BOM/Dokument ein wiederverwendbares, hochpräzises SKiDL Entwurfsmuster (Subcircuit) zu extrahieren.\n\n"
-            "WICHTIGE ANFORDERUNGEN FÜR FREEROUTING & KICAD WORKFLOW:\n"
-            "1. ZWINGENDE FOOTPRINT-ZUWEISUNG:\n"
-            "   Jedes Bauteil MUSS ein explizites 'footprint=' Attribut enthalten (z. B. footprint='Package_TO_SOT_SMD:SOT-23-5' oder part.footprint = 'Resistor_SMD:R_0603_1608Metric').\n"
-            "   SKiDL benötigt diese Angaben zwingend, um ein valides Netzlisten- und Specctra .dsn-Format für Freerouting zu generieren!\n"
-            "2. SCHALTUNGSKAPSELUNG:\n"
-            "   Verwende stets den @subcircuit Dekorator für modulare Funktionsblöcke (z.B. Buck Converter, LDO, Ethernet PHY, ESD Protection).\n"
-            "3. DEVICE-BIBLIOTHEKEN:\n"
-            "   Nutze für Passivbauteile die KiCad Symbol-Bibliothek 'Device' (Part('Device', 'R', ...), Part('Device', 'C', ...), Part('Device', 'D_TVS', ...)).\n\n"
-            "GIB DEINE ANTWORT AUSSCHLIESSLICH IM FOLGENDEN STRUKTURIERTEN MARKDOWN-FORMAT AUS:\n\n"
-            "## 1. Entwurfsmuster / Teilschaltung\n"
-            "- **Name & Funktion:** [z. B. Buck Converter 5V zu 3.3V]\n"
-            "- **Kurzbeschreibung:** [Funktionsweise & Spezifikationen]\n\n"
-            "## 2. Vollständiger SKiDL Python-Block\n"
-            "```python\n"
-            "from skidl import *\n\n"
-            "@subcircuit\n"
-            "def my_subcircuit(v_in, v_out, gnd):\n"
-            "    # SKiDL Code mit expliziten Footprints\n"
-            "```\n\n"
-            "## 3. KiCad Footprint-Zuordnungen\n"
-            "| Bauteil | Ref / Typ | KiCad Footprint Library & Name | Pinning / Bemerkung |\n"
-            "|---|---|---|---|\n"
-        )
+        return True, "OK"
 
-        user_message = f"Schaltplan/Dokument: {filename}\nPfad: {file_path}\n\nInhalt:\n{raw_content[:max_embed_chars]}"
+    @staticmethod
+    def validate_skidl_runtime(md_text: str) -> tuple[bool, str]:
+        # 1. Codeblock extrahieren
+        code_blocks = re.findall(r"```python(.*?)```", md_text, re.DOTALL)
+        if not code_blocks:
+            return False, "Kein ```python Codeblock im SKiDL-Markdown gefunden."
+
+        python_code = code_blocks[0].strip()
+
+        # 2. Statische AST-Syntaxprüfung
+        try:
+            ast.parse(python_code)
+        except SyntaxError as e:
+            return False, f"Python SyntaxError in Zeile {e.lineno}: {e.msg}"
+
+        # 3. Zwingende Footprint-Zuweisung prüfen (Freerouting / DSN Anforderung)
+        has_footprint = "footprint=" in python_code or ".footprint =" in python_code or ".footprint=" in python_code
+        if not has_footprint:
+            return False, "SKiDL-Code enthält keine expliziten Footprint-Zuweisungen (footprint='...')."
+
+        # 4. Der Königsweg: Echte SKiDL Laufzeit-Ausführung im isolierten Scope
+        exec_scope = {}
+        wrapper_code = f"""
+from skidl import *
+default_circuit.reset() # SKiDL Zustand zurücksetzen
+
+{python_code}
+"""
+        # stdout/stderr abfangen, um Konsole während Ingest sauber zu halten
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
 
         try:
-            response = ollama_client.chat(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                options=llm_options,
-            )
-            return "SKIDL_SUBCIRCUIT", response["message"]["content"].strip()
-        except Exception as e:
-            raise RuntimeError(
-                f"Fehler in OSHWCircuitProcessor ({file_path}): {str(e)}"
-            )
+            exec(wrapper_code, exec_scope)
+        except Exception as ex:
+            error_type = type(ex).__name__
+            error_msg = str(ex)
+            return False, f"SKiDL Laufzeit-Fehler ({error_type}): {error_msg}"
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+        return True, "OK"
+
+    @staticmethod
+    def _validate_pinout(md_text: str) -> tuple[bool, str]:
+        if "| Pin Number |" not in md_text and "| Pin |" not in md_text:
+            return False, "Keine valide Markdown-Pin-Tabelle gefunden."
+
+        table_lines = [
+            line for line in md_text.splitlines() 
+            if line.startswith("|") and "---" not in line
+        ]
+        if len(table_lines) < 2:
+            return False, "Pin-Tabelle enthält keine Datenzeilen."
+
+        return True, "OK"
+
+    @staticmethod
+    def _validate_design_rules(md_text: str) -> tuple[bool, str]:
+        forbidden_terms = ["(path ", "(wire ", "(placement "]
+        for term in forbidden_terms:
+            if term in md_text:
+                return False, f"Verbotene Trace-Geometrie '{term}' im DRC/DSN-Chunk enthalten."
+
+        return True, "OK"
