@@ -31,9 +31,9 @@ OSHW_SOURCES_FILE = os.path.join(BASE_DIR, "oshw_sources.json")
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# Strikte Ausschlusslisten für den File-Collector
+# Strikte Ausschlusslisten für den File-Collector (Build-Müll, Artefakte)
 STRICT_EXCLUDE_EXTS = {".o", ".obj", ".elf", ".log", ".bin", ".hex", ".ninja", ".cmakecache.txt"}
-STRICT_EXCLUDE_NAMES = {"cmakecache.txt", "targetdirectories.txt", "package-lock.json"}
+STRICT_EXCLUDE_NAMES = {"cmakecache.txt", "targetdirectories.txt", "package-lock.json", "changelog.md", "license", "licence"}
 
 # --- DEFAULT OSHW BEZUGSQUELLEN ---
 DEFAULT_OSHW_SOURCES = [
@@ -187,10 +187,16 @@ def get_filter_preset_and_key_for_url(repo_url_or_path):
             
     return "default", "\n".join(filters_dict.get("default", []))
 
-# --- LOGGING HELPER MIT LOKALER ZEITZEILE ---
+# --- STRUKTURIERTES LOGGING HELPER ---
 def log_msg(log_list, text: str):
     timestamp = time.strftime("%H:%M:%S", time.localtime())
     log_list.append(f"[{timestamp}] {text}")
+
+def log_banner(log_list, title: str, symbol: str = "📌"):
+    border = "═" * 68
+    log_msg(log_list, f"\n╔{border}╗")
+    log_msg(log_list, f"║  {symbol} {title.upper().ljust(63)} ║")
+    log_msg(log_list, f"╚{border}╝")
 
 def get_git_env():
     env = os.environ.copy()
@@ -325,28 +331,36 @@ def calculate_dynamic_num_ctx(text_len: int, max_limit: int = 32768) -> int:
         num_ctx *= 2
     return min(num_ctx, max_limit)
 
+# --- CODE-AWARE MARKDOWN CHUNKING ---
 def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int = 400) -> list[str]:
+    """Code-Aware Chunking: Trennt Markdown NIEMALS innerhalb eines ```python oder ```lisp Code-Blocks."""
     if len(text) <= max_chars:
         return [text]
 
-    blocks = re.split(r'(\n(?=#{1,4}\s)|\n(?=---\n)|\n\n+)', text)
+    # Aufteilung primär an Modul- und Funktionsebenen
+    raw_sections = re.split(r'(\n(?=#{1,4}\s)|\n(?=@subcircuit)|(?<=\n```\n)\n)', text)
     chunks = []
     current_chunk = ""
 
-    for b in blocks:
-        if not b:
+    for section in raw_sections:
+        if not section:
             continue
-        if len(current_chunk) + len(b) <= max_chars:
-            current_chunk += b
+        
+        if len(current_chunk) + len(section) <= max_chars:
+            current_chunk += section
         else:
             if current_chunk.strip():
                 chunks.append(current_chunk.strip())
             
-            if len(b) > max_chars:
-                lines = b.splitlines(keepends=True)
+            if len(section) > max_chars and "```" in section:
+                lines = section.splitlines(keepends=True)
                 sub_chunk = ""
+                in_code_block = False
                 for line in lines:
-                    if len(sub_chunk) + len(line) <= max_chars:
+                    if "```" in line:
+                        in_code_block = not in_code_block
+                    
+                    if len(sub_chunk) + len(line) <= max_chars or in_code_block:
                         sub_chunk += line
                     else:
                         if sub_chunk.strip():
@@ -354,15 +368,15 @@ def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int
                         sub_chunk = line
                 current_chunk = sub_chunk
             else:
-                current_chunk = b
+                current_chunk = section
 
     if current_chunk.strip():
         chunks.append(current_chunk.strip())
 
+    # Klammerung von unvollständigen Codeblock-Markern absichern
     sanitized_chunks = []
     for chunk in chunks:
-        backtick_matches = re.findall(r'```', chunk)
-        if len(backtick_matches) % 2 != 0:
+        if chunk.count("```") % 2 != 0:
             chunk += "\n```"
         sanitized_chunks.append(chunk)
 
@@ -398,6 +412,14 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
         git_env = get_git_env()
         files_to_process = []
+
+        log_banner(log_list, "RAG INGESTION JOB GESTARTET", "🚀")
+        log_msg(log_list, f"🎯 Ziel-Collection : {target_collection}")
+        log_msg(log_list, f"🤖 LLM Modell      : {active_model}")
+        log_msg(log_list, f"📐 Embed-Modell    : {EMBED_MODEL}")
+        log_msg(log_list, f"📦 Batch-Größe     : {batch_size} Dateien | Max Tokens: {num_ctx}")
+        log_msg(log_list, f"🛡️ Aktive Filter   : {len(active_custom_filters)} Regel(n) geladen")
+        log_msg(log_list, "─" * 70)
 
         if mode in ["repo_mining", "oshw_mining"]:
             repo_urls = mining_repo_url if isinstance(mining_repo_url, list) else [mining_repo_url]
@@ -483,11 +505,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             return
 
         total_files = len(files_to_process)
-        log_msg(log_list, f"📊 Gesamt: {total_files} Datei(en) bereit zur Prüfung.")
-        log_msg(log_list, f"⚙️ Konfiguration: Target Batch Size = {batch_size} verarbeitete Dateien | Max Embed Chars = {max_embed_chars}")
-        log_msg(log_list, f"🛡️ Aktive Webpanel-Filter: {len(active_custom_filters)} Regel(n) geladen.")
-        
         existing_hashes = get_indexed_hashes_set(qdrant_worker, target_collection)
+        log_msg(log_list, f"📊 Gesamt zu verarbeiten: {total_files} Datei(en)")
         log_msg(log_list, f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
 
         batch_prepared_items = []
@@ -496,7 +515,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
         for global_idx, (rel_path, file_path) in enumerate(files_to_process, 1):
             current_buffer_count = len(batch_prepared_items)
-            status_dict["header"] = f"🟢 Status: LÄUFT (Datei {global_idx}/{total_files} | Im Batch-Puffer: {current_buffer_count}/{batch_size})"
+            status_dict["header"] = f"🟢 Status: LÄUFT ({global_idx}/{total_files} | Puffer: {current_buffer_count}/{batch_size})"
 
             raw_text = extract_text_from_file(file_path)
             if not raw_text.strip():
@@ -504,27 +523,28 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
             content_hash = calculate_sha256(raw_text)
             if (rel_path, content_hash) in existing_hashes:
-                log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Unverändert übersprungen: {rel_path}")
+                log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Übersprungen (Unverändert): {rel_path}")
                 continue
 
-            log_msg(log_list, f"[{global_idx}/{total_files}] ⏳ Starte Phase A Analyse [Batch-Puffer: {current_buffer_count}/{batch_size}]: {rel_path}")
             parse_start_time = time.time()
 
             try:
-                # Analyse & Vorverarbeitung durch Processor (inkl. OSHW-Korrektur-Schleife)
+                # Phase A: Analyse & Vorverarbeitung durch Processor
                 category_tag, processed_md = registry.dispatch_parse(
                     rel_path, raw_text, active_model, ollama_worker, llm_options, max_embed_chars, 
                     selected_category=category_key, custom_filters=active_custom_filters
                 )
 
                 if processed_md == "SKIP" or not processed_md:
-                    log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Übersprungen (Gefiltert/Build-Doc): {rel_path}")
+                    log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Übersprungen (Gefiltert): {rel_path}")
                     continue
 
                 # 🛡️ STRIKTE QUALITÄTSKONTROLLE (QC) VOR DEM EMBEDDING
                 is_valid, qc_reason = QualityControl.validate(category_tag, processed_md, rel_path)
                 if not is_valid:
-                    log_msg(log_list, f"[{global_idx}/{total_files}] ⚠️ QC FAILED ({qc_reason}): {rel_path} -> Verworfen!")
+                    log_msg(log_list, f"[{global_idx}/{total_files}] 📄 ANALYSE & QC: {rel_path}")
+                    log_msg(log_list, f"           ├── Kategorie : #{category_tag}")
+                    log_msg(log_list, f"           └── QC-Status : ⚠️ QC FAILED ({qc_reason}) -> Verworfen!")
                     continue
 
                 parse_duration = time.time() - parse_start_time
@@ -539,28 +559,25 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 used_llm_in_current_batch = True
 
                 new_buffer_count = len(batch_prepared_items)
-                log_msg(
-                    log_list, 
-                    f"[{global_idx}/{total_files}] ✅ Phase A Analyse & QC erfolgreich in {parse_duration:.2f}s "
-                    f"[Batch-Puffer: {new_buffer_count}/{batch_size}] | **#{category_tag}**: {rel_path}"
-                )
+                log_msg(log_list, f"[{global_idx}/{total_files}] 📄 ANALYSE & QC: {rel_path}")
+                log_msg(log_list, f"           ├── Kategorie : #{category_tag}")
+                log_msg(log_list, f"           ├── Dauer     : {parse_duration:.2f}s | Puffer: {new_buffer_count}/{batch_size}")
+                log_msg(log_list, f"           └── QC-Status : ✅ PASS (Validierung bestanden)")
 
             except Exception as parse_err:
-                log_msg(log_list, f"   ❌ Analyse-Fehler bei {rel_path}: {str(parse_err)}")
+                log_msg(log_list, f"   ❌ Fehler bei {rel_path}: {str(parse_err)}")
 
             is_last_file = (global_idx == total_files)
             if len(batch_prepared_items) >= batch_size or (is_last_file and batch_prepared_items):
                 batch_count += 1
-                log_msg(log_list, f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                log_msg(log_list, f"📦 STARTE VEKTORISIERUNG FÜR BATCH {batch_count} ({len(batch_prepared_items)} Dateien)")
-                log_msg(log_list, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                log_banner(log_list, f"VEKTORISIERUNG BATCH #{batch_count} ({len(batch_prepared_items)} DATEIEN)", "📦")
 
                 if used_llm_in_current_batch:
-                    log_msg(log_list, f"🔄 Phase A abgeschlossen. Entlade Anwendungs-LLM ({active_model}) aus VRAM...")
+                    log_msg(log_list, f"🔄 Entlade Anwendungs-LLM ({active_model}) aus VRAM...")
                     unload_ollama_model(ollama_worker, active_model)
                     time.sleep(1.5)
 
-                log_msg(log_list, f"📐 Phase B [Batch {batch_count}]: Erzeuge Embeddings ({EMBED_MODEL}) & speichere in Qdrant...")
+                log_msg(log_list, f"📐 Erzeuge Embeddings ({EMBED_MODEL}) & speichere in Qdrant...")
                 overlap_val = max(200, int(max_embed_chars * 0.10))
 
                 for prep_item in batch_prepared_items:
@@ -571,8 +588,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     p_dur = prep_item["parse_duration"]
                     g_idx = prep_item["global_idx"]
 
-                    log_msg(log_list, f"[{g_idx}/{total_files}] ⏳ Starte Phase B Vektorisierung: {r_path}")
                     embed_start_time = time.time()
+                    # Nutzen des Code-Aware Chunkings
                     md_chunks = smart_markdown_chunking(p_md, max_chars=max_embed_chars, overlap_chars=overlap_val)
 
                     for chunk_idx, md_chunk in enumerate(md_chunks):
@@ -626,21 +643,18 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                                 current_chars = int(current_chars * 0.80)
 
                     embed_dur = time.time() - embed_start_time
-                    total_file_dur = p_dur + embed_dur
-                    log_msg(
-                        log_list, 
-                        f"[{g_idx}/{total_files}] ✅ Phase B Vektorisierung abgeschlossen in {embed_dur:.2f}s "
-                        f"({len(md_chunks)} Chunk(s) | Gesamtzeit: {total_file_dur:.2f}s) | **#{c_tag}**: {r_path}"
-                    )
+                    log_msg(log_list, f"[{g_idx}/{total_files}] 📐 EMBEDDING: {r_path}")
+                    log_msg(log_list, f"           ├── Chunks    : {len(md_chunks)} Chunk(s) (Code-Aware)")
+                    log_msg(log_list, f"           └── Status    : ✅ Indiziert in {embed_dur:.2f}s | #{c_tag}")
 
-                log_msg(log_list, f"🔄 Phase B abgeschlossen. Entlade Embedding-Modell ({EMBED_MODEL}) aus VRAM...\n")
+                log_msg(log_list, f"🔄 Entlade Embedding-Modell ({EMBED_MODEL}) aus VRAM...\n")
                 unload_ollama_model(ollama_worker, EMBED_MODEL)
                 time.sleep(1.5)
 
                 batch_prepared_items.clear()
                 used_llm_in_current_batch = False
 
-        log_msg(log_list, f"🎉 Ingestion erfolgreich beendet! Alle Dokumente sind in Collection '{target_collection}' verfügbar.")
+        log_banner(log_list, f"INGESTION ERFOLGREICH BEENDET ({total_files} DATEIEN)", "🎉")
         status_dict["header"] = f"✅ Status: ABGESCHLOSSEN ({total_files}/{total_files})"
 
     except Exception as top_e:
@@ -890,8 +904,9 @@ footer { visibility: hidden; }
     margin: 0 !important;
 }
 #log-textbox textarea {
-    font-family: monospace;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
     font-size: 0.85rem;
+    line-height: 1.35;
     scroll-behavior: smooth;
 }
 """
@@ -1040,11 +1055,11 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                 with gr.Tab("⭐ EDA & Rule Mining"):
                     mining_repo_input = gr.Dropdown(
                         choices=[
-                            ("SKiDL Haupt-Repository (Offiziell)", "https://github.com/xesscorp/skidl"),
-                            ("KiCad Python Action Plugins", "https://github.com/KiCad/kicad-python"),
-                            ("Freerouting Java / Config Core", "https://github.com/freerouting/freerouting.git")
+                            ("SKiDL Haupt-Repository (Offiziell)", "[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)"),
+                            ("KiCad Python Action Plugins", "[https://github.com/KiCad/kicad-python](https://github.com/KiCad/kicad-python)"),
+                            ("Freerouting Java / Config Core", "[https://github.com/freerouting/freerouting.git](https://github.com/freerouting/freerouting.git)")
                         ],
-                        value="https://github.com/freerouting/freerouting.git",
+                        value="[https://github.com/freerouting/freerouting.git](https://github.com/freerouting/freerouting.git)",
                         label="Ziel-Repository für EDA Mining",
                         allow_custom_value=True,
                         interactive=True
@@ -1055,7 +1070,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     with gr.Row(elem_classes=["row-stretch"]):
                         github_input = gr.Textbox(
                             label="Repository URL",
-                            placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
+                            placeholder="[https://gitlab.com/kicad/libraries/kicad-symbols.git](https://gitlab.com/kicad/libraries/kicad-symbols.git)",
                             scale=4
                         )
                         scan_repo_btn = gr.Button("🔍 Scannen", variant="secondary", scale=1, elem_classes=["full-height-btn"])
@@ -1072,9 +1087,9 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
 
         with gr.Column(scale=1):
             status_output = gr.Textbox(
-                label="Server Live-Protokoll", 
+                label="Server Live-Protokoll (Strukturiert)", 
                 interactive=False, 
-                lines=24, 
+                lines=25, 
                 autoscroll=False,
                 elem_id="log-textbox"
             )
