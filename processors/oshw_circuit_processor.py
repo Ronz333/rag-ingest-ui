@@ -6,7 +6,7 @@ from .base_processor import BaseProcessor
 class OSHWCircuitProcessor(BaseProcessor):
     """
     Processor für OSHW-Schaltpläne (.sch, .kicad_sch).
-    Nützt ein semantisches LLM-Gate (temp=0.0) zur Relevanzprüfung vor der SKiDL-Synthese.
+    Generiert SKiDL-Subcircuits, säubert Gate-Präfixe und prüft die Ausführbarkeit via QualityControl.
     """
 
     def __init__(self):
@@ -33,14 +33,12 @@ class OSHWCircuitProcessor(BaseProcessor):
         ext = os.path.splitext(file_path)[1].lower()
         filename = os.path.basename(file_path)
 
-        # Custom Pfad-Filter
         if custom_filters:
             fp_clean = file_path.replace("\\", "/")
             for pattern in custom_filters:
                 if pattern and pattern in fp_clean:
                     return "SKIDL_SUBCIRCUIT", "SKIP"
 
-        # Determination: Temperatur auf 0.0 erzwingen
         phase_a_options = dict(llm_options)
         phase_a_options["temperature"] = 0.0
 
@@ -51,22 +49,13 @@ class OSHWCircuitProcessor(BaseProcessor):
             "FEW-SHOT BEISPIELE:\n"
             "1. RELEVANT (Verarbeiten):\n"
             "   - Schaltpläne mit konkreten ICs, Widerständen, Kondensatoren, Bussen (I2C, SPI, Ethernet, USB) und Netzen.\n"
-            "   - Wiederverwendbare Schaltungs-Topologien (z. B. Step-Down-Regler, Mikrokontroller-Grundbeschaltungen, Power-Management).\n\n"
+            "   - Wiederverwendbare Schaltungs-Topologien (z. B. Step-Down-Regler, Mikrokontroller-Grundbeschaltungen).\n"
             "2. UNRELEVANT (sofort mit 'SKIP' antworten):\n"
-            "   - Leere Schaltpläne, unvollständige Fragmente, Doku-Skizzen ohne Bauteile.\n"
-            "   - rein mechanische CAD-Exporte oder Platzhalter-Grafiken.\n\n"
+            "   - Leere Schaltpläne, unvollständige Fragmente, Doku-Skizzen ohne Bauteile.\n\n"
             "ANWEISUNG:\n"
-            "Wenn die Datei UNRELEVANT ist, antworte AUSSCHLIESSLICH mit dem einzelnen Wort:\n"
-            "SKIP\n\n"
-            "Wenn die Datei RELEVANT ist, synthetisiere daraus ein SKiDL Entwurfsmuster nach folgendem Schema:\n\n"
-            "STRENGE KICAD SYMBOL- & FOOTPRINT REGELN:\n"
-            "1. KICAD SYMBOL-BIBLIOTHEKEN:\n"
-            "   - Passivbauteile: Part('Device', 'R'), Part('Device', 'C'), Part('Device', 'D_TVS')\n"
-            "   - Ethernet-Chips: Part('Interface_Ethernet', 'LAN8710A')\n"
-            "   - Spannungswandler: Part('Regulator_Linear', 'SY8089AAAC') oder Part('Regulator_Switching', ...)\n"
-            "   VERBOTEN: Nutze NIEMALS Footprint-Namen wie 'Resistor_SMD' als Symbolbibliothek!\n\n"
-            "2. ZWINGENDE FOOTPRINT-ZUWEISUNG:\n"
-            "   Jedes Bauteil MUSS ein explizites 'footprint=' Attribut enthalten (z. B. footprint='Resistor_SMD:R_0603_1608Metric').\n\n"
+            "- Wenn die Datei UNRELEVANT ist, antworte AUSSCHLIESSLICH mit dem einzelnen Wort: SKIP\n"
+            "- Wenn die Datei RELEVANT ist, synthetisiere daraus ein SKiDL Entwurfsmuster.\n"
+            "WICHTIG: Schreibe UNTER KEINEN UMSTÄNDEN das Wort 'RELEVANT' in deine Antwort! Beginne direkt mit der Markdown-Ausgabe.\n\n"
             "FORMAT-VORGABE FÜR RELEVANTE DATEIEN:\n"
             "## 1. Entwurfsmuster / Teilschaltung\n"
             "- **Name & Funktion:** [Name]\n\n"
@@ -108,9 +97,12 @@ class OSHWCircuitProcessor(BaseProcessor):
                 if generated_md == "SKIP" or generated_md.startswith("SKIP"):
                     return "SKIDL_SUBCIRCUIT", "SKIP"
 
-                is_valid, err_msg = QualityControl.validate_skidl_runtime(generated_md)
+                # Präfix-Säuberung
+                cleaned_md = re.sub(r'^(?:RELEVANT[\:\s]*)+', '', generated_md, flags=re.IGNORECASE).strip()
+
+                is_valid, err_msg = QualityControl.validate_skidl_runtime(cleaned_md)
                 if is_valid:
-                    return "SKIDL_SUBCIRCUIT", generated_md
+                    return "SKIDL_SUBCIRCUIT", cleaned_md
 
                 last_error = err_msg
 
