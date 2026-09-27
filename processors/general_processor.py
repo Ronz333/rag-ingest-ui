@@ -1,11 +1,14 @@
 import os
+import re
 from .base_processor import BaseProcessor
 
 
 class GeneralProcessor(BaseProcessor):
     """
-    Fallback-Processor für allgemeine Quellcode- und Dokumentations-Dateien (.cpp, .c, .h, .md, .rst, etc.).
-    Setzt das semantische LLM-Gate (temp=0.0) mit Few-Shot-Beispielen ein, um projektfremde Dokumente auszufiltern.
+    Processor für Quellcode, Header und Dokumentation (.c, .h, .cpp, .md, .json, .yaml).
+    Wandelt technische Treiber- und Hardware-Informationen direkt in deterministischen
+    SKiDL-Code, Pin-Mapping-Tabellen und elektrische Parameter um.
+    Verbietet jegliche Prosa-Zusammenfassungen.
     """
 
     def __init__(self):
@@ -35,28 +38,35 @@ class GeneralProcessor(BaseProcessor):
                 if pattern and pattern in fp_clean:
                     return "GENERAL", "SKIP"
 
-        # Determination: Temperatur auf 0.0 erzwingen
         phase_a_options = dict(llm_options)
         phase_a_options["temperature"] = 0.0
 
         system_prompt = (
-            "Du bist ein hochspezialisierter Filter-Assistent für ein PCB-Automatisierungs-RAG.\n\n"
-            "Deine Aufgabe: Entscheide, ob der vorliegende Datei-Inhalt RELEVANT für PCB-Design, Elektronik, SKiDL, "
-            "KiCad, Freerouting, Pinouts, Signalintegrität oder Bus-Protokolle ist.\n\n"
-            "FEW-SHOT BEISPIELE:\n"
-            "1. POSITIV (RELEVANT):\n"
-            "   - Technische Spezifikationen zu Bussen (I2C, SPI, Ethernet, CAN, USB, UART).\n"
-            "   - Pinout-Beschreibungen, Signal-Layout-Guides, Impedanz-Anforderungen.\n"
-            "   - C/C++ Treiber mit genauen Hardware-Register-Maps und Pin-Belegungen.\n"
-            "   - Freerouting-Spezifikationen, DSN-Grammatik-Dokumentation.\n\n"
-            "2. NEGATIV (UNRELEVANT - sofort 'SKIP'):\n"
-            "   - GUI-Code (Qt, Swing, Web-UI), Bildverarbeitung (SVG, Canvas, OpenGL).\n"
-            "   - Lizenzen, ChangeLogs, READMEs ohne technische Schaltungsspezifikationen.\n"
-            "   - Unit-Test-Frameworks, Mocking-Bibliotheken, CI/CD-Skripte, Build-Systeme (CMake, Makefiles).\n\n"
-            "ANWEISUNG:\n"
-            "Wenn die Datei UNRELEVANT ist, antworte AUSSCHLIESSLICH mit dem einzelnen Wort:\n"
-            "SKIP\n\n"
-            "Wenn die Datei RELEVANT ist, fass den Inhalt präzise und strukturiert für das RAG-System zusammen."
+            "Du bist ein deterministischer Hardware-Extraktor und SKiDL-Synthesizer für einen autonomen PCB-Generator.\n\n"
+            "STUFE 1: RELEVANZ-PRÜFUNG\n"
+            "Ist die Datei relevant für PCB-Design, Schaltungen, Pinouts, ICs, Busse (I2C, SPI, Ethernet, CAN, UART) oder Signale?\n"
+            "- NEIN -> Antworte AUSSCHLIESSLICH mit: SKIP\n"
+            "- JA   -> Extrahiere die Hardware-Fakten strikt nach untenstehendem Schema.\n\n"
+            "VERBOTENE PROSA & META-SPRACHE (STRENGSTENS UNTERSAGT):\n"
+            "❌ NIE schreiben: 'Der Datei-Inhalt beschreibt...', 'Zusammenfassung:', 'Diese Datei ist wichtig für...'\n"
+            "❌ NIE den Inhalt mit Fließtext umschreiben. Wir brauchen harte, maschinenlesbare Daten!\n\n"
+            "AUSGABE-SCHEMA FÜR RELEVANTE DATEIEN (Strikte Pflicht):\n\n"
+            "### 1. Pinout & Hardware-Mapping\n"
+            "| Signal / Funktion | Hardware-Pin / GPIO | Schnittstelle / Bus | Bemerkung / Pegel |\n"
+            "|---|---|---|---|\n"
+            "| ... | ... | ... | ... |\n\n"
+            "### 2. Synthetisierter SKiDL Python Code\n"
+            "```python\n"
+            "from skidl import *\n\n"
+            "@subcircuit\n"
+            "def hardware_interface_subcircuit(net_dict):\n"
+            "    # Exakte Verbindungen basierend auf den Datei-Informationen\n"
+            "    pass\n"
+            "```\n\n"
+            "### 3. Elektrische Parameter & Constraints\n"
+            "- **Spannungsebenen:** [z.B. 3.3V, 5V]\n"
+            "- **Takt / Frequenz:** [z.B. 50 MHz REF_CLK, 100 kHz I2C]\n"
+            "- **Erforderliche Bauteile:** [z.B. 4.7k Pull-Ups an SDA/SCL, 100nF Abblockkondensator]\n"
         )
 
         user_message = f"Datei: {filename}\nPfad: {file_path}\n\nInhalt:\n{raw_content[:max_embed_chars]}"
@@ -75,7 +85,10 @@ class GeneralProcessor(BaseProcessor):
             if generated_md == "SKIP" or generated_md.startswith("SKIP"):
                 return "GENERAL", "SKIP"
 
-            return "GENERAL", generated_md
+            # Entfernen eventueller Rest-Präfixe wie 'RELEVANT'
+            cleaned_md = re.sub(r'^(?:RELEVANT[\:\s]*)+', '', generated_md, flags=re.IGNORECASE).strip()
 
-        except Exception as e:
+            return "GENERAL", cleaned_md
+
+        except Exception:
             return "GENERAL", "SKIP"
