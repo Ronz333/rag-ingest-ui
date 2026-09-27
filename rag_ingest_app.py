@@ -39,15 +39,20 @@ TAG_TO_COLLECTION = {
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# STUFE 1: TECHNISCHER PRE-FILTER
+# STUFE 1: TECHNISCHER PRE-FILTER (Strengere, aber gezieltere Ausschlusslisten)
 STRICT_EXCLUDE_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".pdf",
     ".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".o", ".obj", ".elf", ".bin", ".hex",
     ".zip", ".tar", ".gz", ".7z"
 }
 STRICT_EXCLUDE_NAMES = {
-    "package-lock.json", "cargo.lock", "yarn.lock", "composer.lock", "pnpm-lock.yaml"
+    "package-lock.json", "cargo.lock", "yarn.lock", "composer.lock", "pnpm-lock.yaml",
+    "license", "license.txt", "license.md", "copying", "notice"
 }
+# Ordnermuster, die ohne LLM-Aufruf sofort übersprungen werden
+STRICT_EXCLUDE_DIRS = [
+    "/.git/", "/build/", "/.vscode/", "/.idea/", "/cmakefiles/", "/node_modules/"
+]
 
 DEFAULT_OSHW_SOURCES = [
     {"name": "🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet, Power)", "url": "https://github.com/OLIMEX/ESP32-GATEWAY"},
@@ -115,8 +120,8 @@ def handle_save_oshw_editor(raw_text: str):
 
 def get_default_filter_presets() -> dict:
     return {
-        "default": ["/.git/"],
-        "freerouting": ["/.git/"],
+        "default": ["/.git/", "/build/", "/.vscode/"],
+        "freerouting": ["/.git/", "/build/"],
         "kibot": ["/.git/"],
         "skidl": ["/.git/"]
     }
@@ -264,7 +269,9 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
 
     for root, _, files in os.walk(base_search_path):
         root_lower = root.lower().replace("\\", "/")
-        if "/.git" in root_lower:
+        
+        # Schnelles Überspringen von Build- und System-Ordnern
+        if any(ex_dir in root_lower for ex_dir in STRICT_EXCLUDE_DIRS):
             continue
             
         for f in files:
@@ -409,8 +416,11 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 file_count = 0
                 for root, _, filenames in os.walk(mined_repo_dir):
                     root_lower = root.lower().replace("\\", "/")
-                    if "/.git" in root_lower:
+                    
+                    # Schnelles Überspringen von Build- und System-Ordnern
+                    if any(ex_dir in root_lower for ex_dir in STRICT_EXCLUDE_DIRS):
                         continue
+
                     for f in filenames:
                         f_lower = f.lower()
                         ext = os.path.splitext(f)[1].lower()
@@ -573,7 +583,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                                 point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{item_target_coll}_{r_path}_chunk_{chunk_idx}"))
 
-                                # BEREINIGTE PAYLOAD-STRUKTUR: Nur noch 'content' statt Dreifach-Speicherung
+                                # BEREINIGTE PAYLOAD-STRUKTUR: Nur 'content' wird abgelegt
                                 qdrant_worker.upsert(
                                     collection_name=item_target_coll,
                                     points=[
@@ -799,8 +809,9 @@ def scan_github_repository(github_url, old_scanned_repo):
 
     for root, _, files in os.walk(repo_dir):
         root_lower = root.lower().replace("\\", "/")
-        if "/.git" in root_lower:
+        if any(ex_dir in root_lower for ex_dir in STRICT_EXCLUDE_DIRS):
             continue
+
         has_valid = False
         for f in files:
             f_lower = f.lower()
@@ -986,10 +997,10 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
 
                 custom_filters_input = gr.Textbox(
                     label="Ausschlussmuster & Keywords (Ein Muster pro Zeile)",
-                    placeholder="/.git/",
+                    placeholder="/.git/\n/build/",
                     lines=4,
                     value=get_rules_for_preset("default"),
-                    info="Optionale manuelle Pfadmuster. Das semantische LLM-Gate filtert den Rest automatisch."
+                    info="Optionale manuelle Pfadmuster. Pfade immer mit Schrägstrichen angeben (z.B. /build/)."
                 )
 
                 with gr.Row():
@@ -1027,11 +1038,11 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                 with gr.Tab("⭐ EDA & Rule Mining"):
                     mining_repo_input = gr.Dropdown(
                         choices=[
-                            ("SKiDL Haupt-Repository (Offiziell)", "https://github.com/xesscorp/skidl"),
-                            ("KiCad Python Action Plugins", "https://github.com/KiCad/kicad-python"),
-                            ("Freerouting Java / Config Core", "https://github.com/freerouting/freerouting.git")
+                            ("SKiDL Haupt-Repository (Offiziell)", "[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)"),
+                            ("KiCad Python Action Plugins", "[https://github.com/KiCad/kicad-python](https://github.com/KiCad/kicad-python)"),
+                            ("Freerouting Java / Config Core", "[https://github.com/freerouting/freerouting.git](https://github.com/freerouting/freerouting.git)")
                         ],
-                        value="https://github.com/freerouting/freerouting.git",
+                        value="[https://github.com/freerouting/freerouting.git](https://github.com/freerouting/freerouting.git)",
                         label="Ziel-Repository für EDA Mining",
                         allow_custom_value=True,
                         interactive=True
@@ -1042,7 +1053,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     with gr.Row(elem_classes=["row-stretch"]):
                         github_input = gr.Textbox(
                             label="Repository URL",
-                            placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
+                            placeholder="[https://gitlab.com/kicad/libraries/kicad-symbols.git](https://gitlab.com/kicad/libraries/kicad-symbols.git)",
                             scale=4
                         )
                         scan_repo_btn = gr.Button("🔍 Scannen", variant="secondary", scale=1, elem_classes=["full-height-btn"])
