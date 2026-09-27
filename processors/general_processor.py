@@ -5,16 +5,14 @@ from .base_processor import BaseProcessor
 
 class GeneralProcessor(BaseProcessor):
     """
-    Processor für Quellcode, Header und Dokumentation (.c, .h, .cpp, .md, .json, .yaml).
-    Wandelt technische Treiber- und Hardware-Informationen direkt in deterministischen
-    SKiDL-Code, Pin-Mapping-Tabellen und elektrische Parameter um.
-    Verbietet jegliche Prosa-Zusammenfassungen.
+    Processor für Quellcode, Header, SKiDL-Python-Klassen und Dokumentation (.c, .h, .cpp, .py, .md, .json, .yaml).
+    Extrahiert deterministisch Pinouts, Register-Maps und Hardware-Konfigurationen.
     """
 
     def __init__(self):
         super().__init__()
         self.category_key = "🌐 General Knowledge Base"
-        self.supported_extensions = [".cpp", ".c", ".h", ".hpp", ".md", ".rst", ".txt", ".json", ".yaml", ".yml"]
+        self.supported_extensions = [".cpp", ".c", ".h", ".hpp", ".py", ".md", ".rst", ".txt", ".json", ".yaml", ".yml"]
 
     def can_handle(self, file_path: str) -> bool:
         ext = os.path.splitext(file_path)[1].lower()
@@ -32,41 +30,47 @@ class GeneralProcessor(BaseProcessor):
     ) -> tuple[str, str]:
         filename = os.path.basename(file_path)
 
+        # Exakter Pfadfilter: Nur filtern, wenn ein relativer Pfad explizit gematcht wird
         if custom_filters:
             fp_clean = file_path.replace("\\", "/")
             for pattern in custom_filters:
-                if pattern and pattern in fp_clean:
-                    return "GENERAL", "SKIP"
+                if pattern and pattern.strip() and pattern.strip() in fp_clean:
+                    # Sicherstellen, dass nicht versehentlich allgemeine Wörter gematcht werden
+                    if pattern.strip().startswith("/") or pattern.strip().endswith("/"):
+                        return "GENERAL", "SKIP"
 
         phase_a_options = dict(llm_options)
         phase_a_options["temperature"] = 0.0
 
         system_prompt = (
-            "Du bist ein deterministischer Hardware-Extraktor und SKiDL-Synthesizer für einen autonomen PCB-Generator.\n\n"
-            "STUFE 1: RELEVANZ-PRÜFUNG\n"
-            "Ist die Datei relevant für PCB-Design, Schaltungen, Pinouts, ICs, Busse (I2C, SPI, Ethernet, CAN, UART) oder Signale?\n"
-            "- NEIN -> Antworte AUSSCHLIESSLICH mit: SKIP\n"
-            "- JA   -> Extrahiere die Hardware-Fakten strikt nach untenstehendem Schema.\n\n"
+            "Du bist ein deterministischer Hardware-Extraktor und SKiDL-Synthesizer für ein autonomes PCB-RAG-System.\n\n"
+            "AUFGABE & RELEVANZ-KRITERIEN:\n"
+            "Analysiere den vorliegenden Datei-Inhalt (.c, .h, .py, .md, etc.).\n"
+            "Eine Datei ist RELEVANT und DARF NICHT UEBERSEHEN WERDEN, wenn sie mindestens eines der folgenden Elemente enthält:\n"
+            "- GPIO-Pinbelegungen, Register-Definitions, Peripheral-Initialisierungen (Ethernet PHY/MAC, I2C, SPI, CAN, UART, Clock, PWM, Relais, Buttons).\n"
+            "- C/C++ Treiber-Code oder Header mit Pinouts, Hardware-Konfigurationen oder Register-Maps.\n"
+            "- SKiDL Python-Code (Pins, Parts, Nets, Subcircuits, Klassen-Definitionen wie pin.py, part.py).\n"
+            "- Technische Dokumentation (Pinouts, Signalbeschreibungen, Layout-Hinweise, Board-Revisionen).\n\n"
+            "WANN SOLL 'SKIP' GEWÄHLT WERDEN?\n"
+            "- AUSSCHLIESSLICH bei reinem GUI-Code, Bildverarbeitungs-Logik, CI/CD-Pipelines oder völlig inhaltsleeren Platzhaltern.\n"
+            "- WICHTIG: Lizenzhinweise oder Header-Kommentare (z.B. 'Licensed under Apache/MIT') sind KEIN Grund zum Skippen! "
+            "Wenn die Datei Code, Pinouts oder Hardware-Klassen enthält, verarbeite sie UNBEDINGT!\n\n"
             "VERBOTENE PROSA & META-SPRACHE (STRENGSTENS UNTERSAGT):\n"
-            "❌ NIE schreiben: 'Der Datei-Inhalt beschreibt...', 'Zusammenfassung:', 'Diese Datei ist wichtig für...'\n"
-            "❌ NIE den Inhalt mit Fließtext umschreiben. Wir brauchen harte, maschinenlesbare Daten!\n\n"
-            "AUSGABE-SCHEMA FÜR RELEVANTE DATEIEN (Strikte Pflicht):\n\n"
+            "❌ NIE schreiben: 'Der Datei-Inhalt beschreibt...', 'Zusammenfassung:', 'Diese Datei ist wichtig für...'\n\n"
+            "AUSGABE-SCHEMA FÜR RELEVANTE DATEIEN:\n\n"
             "### 1. Pinout & Hardware-Mapping\n"
             "| Signal / Funktion | Hardware-Pin / GPIO | Schnittstelle / Bus | Bemerkung / Pegel |\n"
             "|---|---|---|---|\n"
             "| ... | ... | ... | ... |\n\n"
-            "### 2. Synthetisierter SKiDL Python Code\n"
+            "### 2. Synthetisierter SKiDL Python Code / Code-Struktur\n"
             "```python\n"
-            "from skidl import *\n\n"
-            "@subcircuit\n"
-            "def hardware_interface_subcircuit(net_dict):\n"
-            "    # Exakte Verbindungen basierend auf den Datei-Informationen\n"
-            "    pass\n"
+            "from skidl import *\n"
+            "# Exakte Verbindungen, SKiDL-Definitionen oder Hardware-Interface\n"
             "```\n\n"
             "### 3. Elektrische Parameter & Constraints\n"
             "- **Spannungsebenen:** [z.B. 3.3V, 5V]\n"
             "- **Takt / Frequenz:** [z.B. 50 MHz REF_CLK, 100 kHz I2C]\n"
-            "- **Erforderliche Bauteile:** [z.B. 4.7k Pull-Ups an SDA/SCL, 100nF Abblockkondensator]\n"
+            "- **Schnittstellen & Pins:** [Genaue Pin-Liste]\n"
         )
 
         user_message = f"Datei: {filename}\nPfad: {file_path}\n\nInhalt:\n{raw_content[:max_embed_chars]}"
@@ -85,7 +89,6 @@ class GeneralProcessor(BaseProcessor):
             if generated_md == "SKIP" or generated_md.startswith("SKIP"):
                 return "GENERAL", "SKIP"
 
-            # Entfernen eventueller Rest-Präfixe wie 'RELEVANT'
             cleaned_md = re.sub(r'^(?:RELEVANT[\:\s]*)+', '', generated_md, flags=re.IGNORECASE).strip()
 
             return "GENERAL", cleaned_md
