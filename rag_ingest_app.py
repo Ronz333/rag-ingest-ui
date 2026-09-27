@@ -14,11 +14,10 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from pypdf import PdfReader
 
-# Dynamisches Plugin-System & Quality Control Modul importieren
 from processors.processor_registry import registry
 from quality_control import QualityControl
 
-# --- KONFIGURATION & KONSTANTEN ---
+# --- KONFIGURATION ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
@@ -31,11 +30,17 @@ OSHW_SOURCES_FILE = os.path.join(BASE_DIR, "oshw_sources.json")
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# Strikte Ausschlusslisten für den File-Collector (Build-Müll, Artefakte)
-STRICT_EXCLUDE_EXTS = {".o", ".obj", ".elf", ".log", ".bin", ".hex", ".ninja", ".cmakecache.txt"}
-STRICT_EXCLUDE_NAMES = {"cmakecache.txt", "targetdirectories.txt", "package-lock.json", "changelog.md", "license", "licence"}
+# STUFE 1: TECHNISCHER PRE-FILTER (Hardcoded, super schnell)
+# Nur reine Binärdateien, Compilate und Lockfiles filtern. Keine Inhalts-Filterlisten mehr!
+STRICT_EXCLUDE_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".pdf",
+    ".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".o", ".obj", ".elf", ".bin", ".hex",
+    ".zip", ".tar", ".gz", ".7z"
+}
+STRICT_EXCLUDE_NAMES = {
+    "package-lock.json", "cargo.lock", "yarn.lock", "composer.lock", "pnpm-lock.yaml"
+}
 
-# --- DEFAULT OSHW BEZUGSQUELLEN ---
 DEFAULT_OSHW_SOURCES = [
     {"name": "🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet, Power)", "url": "https://github.com/OLIMEX/ESP32-GATEWAY"},
     {"name": "🔌 Olimex ESP32-EVB (Ethernet, Relays, CAN Bus, Power)", "url": "https://github.com/OLIMEX/ESP32-EVB"},
@@ -45,7 +50,6 @@ DEFAULT_OSHW_SOURCES = [
     {"name": "🚦 Freerouting Core (Routing Engine & DSN/Rules Grammar)", "url": "https://github.com/freerouting/freerouting.git"}
 ]
 
-# --- PERSISTENT OSHW SOURCES MANAGEMENT ---
 def load_oshw_sources() -> list[dict]:
     if os.path.exists(OSHW_SOURCES_FILE):
         try:
@@ -101,26 +105,12 @@ def handle_save_oshw_editor(raw_text: str):
         f"✅ {len(new_sources)} Quellen erfolgreich gespeichert und Menü aktualisiert!"
     )
 
-# --- REPO FILTERS PERSISTENT MANAGEMENT ---
 def get_default_filter_presets() -> dict:
     return {
-        "default": [
-            "/api/security/", "/api/dev/", "/analytics/", "/api/mcp/", "/util/gson/",
-            "Analytics", "RateLimit", "ApiKey", "ExceptionMapper", "MessageBody", 
-            "WebSocketConfigurator", "Mocked", "/build/", "/CMakeFiles/", "/.git/",
-            ".pro", ".kicad_pro", "CMakeCache.txt", "TargetDirectories.txt", ".ninja", 
-            ".txt", ".kicad_pcb", ".o", ".obj", ".elf", ".log"
-        ],
-        "freerouting": [
-            "/gui/", "/swing/", "/display/", "/board/graphics/", "/view/", 
-            "/fixtures/", "/tests/", "/.github/", "README.md"
-        ],
-        "kibot": [
-            "/tests/", "/docs/", "/images/", "/.github/", "setup.py"
-        ],
-        "skidl": [
-            "/doc/", "/tests/", "/.github/", "setup.py"
-        ]
+        "default": ["/.git/"],
+        "freerouting": ["/.git/"],
+        "kibot": ["/.git/"],
+        "skidl": ["/.git/"]
     }
 
 def get_repo_filters_dict() -> dict:
@@ -187,7 +177,6 @@ def get_filter_preset_and_key_for_url(repo_url_or_path):
             
     return "default", "\n".join(filters_dict.get("default", []))
 
-# --- STRUKTURIERTES LOGGING HELPER ---
 def log_msg(log_list, text: str):
     timestamp = time.strftime("%H:%M:%S", time.localtime())
     log_list.append(f"[{timestamp}] {text}")
@@ -296,21 +285,16 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
 
     for root, _, files in os.walk(base_search_path):
         root_lower = root.lower().replace("\\", "/")
-        if "/.git" in root_lower or "/build" in root_lower or "/cmakefiles" in root_lower:
+        if "/.git" in root_lower:
             continue
             
         for f in files:
             f_lower = f.lower()
             ext = os.path.splitext(f)[1].lower()
             
-            # Strikter Ausschluss von Binär- und Build-Dateien
+            # Stufe 1: Technischer Pre-Filter
             if ext in STRICT_EXCLUDE_EXTS or f_lower in STRICT_EXCLUDE_NAMES:
                 continue
-
-            # JSON Sonderprüfung: Nur verarbeiten, wenn es sich um Hardware/KiCad Configs handelt
-            if ext == ".json":
-                if not any(k in f_lower for k in ["skidl", "kicad", "component", "oshw", "symbol", "footprint", "sources"]):
-                    continue
 
             if ext in TEXT_EXTENSIONS:
                 full_path = os.path.join(root, f)
@@ -331,13 +315,11 @@ def calculate_dynamic_num_ctx(text_len: int, max_limit: int = 32768) -> int:
         num_ctx *= 2
     return min(num_ctx, max_limit)
 
-# --- CODE-AWARE MARKDOWN CHUNKING ---
 def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int = 400) -> list[str]:
     """Code-Aware Chunking: Trennt Markdown NIEMALS innerhalb eines ```python oder ```lisp Code-Blocks."""
     if len(text) <= max_chars:
         return [text]
 
-    # Aufteilung primär an Modul- und Funktionsebenen
     raw_sections = re.split(r'(\n(?=#{1,4}\s)|\n(?=@subcircuit)|(?<=\n```\n)\n)', text)
     chunks = []
     current_chunk = ""
@@ -373,7 +355,6 @@ def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int
     if current_chunk.strip():
         chunks.append(current_chunk.strip())
 
-    # Klammerung von unvollständigen Codeblock-Markern absichern
     sanitized_chunks = []
     for chunk in chunks:
         if chunk.count("```") % 2 != 0:
@@ -382,7 +363,6 @@ def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int
 
     return sanitized_chunks
 
-# --- PROZESS WORKER ---
 def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size, custom_filters_raw=""):
     temp_work_dir = None
     try:
@@ -398,9 +378,10 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             if line.strip() and not line.strip().startswith("#")
         ]
 
+        # Phase A Analysedeterminismus: temperature = 0.0
         llm_options = {
             "num_ctx": num_ctx,
-            "temperature": 0.7,
+            "temperature": 0.0,
             "top_p": 0.8,
             "top_k": 20,
             "repeat_penalty": 1.05
@@ -413,12 +394,11 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         git_env = get_git_env()
         files_to_process = []
 
-        log_banner(log_list, "RAG INGESTION JOB GESTARTET", "🚀")
+        log_banner(log_list, "ZERO-MAINTENANCE RAG INGESTION GESTARTET", "🚀")
         log_msg(log_list, f"🎯 Ziel-Collection : {target_collection}")
-        log_msg(log_list, f"🤖 LLM Modell      : {active_model}")
+        log_msg(log_list, f"🤖 LLM Modell      : {active_model} (temp=0.0 für Phase A Gate)")
         log_msg(log_list, f"📐 Embed-Modell    : {EMBED_MODEL}")
         log_msg(log_list, f"📦 Batch-Größe     : {batch_size} Dateien | Max Tokens: {num_ctx}")
-        log_msg(log_list, f"🛡️ Aktive Filter   : {len(active_custom_filters)} Regel(n) geladen")
         log_msg(log_list, "─" * 70)
 
         if mode in ["repo_mining", "oshw_mining"]:
@@ -450,7 +430,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 file_count = 0
                 for root, _, filenames in os.walk(mined_repo_dir):
                     root_lower = root.lower().replace("\\", "/")
-                    if "/.git" in root_lower or "/build" in root_lower or "/cmakefiles" in root_lower:
+                    if "/.git" in root_lower:
                         continue
                     for f in filenames:
                         f_lower = f.lower()
@@ -463,7 +443,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                             files_to_process.append((f"{repo_base_name}/{rel_p}", full_p))
                             file_count += 1
                 
-                log_msg(log_list, f"   ↳ Repo '{repo_base_name}' geklont ({file_count} relevante Dateien).")
+                log_msg(log_list, f"   ↳ Repo '{repo_base_name}' geklont ({file_count} Dateien gesammelt).")
 
         else:
             if files:
@@ -529,17 +509,17 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             parse_start_time = time.time()
 
             try:
-                # Phase A: Analyse & Vorverarbeitung durch Processor
+                # STUFE 2: Semantisches LLM-Gate in Phase A
                 category_tag, processed_md = registry.dispatch_parse(
                     rel_path, raw_text, active_model, ollama_worker, llm_options, max_embed_chars, 
                     selected_category=category_key, custom_filters=active_custom_filters
                 )
 
-                if processed_md == "SKIP" or not processed_md:
-                    log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Übersprungen (Gefiltert): {rel_path}")
+                if processed_md == "SKIP" or not processed_md or processed_md.strip() == "SKIP":
+                    log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ LLM-GATE: {rel_path} -> 🚫 Irrelevant (SKIP)")
                     continue
 
-                # 🛡️ STRIKTE QUALITÄTSKONTROLLE (QC) VOR DEM EMBEDDING
+                # Qualitätskontrolle (QC-Pipeline)
                 is_valid, qc_reason = QualityControl.validate(category_tag, processed_md, rel_path)
                 if not is_valid:
                     log_msg(log_list, f"[{global_idx}/{total_files}] 📄 ANALYSE & QC: {rel_path}")
@@ -562,7 +542,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 log_msg(log_list, f"[{global_idx}/{total_files}] 📄 ANALYSE & QC: {rel_path}")
                 log_msg(log_list, f"           ├── Kategorie : #{category_tag}")
                 log_msg(log_list, f"           ├── Dauer     : {parse_duration:.2f}s | Puffer: {new_buffer_count}/{batch_size}")
-                log_msg(log_list, f"           └── QC-Status : ✅ PASS (Validierung bestanden)")
+                log_msg(log_list, f"           └── QC-Status : ✅ PASS (Aktiv für Embedding)")
 
             except Exception as parse_err:
                 log_msg(log_list, f"   ❌ Fehler bei {rel_path}: {str(parse_err)}")
@@ -589,7 +569,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     g_idx = prep_item["global_idx"]
 
                     embed_start_time = time.time()
-                    # Nutzen des Code-Aware Chunkings
                     md_chunks = smart_markdown_chunking(p_md, max_chars=max_embed_chars, overlap_chars=overlap_val)
 
                     for chunk_idx, md_chunk in enumerate(md_chunks):
@@ -666,7 +645,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             shutil.rmtree(temp_work_dir, ignore_errors=True)
         log_msg(log_list, "✨ System ist wieder inaktiv und bereit für neue Anfragen.")
 
-# --- INGEST TASK PROCESS MANAGER ---
 class IngestProcessManager:
     def __init__(self):
         self.process = None
@@ -738,7 +716,6 @@ class IngestProcessManager:
 
 task_manager = IngestProcessManager()
 
-# --- HILFSFUNKTIONEN UI & GIT ---
 def get_ollama_models():
     config = load_config()
     saved_model = config.get("last_model", DEFAULT_MODEL)
@@ -835,7 +812,7 @@ def scan_github_repository(github_url, old_scanned_repo):
 
     for root, _, files in os.walk(repo_dir):
         root_lower = root.lower().replace("\\", "/")
-        if "/.git" in root_lower or "/build" in root_lower or "/cmakefiles" in root_lower:
+        if "/.git" in root_lower:
             continue
         has_valid = False
         for f in files:
@@ -884,7 +861,6 @@ def scan_github_repository(github_url, old_scanned_repo):
         log_msg_text
     )
 
-# --- STYLES & JAVASCRIPT ---
 custom_css = """
 footer { visibility: hidden; }
 .row-stretch {
@@ -936,7 +912,6 @@ function() {
 }
 """
 
-# --- GRADIO GUI BUILDER ---
 initial_model_choices, initial_default_model = get_ollama_models()
 saved_cfg = load_config()
 initial_default_category = saved_cfg.get("last_category", list(CATEGORIES.keys())[0])
@@ -951,7 +926,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     repo_state = gr.State("")
     status_timer = gr.Timer(value=2.0)
 
-    gr.Markdown("# 🏢 Universal RAG Ingestion Control Center")
+    gr.Markdown("# 🏢 Universal RAG Ingestion Control Center (Zero-Maintenance)")
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -981,7 +956,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     step=5, 
                     value=initial_batch_size, 
                     label="Batch-Größe (Gültig aufbereitete Dateien pro Wechsel)",
-                    info="Legt fest, nach wie vielen echten, verarbeiteten Dateien VRAM entladen und Embeddings in Qdrant gespeichert werden."
+                    info="Legt fest, nach wie vielen verarbeiteten Dateien VRAM entladen und Embeddings gespeichert werden."
                 )
                 num_ctx_slider = gr.Slider(
                     minimum=4096, 
@@ -997,15 +972,15 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     step=500, 
                     value=initial_max_embed_chars, 
                     label="Max. Embedding Chunk-Größe (Zeichen)",
-                    info="Regelt die Chunk-Größe vor der Einreichung beim Vektormodell (4.000 Chars ideal für Vulkan)."
+                    info="Regelt die Chunk-Größe vor der Einreichung beim Vektormodell."
                 )
 
-            with gr.Accordion("🛡️ Dynamic Repository Filter-Rules (Live Edit & Presets)", open=False):
+            with gr.Accordion("🛡️ Dynamic Repository Filter-Rules (Optional)", open=False):
                 with gr.Row():
                     filter_preset_dropdown = gr.Dropdown(
                         choices=get_preset_choices(),
                         value="default",
-                        label="Filter-Preset wählen (aus repo_filters.json)",
+                        label="Filter-Preset wählen",
                         interactive=True,
                         scale=3
                     )
@@ -1013,10 +988,10 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
 
                 custom_filters_input = gr.Textbox(
                     label="Ausschlussmuster & Keywords (Ein Muster pro Zeile)",
-                    placeholder="/api/security/\nRateLimit\n/fixtures/",
-                    lines=8,
+                    placeholder="/.git/",
+                    lines=4,
                     value=get_rules_for_preset("default"),
-                    info="Dateien, deren Pfad oder Name ein solches Muster enthält, werden im Ingest sofort übersprungen."
+                    info="Optionale manuelle Pfadmuster. Das semantische LLM-Gate filtert den Rest automatisch."
                 )
 
                 with gr.Row():
@@ -1035,16 +1010,15 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     oshw_preset_dropdown = gr.Dropdown(
                         choices=initial_oshw_choices,
                         value=initial_oshw_defaults,
-                        label="OSHW-Bezugsquellen auswählen (Mehrfachauswahl möglich)",
+                        label="OSHW-Bezugsquellen auswählen",
                         multiselect=True,
                         interactive=True
                     )
                     start_oshw_btn = gr.Button("🔌 OSHW Sub-Circuits Ingestieren (Batch)", variant="primary")
 
-                    with gr.Accordion("📝 OSHW-Quellen verwalten & speichern (Persistent)", open=False):
-                        gr.Markdown("Format pro Zeile: `Anzeigename | Repository-URL` oder nur `Repository-URL`")
+                    with gr.Accordion("📝 OSHW-Quellen verwalten & speichern", open=False):
                         oshw_editor_input = gr.Textbox(
-                            label="OSHW Quellen-Liste (Bearbeitbar)",
+                            label="OSHW Quellen-Liste",
                             value=oshw_sources_to_text(load_oshw_sources()),
                             lines=10,
                             interactive=True
@@ -1064,7 +1038,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                         allow_custom_value=True,
                         interactive=True
                     )
-                    start_mining_btn = gr.Button("⛏️ Mining & Hybrid Ingestion Starten", variant="primary")
+                    start_mining_btn = gr.Button("⛏️ Mining Starten", variant="primary")
 
                 with gr.Tab("🌐 Git Repository Crawler"):
                     with gr.Row(elem_classes=["row-stretch"]):
@@ -1087,7 +1061,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
 
         with gr.Column(scale=1):
             status_output = gr.Textbox(
-                label="Server Live-Protokoll (Strukturiert)", 
+                label="Server Live-Protokoll (Semantisches Gate Aktiv)", 
                 interactive=False, 
                 lines=25, 
                 autoscroll=False,
@@ -1108,7 +1082,6 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     category_dropdown.change(fn=update_category_preference, inputs=[category_dropdown])
     refresh_models_btn.click(fn=lambda: gr.Dropdown(choices=get_ollama_models()[0]), outputs=[model_dropdown])
 
-    # Filter Management Callbacks
     filter_preset_dropdown.change(
         fn=handle_preset_dropdown_change,
         inputs=[filter_preset_dropdown],
@@ -1125,14 +1098,12 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
         outputs=[filter_preset_dropdown, filter_status_msg]
     )
 
-    # Persistent OSHW Editor Callbacks
     save_oshw_sources_btn.click(
         fn=handle_save_oshw_editor,
         inputs=[oshw_editor_input],
         outputs=[oshw_preset_dropdown, oshw_save_status]
     )
 
-    # Dynamic Filter Presets + Key Sync
     mining_repo_input.change(
         fn=get_filter_preset_and_key_for_url,
         inputs=[mining_repo_input],
