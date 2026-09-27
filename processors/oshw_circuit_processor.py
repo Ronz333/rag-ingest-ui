@@ -36,8 +36,9 @@ class OSHWCircuitProcessor(BaseProcessor):
         if custom_filters:
             fp_clean = file_path.replace("\\", "/")
             for pattern in custom_filters:
-                if pattern and pattern in fp_clean:
-                    return "SKIDL_SUBCIRCUIT", "SKIP"
+                if pattern and pattern.strip() and pattern.strip() in fp_clean:
+                    if pattern.strip().startswith("/") or pattern.strip().endswith("/"):
+                        return "SKIDL_SUBCIRCUIT", "SKIP"
 
         phase_a_options = dict(llm_options)
         phase_a_options["temperature"] = 0.0
