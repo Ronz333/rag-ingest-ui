@@ -230,35 +230,6 @@ def save_config(data: dict):
     except Exception as e:
         print(f"Fehler beim Speichern der Konfiguration: {e}")
 
-def get_indexed_hashes_set(qdrant_client, collection_name: str) -> set:
-    indexed_set = set()
-    try:
-        collections = [c.name for c in qdrant_client.get_collections().collections]
-        if collection_name not in collections:
-            return indexed_set
-
-        offset = None
-        while True:
-            records, next_offset = qdrant_client.scroll(
-                collection_name=collection_name,
-                limit=500,
-                offset=offset,
-                with_payload=["file_path", "content_hash"],
-                with_vectors=False
-            )
-            for r in records:
-                if r.payload:
-                    fp = r.payload.get("file_path")
-                    ch = r.payload.get("content_hash")
-                    if fp and ch:
-                        indexed_set.add((fp, ch))
-            if next_offset is None or len(records) == 0:
-                break
-            offset = next_offset
-    except Exception as e:
-        print(f"Fehler beim Batch-Laden der Qdrant-Hashes: {e}")
-    return indexed_set
-
 def ensure_qdrant_collection(qdrant_client, collection_name: str, vector_size: int):
     collections = [c.name for c in qdrant_client.get_collections().collections]
     if collection_name not in collections:
@@ -401,8 +372,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         git_env = get_git_env()
         files_to_process = []
 
-        log_banner(log_list, "ZERO-MAINTENANCE RAG INGESTION GESTARTET", "🚀")
-        log_msg(log_list, f"🤖 LLM Modell      : {active_model} (temp=0.0 für Phase A Gate)")
+        log_banner(log_list, "AUTONOMOUS PCB RAG INGESTION GESTARTET", "🚀")
+        log_msg(log_list, f"🤖 LLM Modell      : {active_model} (temp=0.0 für Phase A Extraktion)")
         log_msg(log_list, f"📐 Embed-Modell    : {EMBED_MODEL}")
         log_msg(log_list, f"📦 Batch-Größe     : {batch_size} Dateien | Max Tokens: {num_ctx}")
         log_msg(log_list, "─" * 70)
@@ -513,7 +484,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             parse_start_time = time.time()
 
             try:
-                # STUFE 2: Semantisches LLM-Gate
+                # STUFE 2: Semantisches LLM-Gate & Code-Synthese
                 category_tag, processed_md = registry.dispatch_parse(
                     rel_path, raw_text, active_model, ollama_worker, llm_options, max_embed_chars, 
                     selected_category=category_key, custom_filters=active_custom_filters
@@ -526,7 +497,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 # Qualitätskontrolle
                 is_valid, qc_reason = QualityControl.validate(category_tag, processed_md, rel_path)
                 if not is_valid:
-                    log_msg(log_list, f"[{global_idx}/{total_files}] 📄 ANALYSE & QC: {rel_path}")
+                    log_msg(log_list, f"[{global_idx}/{total_files}] 📄 EXTRAKTION & QC: {rel_path}")
                     log_msg(log_list, f"           ├── Kategorie : #{category_tag}")
                     log_msg(log_list, f"           └── QC-Status : ⚠️ QC FAILED ({qc_reason}) -> Verworfen!")
                     continue
@@ -548,7 +519,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 used_llm_in_current_batch = True
 
                 new_buffer_count = len(batch_prepared_items)
-                log_msg(log_list, f"[{global_idx}/{total_files}] 📄 ANALYSE & QC: {rel_path}")
+                log_msg(log_list, f"[{global_idx}/{total_files}] 📄 EXTRAKTION & QC: {rel_path}")
                 log_msg(log_list, f"           ├── Ziel-DB   : [{target_coll}] (Tag: #{category_tag})")
                 log_msg(log_list, f"           ├── Dauer     : {parse_duration:.2f}s | Puffer: {new_buffer_count}/{batch_size}")
                 log_msg(log_list, f"           └── QC-Status : ✅ PASS (Aktiv für Embedding)")
@@ -602,6 +573,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                                 point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{item_target_coll}_{r_path}_chunk_{chunk_idx}"))
 
+                                # BEREINIGTE PAYLOAD-STRUKTUR: Nur noch 'content' statt Dreifach-Speicherung
                                 qdrant_worker.upsert(
                                     collection_name=item_target_coll,
                                     points=[
@@ -609,8 +581,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                                             id=point_id,
                                             vector=vector,
                                             payload={
-                                                "text": md_chunk[:current_chars],
-                                                "document": md_chunk[:current_chars],
                                                 "title": os.path.basename(r_path),
                                                 "filename": os.path.basename(r_path),
                                                 "file_path": r_path,
@@ -953,7 +923,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     repo_state = gr.State("")
     status_timer = gr.Timer(value=1.5)
 
-    gr.Markdown("# 🏢 Universal RAG Ingestion Control Center (Zero-Maintenance)")
+    gr.Markdown("# 🏢 Universal RAG Ingestion Control Center (Autonomous PCB Generator)")
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -1057,11 +1027,11 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                 with gr.Tab("⭐ EDA & Rule Mining"):
                     mining_repo_input = gr.Dropdown(
                         choices=[
-                            ("SKiDL Haupt-Repository (Offiziell)", "[https://github.com/xesscorp/skidl](https://github.com/xesscorp/skidl)"),
-                            ("KiCad Python Action Plugins", "[https://github.com/KiCad/kicad-python](https://github.com/KiCad/kicad-python)"),
-                            ("Freerouting Java / Config Core", "[https://github.com/freerouting/freerouting.git](https://github.com/freerouting/freerouting.git)")
+                            ("SKiDL Haupt-Repository (Offiziell)", "https://github.com/xesscorp/skidl"),
+                            ("KiCad Python Action Plugins", "https://github.com/KiCad/kicad-python"),
+                            ("Freerouting Java / Config Core", "https://github.com/freerouting/freerouting.git")
                         ],
-                        value="[https://github.com/freerouting/freerouting.git](https://github.com/freerouting/freerouting.git)",
+                        value="https://github.com/freerouting/freerouting.git",
                         label="Ziel-Repository für EDA Mining",
                         allow_custom_value=True,
                         interactive=True
@@ -1072,7 +1042,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     with gr.Row(elem_classes=["row-stretch"]):
                         github_input = gr.Textbox(
                             label="Repository URL",
-                            placeholder="[https://gitlab.com/kicad/libraries/kicad-symbols.git](https://gitlab.com/kicad/libraries/kicad-symbols.git)",
+                            placeholder="https://gitlab.com/kicad/libraries/kicad-symbols.git",
                             scale=4
                         )
                         scan_repo_btn = gr.Button("🔍 Scannen", variant="secondary", scale=1, elem_classes=["full-height-btn"])
