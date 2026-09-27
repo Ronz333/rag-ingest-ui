@@ -14,10 +14,11 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from pypdf import PdfReader
 
+# Dynamisches Plugin-System & Quality Control Modul importieren
 from processors.processor_registry import registry
 from quality_control import QualityControl
 
-# --- KONFIGURATION ---
+# --- KONFIGURATION & KONSTANTEN ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
@@ -27,11 +28,18 @@ CONFIG_FILE = "/tmp/rag_ingest_config.json"
 REPO_FILTERS_FILE = os.path.join(BASE_DIR, "repo_filters.json")
 OSHW_SOURCES_FILE = os.path.join(BASE_DIR, "oshw_sources.json")
 
+# DYNAMISCHES COLLECTION ROUTING
+TAG_TO_COLLECTION = {
+    "SKIDL_SUBCIRCUIT": "skidl_patterns_kb",
+    "KICAD_SYMBOL": "kicad_sym_kb",
+    "DESIGN_RULE": "freerouting_rules_kb",
+    "GENERAL": "general_knowledge_base"
+}
+
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# STUFE 1: TECHNISCHER PRE-FILTER (Hardcoded, super schnell)
-# Nur reine Binärdateien, Compilate und Lockfiles filtern. Keine Inhalts-Filterlisten mehr!
+# STUFE 1: TECHNISCHER PRE-FILTER
 STRICT_EXCLUDE_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".pdf",
     ".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".o", ".obj", ".elf", ".bin", ".hex",
@@ -292,7 +300,6 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
             f_lower = f.lower()
             ext = os.path.splitext(f)[1].lower()
             
-            # Stufe 1: Technischer Pre-Filter
             if ext in STRICT_EXCLUDE_EXTS or f_lower in STRICT_EXCLUDE_NAMES:
                 continue
 
@@ -363,6 +370,7 @@ def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int
 
     return sanitized_chunks
 
+# --- PROZESS WORKER ---
 def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size, custom_filters_raw=""):
     temp_work_dir = None
     try:
@@ -370,7 +378,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         qdrant_worker = QdrantClient(url=QDRANT_HOST)
 
         category_info = CATEGORIES.get(category_key, CATEGORIES[list(CATEGORIES.keys())[0]])
-        target_collection = category_info["collection"]
+        fallback_collection = category_info["collection"]
         active_model = selected_model if selected_model else DEFAULT_MODEL
 
         active_custom_filters = [
@@ -378,7 +386,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             if line.strip() and not line.strip().startswith("#")
         ]
 
-        # Phase A Analysedeterminismus: temperature = 0.0
         llm_options = {
             "num_ctx": num_ctx,
             "temperature": 0.0,
@@ -395,7 +402,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         files_to_process = []
 
         log_banner(log_list, "ZERO-MAINTENANCE RAG INGESTION GESTARTET", "🚀")
-        log_msg(log_list, f"🎯 Ziel-Collection : {target_collection}")
         log_msg(log_list, f"🤖 LLM Modell      : {active_model} (temp=0.0 für Phase A Gate)")
         log_msg(log_list, f"📐 Embed-Modell    : {EMBED_MODEL}")
         log_msg(log_list, f"📦 Batch-Größe     : {batch_size} Dateien | Max Tokens: {num_ctx}")
@@ -408,11 +414,13 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             if not clean_repo_urls:
                 log_msg(log_list, "❌ Keine validen Repository-URLs für das Mining angegeben.")
                 status_dict["header"] = "🔴 Status: BEENDET (Ungültige URL)"
+                status_dict["current_file"] = "Keine"
                 return
 
             log_msg(log_list, f"⛏️ Starte Batch Git-Mining [{mode.upper()}] für {len(clean_repo_urls)} Repository/Repositories...")
 
             for repo_idx, clean_repo_url in enumerate(clean_repo_urls, 1):
+                status_dict["current_file"] = f"Klone Git Repo: {clean_repo_url}"
                 log_msg(log_list, f"   [Repo {repo_idx}/{len(clean_repo_urls)}] Klone: {clean_repo_url}")
                 mined_repo_dir = os.path.join(temp_work_dir, f"mined_repo_{repo_idx}")
                 
@@ -482,12 +490,11 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         if not files_to_process:
             log_msg(log_list, "❌ Keine verwertbaren Dateien in allen ausgewählten Quellen gefunden.")
             status_dict["header"] = "🔴 Status: BEENDET (Keine Dateien)"
+            status_dict["current_file"] = "Keine"
             return
 
         total_files = len(files_to_process)
-        existing_hashes = get_indexed_hashes_set(qdrant_worker, target_collection)
-        log_msg(log_list, f"📊 Gesamt zu verarbeiten: {total_files} Datei(en)")
-        log_msg(log_list, f"   ↳ {len(existing_hashes)} bereits indizierte Datei(en) in '{target_collection}' übersprungen.\n")
+        log_msg(log_list, f"📊 Gesamt zu verarbeiten: {total_files} Datei(en)\n")
 
         batch_prepared_items = []
         batch_count = 0
@@ -496,20 +503,17 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         for global_idx, (rel_path, file_path) in enumerate(files_to_process, 1):
             current_buffer_count = len(batch_prepared_items)
             status_dict["header"] = f"🟢 Status: LÄUFT ({global_idx}/{total_files} | Puffer: {current_buffer_count}/{batch_size})"
+            status_dict["current_file"] = f"🔍 Phase A Analyse: {rel_path}"
 
             raw_text = extract_text_from_file(file_path)
             if not raw_text.strip():
                 continue
 
             content_hash = calculate_sha256(raw_text)
-            if (rel_path, content_hash) in existing_hashes:
-                log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ Übersprungen (Unverändert): {rel_path}")
-                continue
-
             parse_start_time = time.time()
 
             try:
-                # STUFE 2: Semantisches LLM-Gate in Phase A
+                # STUFE 2: Semantisches LLM-Gate
                 category_tag, processed_md = registry.dispatch_parse(
                     rel_path, raw_text, active_model, ollama_worker, llm_options, max_embed_chars, 
                     selected_category=category_key, custom_filters=active_custom_filters
@@ -519,7 +523,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ LLM-GATE: {rel_path} -> 🚫 Irrelevant (SKIP)")
                     continue
 
-                # Qualitätskontrolle (QC-Pipeline)
+                # Qualitätskontrolle
                 is_valid, qc_reason = QualityControl.validate(category_tag, processed_md, rel_path)
                 if not is_valid:
                     log_msg(log_list, f"[{global_idx}/{total_files}] 📄 ANALYSE & QC: {rel_path}")
@@ -528,10 +532,15 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     continue
 
                 parse_duration = time.time() - parse_start_time
+                
+                # Zuweisung der dynamischen Ziel-Collection
+                target_coll = TAG_TO_COLLECTION.get(category_tag, fallback_collection)
+
                 batch_prepared_items.append({
                     "rel_path": rel_path,
                     "content_hash": content_hash,
                     "category_tag": category_tag,
+                    "target_collection": target_coll,
                     "processed_md": processed_md,
                     "parse_duration": parse_duration,
                     "global_idx": global_idx
@@ -540,7 +549,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                 new_buffer_count = len(batch_prepared_items)
                 log_msg(log_list, f"[{global_idx}/{total_files}] 📄 ANALYSE & QC: {rel_path}")
-                log_msg(log_list, f"           ├── Kategorie : #{category_tag}")
+                log_msg(log_list, f"           ├── Ziel-DB   : [{target_coll}] (Tag: #{category_tag})")
                 log_msg(log_list, f"           ├── Dauer     : {parse_duration:.2f}s | Puffer: {new_buffer_count}/{batch_size}")
                 log_msg(log_list, f"           └── QC-Status : ✅ PASS (Aktiv für Embedding)")
 
@@ -553,6 +562,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 log_banner(log_list, f"VEKTORISIERUNG BATCH #{batch_count} ({len(batch_prepared_items)} DATEIEN)", "📦")
 
                 if used_llm_in_current_batch:
+                    status_dict["current_file"] = "🔄 VRAM-Switch: Entlade Anwendungs-LLM..."
                     log_msg(log_list, f"🔄 Entlade Anwendungs-LLM ({active_model}) aus VRAM...")
                     unload_ollama_model(ollama_worker, active_model)
                     time.sleep(1.5)
@@ -564,10 +574,11 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     r_path = prep_item["rel_path"]
                     c_hash = prep_item["content_hash"]
                     c_tag = prep_item["category_tag"]
+                    item_target_coll = prep_item["target_collection"]
                     p_md = prep_item["processed_md"]
-                    p_dur = prep_item["parse_duration"]
                     g_idx = prep_item["global_idx"]
 
+                    status_dict["current_file"] = f"📐 Phase B Embedding: {r_path}"
                     embed_start_time = time.time()
                     md_chunks = smart_markdown_chunking(p_md, max_chars=max_embed_chars, overlap_chars=overlap_val)
 
@@ -587,12 +598,12 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                                 )
 
                                 vector = embed_res['embedding']
-                                ensure_qdrant_collection(qdrant_worker, target_collection, len(vector))
+                                ensure_qdrant_collection(qdrant_worker, item_target_coll, len(vector))
 
-                                point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{target_collection}_{r_path}_chunk_{chunk_idx}"))
+                                point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{item_target_coll}_{r_path}_chunk_{chunk_idx}"))
 
                                 qdrant_worker.upsert(
-                                    collection_name=target_collection,
+                                    collection_name=item_target_coll,
                                     points=[
                                         PointStruct(
                                             id=point_id,
@@ -623,8 +634,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                     embed_dur = time.time() - embed_start_time
                     log_msg(log_list, f"[{g_idx}/{total_files}] 📐 EMBEDDING: {r_path}")
-                    log_msg(log_list, f"           ├── Chunks    : {len(md_chunks)} Chunk(s) (Code-Aware)")
-                    log_msg(log_list, f"           └── Status    : ✅ Indiziert in {embed_dur:.2f}s | #{c_tag}")
+                    log_msg(log_list, f"           ├── Collection: [{item_target_coll}]")
+                    log_msg(log_list, f"           └── Status    : ✅ Indiziert in {embed_dur:.2f}s ({len(md_chunks)} Chunks)")
 
                 log_msg(log_list, f"🔄 Entlade Embedding-Modell ({EMBED_MODEL}) aus VRAM...\n")
                 unload_ollama_model(ollama_worker, EMBED_MODEL)
@@ -635,10 +646,12 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
         log_banner(log_list, f"INGESTION ERFOLGREICH BEENDET ({total_files} DATEIEN)", "🎉")
         status_dict["header"] = f"✅ Status: ABGESCHLOSSEN ({total_files}/{total_files})"
+        status_dict["current_file"] = "Inaktiv (Fertig)"
 
     except Exception as top_e:
         log_msg(log_list, f"\n❌ Unerwarteter Systemfehler: {str(top_e)}")
         status_dict["header"] = "🔴 Status: FEHLER"
+        status_dict["current_file"] = "Fehler aufgetreten"
     finally:
         status_dict["running"] = False
         if temp_work_dir and os.path.exists(temp_work_dir):
@@ -651,7 +664,7 @@ class IngestProcessManager:
         self.manager = multiprocessing.Manager()
         self.log_list = self.manager.list()
         log_msg(self.log_list, "Inaktiv. Bereit für neuen Ingestion-Job.")
-        self.status_dict = self.manager.dict({"header": "⚪ Status: Inaktiv", "running": False})
+        self.status_dict = self.manager.dict({"header": "⚪ Status: Inaktiv", "running": False, "current_file": "Keine"})
 
     def append_log(self, text: str):
         log_msg(self.log_list, text)
@@ -662,7 +675,8 @@ class IngestProcessManager:
     def get_ui_snapshot(self):
         full_log = "\n".join(list(self.log_list))
         header = self.status_dict.get("header", "⚪ Status: Inaktiv")
-        return full_log, f"### {header}"
+        curr_file = self.status_dict.get("current_file", "Keine")
+        return full_log, f"### {header}", f"📂 **Aktuell in Bearbeitung:** `{curr_file}`"
 
     def is_alive(self):
         return self.process is not None and self.process.is_alive()
@@ -676,14 +690,16 @@ class IngestProcessManager:
             
             self.status_dict["running"] = False
             self.status_dict["header"] = "🔴 Status: ABGEBROCHEN"
+            self.status_dict["current_file"] = "Keine"
             log_msg(self.log_list, "\n🛑 Abbruch-Signal ausgeführt: Prozess wurde umgehend beendet.")
             log_msg(self.log_list, "✨ System ist wieder inaktiv und bereit für neue Anfragen.")
         else:
             self.status_dict["header"] = "⚪ Status: Inaktiv"
             self.status_dict["running"] = False
+            self.status_dict["current_file"] = "Keine"
             log_msg(self.log_list, "ℹ️ Kein aktiver Job zum Abbrechen vorhanden.")
 
-        return "\n".join(list(self.log_list)), f"### {self.status_dict['header']}"
+        return "\n".join(list(self.log_list)), f"### {self.status_dict['header']}", "📂 **Aktuell in Bearbeitung:** `Keine`"
 
     def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url="", num_ctx=32768, max_embed_chars=50000, batch_size=25, custom_filters_raw=""):
         if self.is_alive():
@@ -692,6 +708,7 @@ class IngestProcessManager:
 
         del self.log_list[:]
         self.status_dict["header"] = "🟢 Status: WIRD GESTARTET..."
+        self.status_dict["current_file"] = "Initialisierung..."
         self.status_dict["running"] = True
         
         save_config({
@@ -861,6 +878,7 @@ def scan_github_repository(github_url, old_scanned_repo):
         log_msg_text
     )
 
+# --- STYLES & JAVASCRIPT FOR DYNAMIC RESIZABLE PANELS ---
 custom_css = """
 footer { visibility: hidden; }
 .row-stretch {
@@ -883,7 +901,16 @@ footer { visibility: hidden; }
     font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
     font-size: 0.85rem;
     line-height: 1.35;
+    resize: vertical !important;
     scroll-behavior: smooth;
+}
+.file-status-card {
+    background-color: rgba(70, 130, 180, 0.1) !important;
+    border-left: 4px solid #4682b4 !important;
+    padding: 8px 12px !important;
+    border-radius: 4px !important;
+    margin-top: 5px !important;
+    margin-bottom: 10px !important;
 }
 """
 
@@ -924,13 +951,14 @@ initial_oshw_defaults = [c[1] for c in initial_oshw_choices[:2]] if len(initial_
 
 with gr.Blocks(title="Universal RAG Control Center") as demo:
     repo_state = gr.State("")
-    status_timer = gr.Timer(value=2.0)
+    status_timer = gr.Timer(value=1.5)
 
     gr.Markdown("# 🏢 Universal RAG Ingestion Control Center (Zero-Maintenance)")
 
     with gr.Row():
         with gr.Column(scale=1):
             status_banner = gr.Markdown("### ⚪ Status: Inaktiv")
+            current_file_display = gr.Markdown("📂 **Aktuell in Bearbeitung:** `Keine`", elem_classes=["file-status-card"])
 
             with gr.Row(elem_classes=["row-stretch"]):
                 model_dropdown = gr.Dropdown(
@@ -945,7 +973,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
             category_dropdown = gr.Dropdown(
                 choices=list(CATEGORIES.keys()),
                 value=initial_default_category,
-                label="Knowledge Collection / Plugin Category",
+                label="Knowledge Collection Fallback / Plugin Category",
                 interactive=True
             )
 
@@ -1061,9 +1089,9 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
 
         with gr.Column(scale=1):
             status_output = gr.Textbox(
-                label="Server Live-Protokoll (Semantisches Gate Aktiv)", 
+                label="Server Live-Protokoll (Höhe anpassbar)", 
                 interactive=False, 
-                lines=25, 
+                lines=26, 
                 autoscroll=False,
                 elem_id="log-textbox"
             )
@@ -1074,7 +1102,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
 
     status_timer.tick(
         fn=task_manager.get_ui_snapshot,
-        outputs=[status_output, status_banner],
+        outputs=[status_output, status_banner, current_file_display],
         show_progress="hidden"
     )
 
@@ -1154,7 +1182,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
 
     stop_btn.click(
         fn=task_manager.request_cancel,
-        outputs=[status_output, status_banner]
+        outputs=[status_output, status_banner, current_file_display]
     )
 
 if __name__ == "__main__":
