@@ -1,13 +1,13 @@
 import os
 import re
+import json
 from .base_processor import BaseProcessor
 
 
 class OSHWCircuitProcessor(BaseProcessor):
     """
     Processor für OSHW-Schaltpläne (.sch, .kicad_sch).
-    Generiert SKiDL-Subcircuits, prüft deren Ausführbarkeit via QualityControl (skidl.generate_netlist())
-    und garantiert vollkommen deterministischen Python-Code.
+    Nützt Clef-27B für schnelles Gating und prüft SKiDL-Code via QualityControl (skidl.generate_netlist()).
     """
 
     def __init__(self):
@@ -24,6 +24,7 @@ class OSHWCircuitProcessor(BaseProcessor):
         file_path: str,
         raw_content: str,
         model_name: str,
+        clef_model_name: str,
         ollama_client,
         llm_options: dict,
         max_embed_chars: int,
@@ -40,17 +41,35 @@ class OSHWCircuitProcessor(BaseProcessor):
                     if pattern.strip().startswith("/") or pattern.strip().endswith("/"):
                         return "SKIDL_SUBCIRCUIT", "SKIP"
 
-        phase_a_options = dict(llm_options)
-        phase_a_options["temperature"] = 0.0
+        # PHASE A1: CLEF-27B DECISION GATE
+        clef_prompt = (
+            "Du bist ein Hardware-Decision-Head (Cloudflare Clef Gate).\n"
+            "Pruefe, ob der Schaltplan gueltige Bauteile, Netze oder Schaltungstopologien enthaelt.\n\n"
+            "ANTWORTE AUSSCHLIESSLICH IM JSON-FORMAT:\n"
+            '{"is_hardware_relevant": true, "category_tag": "SKIDL_SUBCIRCUIT"}'
+        )
 
+        try:
+            clef_res = ollama_client.chat(
+                model=clef_model_name,
+                messages=[
+                    {"role": "system", "content": clef_prompt},
+                    {"role": "user", "content": f"Schaltplan: {filename}\nInhalt:\n{raw_content[:3000]}"}
+                ],
+                format="json",
+                options={"temperature": 0.0}
+            )
+            clef_json = json.loads(clef_res["message"]["content"].strip())
+            if not clef_json.get("is_hardware_relevant", False):
+                return "SKIDL_SUBCIRCUIT", "SKIP"
+        except Exception:
+            pass
+
+        # PHASE A2: SKIDL SYNTHESE MIT QUALITY CONTROL LOOP
         base_system_prompt = (
             "Du bist ein deterministischer SKiDL-Code-Synthesizer für ein autonomes PCB-Generierungssystem.\n\n"
-            "STUFE 1: SEMANTISCHE RELEVANZ-PRÜFUNG\n"
-            "Enthält die Datei eine verwertbare Schaltung, Komponenten oder Bus-Topologie?\n"
-            "- NEIN -> Antworte AUSSCHLIESSLICH mit: SKIP\n"
-            "- JA   -> Erstelle den SKiDL Python-Code.\n\n"
             "VERBOTENE PROSA (STRENGSTENS UNTERSAGT):\n"
-            "Keine Einleitungssätze, keine Erklärung wie 'Dieser Schaltplan zeigt...'. Beginne sofort mit den Markdown-Sektionen.\n\n"
+            "Keine Einleitungssätze! Beginne sofort mit den Markdown-Sektionen.\n\n"
             "FORMAT-VORGABE:\n"
             "## 1. Schaltungs-Spezifikation\n"
             "- **Modul-Name:** [Name]\n"
@@ -87,7 +106,7 @@ class OSHWCircuitProcessor(BaseProcessor):
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message},
                     ],
-                    options=phase_a_options,
+                    options=llm_options,
                 )
                 generated_md = response["message"]["content"].strip()
 
@@ -96,7 +115,6 @@ class OSHWCircuitProcessor(BaseProcessor):
 
                 cleaned_md = re.sub(r'^(?:RELEVANT[\:\s]*)+', '', generated_md, flags=re.IGNORECASE).strip()
 
-                # Laufzeit-Compiler-Check für SKiDL Code
                 is_valid, err_msg = QualityControl.validate_skidl_runtime(cleaned_md)
                 if is_valid:
                     return "SKIDL_SUBCIRCUIT", cleaned_md
