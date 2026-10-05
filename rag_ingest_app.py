@@ -19,7 +19,7 @@ from processors.processor_registry import registry
 from quality_control import QualityControl
 
 # --- KONFIGURATION & KONSTANTEN ---
-BASE_DIR = os.path.dirname(os.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_1")
