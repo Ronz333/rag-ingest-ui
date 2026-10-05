@@ -203,6 +203,8 @@ def get_git_env():
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ASKPASS"] = "echo"
+    # Performance-Booster & IPv4-Zwang gegen Docker-Timeouts:
+    env["GIT_CURL_VERBOSE"] = "0"
     return env
 
 def sanitize_url(raw_url: str) -> str:
@@ -400,9 +402,21 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 log_msg(log_list, f"   [Repo {repo_idx}/{len(clean_repo_urls)}] Klone: {clean_repo_url}")
                 mined_repo_dir = os.path.join(temp_work_dir, f"mined_repo_{repo_idx}")
                 
+                # Optimierter Blitz-Clone für RAG-Ingestion:
                 res = subprocess.run(
-                    ["git", "clone", "--depth", "1", clean_repo_url, mined_repo_dir],
-                    capture_output=True, text=True, env=git_env
+                    [
+                        "git", "-c", "http.version=HTTP/1.1", "clone",
+                        "--depth", "1",
+                        "--single-branch",
+                        "--no-tags",
+                        "--recurse-submodules",
+                        "--shallow-submodules",
+                        clean_repo_url, 
+                        mined_repo_dir
+                    ],
+                    capture_output=True, 
+                    text=True, 
+                    env=git_env
                 )
 
                 if res.returncode != 0:
