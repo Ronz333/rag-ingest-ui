@@ -219,15 +219,11 @@ def sanitize_url(raw_url: str) -> str:
     return raw_url.strip("[]()'\" ")
 
 def fetch_repository(repo_url: str, target_dir: str, log_list: list) -> bool:
-    """
-    Maßnahme 2: Versucht zuerst ein schnelles ZIP-Archiv via GitHub HEAD.zip herunterzuladen.
-    Sollte dies fehlschlagen oder kein GitHub-Repo sein, erfolgt der Fallback auf 'git clone'.
-    """
     clean_url = repo_url.rstrip("/").removesuffix(".git")
 
     if "github.com" in clean_url:
         zip_url = f"{clean_url}/archive/HEAD.zip"
-        zip_path = os.path.join(os.path.dirname(target_dir), f"temp_{uuid.uuid4()[:6]}.zip")
+        zip_path = os.path.join(os.path.dirname(target_dir), f"temp_{str(uuid.uuid4())[:6]}.zip")
         try:
             log_msg(log_list, f"   ⚡ Versuche Schnell-Download via ZIP: {zip_url}")
             req = urllib.request.Request(
@@ -453,7 +449,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             log_msg(log_list, f"⛏️ Starte Batch Git-Mining [{mode.upper()}] für {len(clean_repo_urls)} Repository/Repositories...")
 
             for repo_idx, clean_repo_url in enumerate(clean_repo_urls, 1):
-                # Maßnahme 3: Pause zur Vermeidung von GitHub-Rate-Limits bei mehreren Repos
                 if repo_idx > 1:
                     log_msg(log_list, "⏳ Pause von 2,0s zur Vermeidung von GitHub Rate-Limits...")
                     time.sleep(2.0)
@@ -462,7 +457,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 log_msg(log_list, f"   [Repo {repo_idx}/{len(clean_repo_urls)}] Lade: {clean_repo_url}")
                 mined_repo_dir = os.path.join(temp_work_dir, f"mined_repo_{repo_idx}")
 
-                # Maßnahme 2: Schnell-Download via ZIP mit Git-Clone Fallback
                 success = fetch_repository(clean_repo_url, mined_repo_dir, log_list)
                 if not success:
                     continue
@@ -496,7 +490,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                     if ext == ".zip":
                         log_msg(log_list, f"📦 Entpacke ZIP: {fname}...")
-                        zip_extract_dir = os.path.join(temp_work_dir, f"zip_{uuid.uuid4()[:4]}")
+                        zip_extract_dir = os.path.join(temp_work_dir, f"zip_{str(uuid.uuid4())[:4]}")
                         with zipfile.ZipFile(fpath, 'r') as zip_ref:
                             zip_ref.extractall(zip_extract_dir)
                         extracted = collect_files_from_dir(zip_extract_dir)
@@ -547,7 +541,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             parse_start_time = time.time()
 
             try:
-                # DUAL-STAGE PHASE A: Clef-27B Gate -> Coder LLM Synthese
                 category_tag, processed_md = registry.dispatch_parse(
                     rel_path, raw_text, active_model, active_clef_model, ollama_worker, llm_options, max_embed_chars, 
                     selected_category=category_key, custom_filters=active_custom_filters
@@ -557,7 +550,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ CLEF-GATE: {rel_path} -> 🚫 Irrelevant (SKIP)")
                     continue
 
-                # Quality Control Check
                 is_valid, qc_reason = QualityControl.validate(category_tag, processed_md, rel_path)
                 if not is_valid:
                     log_msg(log_list, f"[{global_idx}/{total_files}] 📄 EXTRAKTION & QC: {rel_path}")
