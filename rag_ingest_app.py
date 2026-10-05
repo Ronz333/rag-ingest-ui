@@ -8,6 +8,7 @@ import hashlib
 import json
 import subprocess
 import multiprocessing
+import urllib.request
 import gradio as gr
 import ollama
 from qdrant_client import QdrantClient
@@ -203,7 +204,6 @@ def get_git_env():
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ASKPASS"] = "echo"
-    # Performance-Booster & IPv4-Zwang gegen Docker-Timeouts:
     env["GIT_CURL_VERBOSE"] = "0"
     return env
 
@@ -217,6 +217,62 @@ def sanitize_url(raw_url: str) -> str:
     if url_match:
         return url_match.group(0).strip()
     return raw_url.strip("[]()'\" ")
+
+def fetch_repository(repo_url: str, target_dir: str, log_list: list) -> bool:
+    """
+    Maßnahme 2: Versucht zuerst ein schnelles ZIP-Archiv via GitHub HEAD.zip herunterzuladen.
+    Sollte dies fehlschlagen oder kein GitHub-Repo sein, erfolgt der Fallback auf 'git clone'.
+    """
+    clean_url = repo_url.rstrip("/").removesuffix(".git")
+
+    if "github.com" in clean_url:
+        zip_url = f"{clean_url}/archive/HEAD.zip"
+        zip_path = os.path.join(os.path.dirname(target_dir), f"temp_{uuid.uuid4()[:6]}.zip")
+        try:
+            log_msg(log_list, f"   ⚡ Versuche Schnell-Download via ZIP: {zip_url}")
+            req = urllib.request.Request(
+                zip_url,
+                headers={"User-Agent": "Mozilla/5.0 (RAG-Ingest-App)"}
+            )
+            with urllib.request.urlopen(req, timeout=30) as response, open(zip_path, 'wb') as out_file:
+                out_file.write(response.read())
+
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(target_dir)
+
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+
+            log_msg(log_list, "   ✅ ZIP erfolgreich geladen und entpackt.")
+            return True
+        except Exception as zip_err:
+            log_msg(log_list, f"   ⚠️ ZIP-Download fehlgeschlagen ({zip_err}). Wechsle zu Git-Clone Fallback...")
+            if os.path.exists(zip_path):
+                try:
+                    os.remove(zip_path)
+                except Exception:
+                    pass
+
+    # Fallback auf Git Clone
+    git_env = get_git_env()
+    res = subprocess.run(
+        [
+            "git", "-c", "http.version=HTTP/1.1", "clone",
+            "--depth", "1",
+            "--single-branch",
+            "--no-tags",
+            repo_url,
+            target_dir
+        ],
+        capture_output=True, text=True, env=git_env
+    )
+    if res.returncode == 0:
+        log_msg(log_list, "   ✅ Git Clone erfolgreich abgeschlossen.")
+        return True
+    else:
+        err_brief = res.stderr.strip()[:200] if res.stderr else "Unbekannter Fehler"
+        log_msg(log_list, f"   ❌ Git-Clone fehlgeschlagen: {err_brief}")
+        return False
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -375,7 +431,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         temp_work_dir = os.path.join("/tmp", f"rag_ingest_{session_id}")
         os.makedirs(temp_work_dir, exist_ok=True)
 
-        git_env = get_git_env()
         files_to_process = []
 
         log_banner(log_list, "AUTONOMOUS PCB RAG INGESTION (CLEF-27B GATEWAY)", "🚀")
@@ -398,30 +453,18 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             log_msg(log_list, f"⛏️ Starte Batch Git-Mining [{mode.upper()}] für {len(clean_repo_urls)} Repository/Repositories...")
 
             for repo_idx, clean_repo_url in enumerate(clean_repo_urls, 1):
-                status_dict["current_file"] = f"Klone Git Repo: {clean_repo_url}"
-                log_msg(log_list, f"   [Repo {repo_idx}/{len(clean_repo_urls)}] Klone: {clean_repo_url}")
-                mined_repo_dir = os.path.join(temp_work_dir, f"mined_repo_{repo_idx}")
-                
-                # Optimierter Blitz-Clone für RAG-Ingestion:
-                res = subprocess.run(
-                    [
-                        "git", "-c", "http.version=HTTP/1.1", "clone",
-                        "--depth", "1",
-                        "--single-branch",
-                        "--no-tags",
-                        "--recurse-submodules",
-                        "--shallow-submodules",
-                        clean_repo_url, 
-                        mined_repo_dir
-                    ],
-                    capture_output=True, 
-                    text=True, 
-                    env=git_env
-                )
+                # Maßnahme 3: Pause zur Vermeidung von GitHub-Rate-Limits bei mehreren Repos
+                if repo_idx > 1:
+                    log_msg(log_list, "⏳ Pause von 2,0s zur Vermeidung von GitHub Rate-Limits...")
+                    time.sleep(2.0)
 
-                if res.returncode != 0:
-                    err_brief = res.stderr.strip()[:200] if res.stderr else "Unbekannter Fehler"
-                    log_msg(log_list, f"   ⚠️ Git-Clone fehlgeschlagen für {clean_repo_url}: {err_brief}")
+                status_dict["current_file"] = f"Lade Repository: {clean_repo_url}"
+                log_msg(log_list, f"   [Repo {repo_idx}/{len(clean_repo_urls)}] Lade: {clean_repo_url}")
+                mined_repo_dir = os.path.join(temp_work_dir, f"mined_repo_{repo_idx}")
+
+                # Maßnahme 2: Schnell-Download via ZIP mit Git-Clone Fallback
+                success = fetch_repository(clean_repo_url, mined_repo_dir, log_list)
+                if not success:
                     continue
 
                 repo_base_name = os.path.basename(clean_repo_url.rstrip("/"))
@@ -442,7 +485,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                             files_to_process.append((f"{repo_base_name}/{rel_p}", full_p))
                             file_count += 1
                 
-                log_msg(log_list, f"   ↳ Repo '{repo_base_name}' geklont ({file_count} Dateien gesammelt).")
+                log_msg(log_list, f"   ↳ Repo '{repo_base_name}' verarbeitet ({file_count} Dateien gesammelt).")
 
         else:
             if files:
@@ -802,28 +845,21 @@ def scan_github_repository(github_url, old_scanned_repo):
         gr.update(visible=False),
         gr.update(visible=False),
         "",
-        f"🌐 Klone Repository {clean_url} im Hintergrund..."
+        f"🌐 Lade Repository {clean_url} im Hintergrund..."
     )
 
     session_id = str(uuid.uuid4())[:8]
     repo_dir = os.path.join("/tmp", f"scan_repo_{session_id}")
 
-    git_env = get_git_env()
+    success = fetch_repository(clean_url, repo_dir, task_manager.log_list)
 
-    res = subprocess.run(
-        ["git", "clone", "--depth", "1", clean_url, repo_dir],
-        capture_output=True, text=True, env=git_env
-    )
-
-    if res.returncode != 0:
-        err_brief = res.stderr.strip()[:200] if res.stderr else "Unbekannter Fehler"
+    if not success:
         task_manager.set_status("🔴 Status: SCAN FEHLGESCHLAGEN")
-        task_manager.append_log(f"❌ Git-Clone fehlgeschlagen: {err_brief}")
         yield (
             gr.update(choices=[], value=[], visible=False),
             gr.update(choices=[], value=[], visible=False),
             "",
-            f"❌ Git-Clone fehlgeschlagen:\n{err_brief}"
+            "❌ Repository-Download fehlgeschlagen."
         )
         return
 
