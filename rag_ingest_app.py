@@ -19,10 +19,11 @@ from processors.processor_registry import registry
 from quality_control import QualityControl
 
 # --- KONFIGURATION & KONSTANTEN ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.abspath(__file__))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_1")
+DEFAULT_CLEF_MODEL = os.getenv("CLEF_MODEL", "cloudflare/clef-27b")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "hf.co/Qwen/Qwen3-Embedding-8B-GGUF:Q5_K_M")
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
 REPO_FILTERS_FILE = os.path.join(BASE_DIR, "repo_filters.json")
@@ -39,7 +40,6 @@ TAG_TO_COLLECTION = {
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# STUFE 1: TECHNISCHER PRE-FILTER (Strengere, aber gezieltere Ausschlusslisten)
 STRICT_EXCLUDE_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".pdf",
     ".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".o", ".obj", ".elf", ".bin", ".hex",
@@ -49,7 +49,6 @@ STRICT_EXCLUDE_NAMES = {
     "package-lock.json", "cargo.lock", "yarn.lock", "composer.lock", "pnpm-lock.yaml",
     "license", "license.txt", "license.md", "copying", "notice"
 }
-# Ordnermuster, die ohne LLM-Aufruf sofort übersprungen werden
 STRICT_EXCLUDE_DIRS = [
     "/.git/", "/build/", "/.vscode/", "/.idea/", "/cmakefiles/", "/node_modules/"
 ]
@@ -269,8 +268,6 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
 
     for root, _, files in os.walk(base_search_path):
         root_lower = root.lower().replace("\\", "/")
-        
-        # Schnelles Überspringen von Build- und System-Ordnern
         if any(ex_dir in root_lower for ex_dir in STRICT_EXCLUDE_DIRS):
             continue
             
@@ -301,7 +298,6 @@ def calculate_dynamic_num_ctx(text_len: int, max_limit: int = 32768) -> int:
     return min(num_ctx, max_limit)
 
 def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int = 400) -> list[str]:
-    """Code-Aware Chunking: Trennt Markdown NIEMALS innerhalb eines ```python oder ```lisp Code-Blocks."""
     if len(text) <= max_chars:
         return [text]
 
@@ -349,7 +345,7 @@ def smart_markdown_chunking(text: str, max_chars: int = 4000, overlap_chars: int
     return sanitized_chunks
 
 # --- PROZESS WORKER ---
-def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size, custom_filters_raw=""):
+def worker_process_entry(log_list, status_dict, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, selected_clef_model, mode, mining_repo_url, num_ctx, max_embed_chars, batch_size, custom_filters_raw=""):
     temp_work_dir = None
     try:
         ollama_worker = ollama.Client(host=OLLAMA_HOST)
@@ -358,6 +354,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         category_info = CATEGORIES.get(category_key, CATEGORIES[list(CATEGORIES.keys())[0]])
         fallback_collection = category_info["collection"]
         active_model = selected_model if selected_model else DEFAULT_MODEL
+        active_clef_model = selected_clef_model if selected_clef_model else DEFAULT_CLEF_MODEL
 
         active_custom_filters = [
             line.strip() for line in (custom_filters_raw or "").splitlines()
@@ -379,10 +376,11 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         git_env = get_git_env()
         files_to_process = []
 
-        log_banner(log_list, "AUTONOMOUS PCB RAG INGESTION GESTARTET", "🚀")
-        log_msg(log_list, f"🤖 LLM Modell      : {active_model} (temp=0.0 für Phase A Extraktion)")
-        log_msg(log_list, f"📐 Embed-Modell    : {EMBED_MODEL}")
-        log_msg(log_list, f"📦 Batch-Größe     : {batch_size} Dateien | Max Tokens: {num_ctx}")
+        log_banner(log_list, "AUTONOMOUS PCB RAG INGESTION (CLEF-27B GATEWAY)", "🚀")
+        log_msg(log_list, f"🎯 Decision Gate    : {active_clef_model} (Phase A1 JSON Head)")
+        log_msg(log_list, f"🤖 Synthesis Model   : {active_model} (Phase A2 SKiDL/PCB Engine)")
+        log_msg(log_list, f"📐 Embed-Modell      : {EMBED_MODEL}")
+        log_msg(log_list, f"📦 Batch-Größe       : {batch_size} Dateien | Max Tokens: {num_ctx}")
         log_msg(log_list, "─" * 70)
 
         if mode in ["repo_mining", "oshw_mining"]:
@@ -416,8 +414,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 file_count = 0
                 for root, _, filenames in os.walk(mined_repo_dir):
                     root_lower = root.lower().replace("\\", "/")
-                    
-                    # Schnelles Überspringen von Build- und System-Ordnern
                     if any(ex_dir in root_lower for ex_dir in STRICT_EXCLUDE_DIRS):
                         continue
 
@@ -494,17 +490,17 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             parse_start_time = time.time()
 
             try:
-                # STUFE 2: Semantisches LLM-Gate & Code-Synthese
+                # DUAL-STAGE PHASE A: Clef-27B Gate -> Coder LLM Synthese
                 category_tag, processed_md = registry.dispatch_parse(
-                    rel_path, raw_text, active_model, ollama_worker, llm_options, max_embed_chars, 
+                    rel_path, raw_text, active_model, active_clef_model, ollama_worker, llm_options, max_embed_chars, 
                     selected_category=category_key, custom_filters=active_custom_filters
                 )
 
                 if processed_md == "SKIP" or not processed_md or processed_md.strip() == "SKIP":
-                    log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ LLM-GATE: {rel_path} -> 🚫 Irrelevant (SKIP)")
+                    log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ CLEF-GATE: {rel_path} -> 🚫 Irrelevant (SKIP)")
                     continue
 
-                # Qualitätskontrolle
+                # Quality Control Check
                 is_valid, qc_reason = QualityControl.validate(category_tag, processed_md, rel_path)
                 if not is_valid:
                     log_msg(log_list, f"[{global_idx}/{total_files}] 📄 EXTRAKTION & QC: {rel_path}")
@@ -513,8 +509,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     continue
 
                 parse_duration = time.time() - parse_start_time
-                
-                # Zuweisung der dynamischen Ziel-Collection
                 target_coll = TAG_TO_COLLECTION.get(category_tag, fallback_collection)
 
                 batch_prepared_items.append({
@@ -543,9 +537,10 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 log_banner(log_list, f"VEKTORISIERUNG BATCH #{batch_count} ({len(batch_prepared_items)} DATEIEN)", "📦")
 
                 if used_llm_in_current_batch:
-                    status_dict["current_file"] = "🔄 VRAM-Switch: Entlade Anwendungs-LLM..."
-                    log_msg(log_list, f"🔄 Entlade Anwendungs-LLM ({active_model}) aus VRAM...")
+                    status_dict["current_file"] = "🔄 VRAM-Switch: Entlade Anwendungs-LLMs..."
+                    log_msg(log_list, f"🔄 Entlade Anwendungs-LLMs ({active_model}, {active_clef_model}) aus VRAM...")
                     unload_ollama_model(ollama_worker, active_model)
+                    unload_ollama_model(ollama_worker, active_clef_model)
                     time.sleep(1.5)
 
                 log_msg(log_list, f"📐 Erzeuge Embeddings ({EMBED_MODEL}) & speichere in Qdrant...")
@@ -583,7 +578,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                                 point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{item_target_coll}_{r_path}_chunk_{chunk_idx}"))
 
-                                # BEREINIGTE PAYLOAD-STRUKTUR: Nur 'content' wird abgelegt
                                 qdrant_worker.upsert(
                                     collection_name=item_target_coll,
                                     points=[
@@ -681,7 +675,7 @@ class IngestProcessManager:
 
         return "\n".join(list(self.log_list)), f"### {self.status_dict['header']}", "📂 **Aktuell in Bearbeitung:** `Keine`"
 
-    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, mode="standard", mining_repo_url="", num_ctx=32768, max_embed_chars=50000, batch_size=25, custom_filters_raw=""):
+    def start_background_job(self, files, scanned_repo_path, selected_folders, selected_exts, category_key, selected_model, selected_clef_model, mode="standard", mining_repo_url="", num_ctx=32768, max_embed_chars=50000, batch_size=25, custom_filters_raw=""):
         if self.is_alive():
             log_msg(self.log_list, "⚠️ Ein Ingestion-Job läuft derzeit noch. Bitte erst abbrechen...")
             return f"### {self.status_dict['header']}"
@@ -693,6 +687,7 @@ class IngestProcessManager:
         
         save_config({
             "last_model": selected_model, 
+            "last_clef_model": selected_clef_model,
             "last_category": category_key,
             "last_num_ctx": num_ctx,
             "last_max_embed_chars": max_embed_chars,
@@ -703,7 +698,7 @@ class IngestProcessManager:
             target=worker_process_entry,
             args=(
                 self.log_list, self.status_dict, files, scanned_repo_path, 
-                selected_folders, selected_exts, category_key, selected_model, 
+                selected_folders, selected_exts, category_key, selected_model, selected_clef_model,
                 mode, mining_repo_url, num_ctx, max_embed_chars, batch_size, custom_filters_raw
             ),
             daemon=True
@@ -716,13 +711,17 @@ task_manager = IngestProcessManager()
 def get_ollama_models():
     config = load_config()
     saved_model = config.get("last_model", DEFAULT_MODEL)
+    saved_clef_model = config.get("last_clef_model", DEFAULT_CLEF_MODEL)
 
     try:
         ollama_client = ollama.Client(host=OLLAMA_HOST)
         res = ollama_client.list()
         models_data = res.get('models', []) if isinstance(res, dict) else getattr(res, 'models', [])
         choices = []
+        clef_choices = []
+        
         found_saved = False
+        found_clef_saved = False
 
         for m in models_data:
             m_name = (
@@ -733,17 +732,24 @@ def get_ollama_models():
             if m_name and m_name != EMBED_MODEL:
                 if m_name == saved_model:
                     found_saved = True
+                if m_name == saved_clef_model:
+                    found_clef_saved = True
+                    
                 is_cloud = any(term in m_name.lower() for term in ["cloud", "gpt", "claude", "gemini", "remote", "openai", "deepseek-v3"])
                 label = f"{m_name} ({'☁️ Cloud' if is_cloud else '💻 Lokal'})"
                 choices.append((label, m_name))
+                clef_choices.append((label, m_name))
         
         if choices:
             selected_default = saved_model if found_saved else choices[0][1]
-            return choices, selected_default
+            selected_clef_default = saved_clef_model if found_clef_saved else (clef_choices[0][1] if clef_choices else DEFAULT_CLEF_MODEL)
+            return choices, selected_default, clef_choices, selected_clef_default
     except Exception as e:
         print(f"Fehler beim Abrufen der Ollama-Modelle: {e}")
     
-    return [(f"{DEFAULT_MODEL} (💻 Lokal)", DEFAULT_MODEL)], DEFAULT_MODEL
+    fallback_choice = [(f"{DEFAULT_MODEL} (💻 Lokal)", DEFAULT_MODEL)]
+    clef_fallback_choice = [(f"{DEFAULT_CLEF_MODEL} (💻 Decision Head)", DEFAULT_CLEF_MODEL)]
+    return fallback_choice, DEFAULT_MODEL, clef_fallback_choice, DEFAULT_CLEF_MODEL
 
 def handle_folder_selection(selected):
     if not selected:
@@ -754,6 +760,9 @@ def handle_folder_selection(selected):
 
 def update_model_preference(model_name):
     save_config({"last_model": model_name})
+
+def update_clef_preference(clef_name):
+    save_config({"last_clef_model": clef_name})
 
 def update_category_preference(cat_name):
     save_config({"last_category": cat_name})
@@ -920,7 +929,7 @@ function() {
 }
 """
 
-initial_model_choices, initial_default_model = get_ollama_models()
+initial_model_choices, initial_default_model, initial_clef_choices, initial_clef_default = get_ollama_models()
 saved_cfg = load_config()
 initial_default_category = saved_cfg.get("last_category", list(CATEGORIES.keys())[0])
 initial_num_ctx = saved_cfg.get("last_num_ctx", 32768)
@@ -934,7 +943,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     repo_state = gr.State("")
     status_timer = gr.Timer(value=1.5)
 
-    gr.Markdown("# 🏢 Universal RAG Ingestion Control Center (Autonomous PCB Generator)")
+    gr.Markdown("# 🏢 Universal RAG Control Center (Clef-27B Decision Pipeline)")
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -942,10 +951,17 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
             current_file_display = gr.Markdown("📂 **Aktuell in Bearbeitung:** `Keine`", elem_classes=["file-status-card"])
 
             with gr.Row(elem_classes=["row-stretch"]):
+                clef_model_dropdown = gr.Dropdown(
+                    choices=initial_clef_choices,
+                    value=initial_clef_default,
+                    label="Phase A1 Decision Gate (e.g., Clef-27B / Fast Classifier)",
+                    interactive=True,
+                    scale=4
+                )
                 model_dropdown = gr.Dropdown(
                     choices=initial_model_choices,
                     value=initial_default_model,
-                    label="LLM Modell (Gespeichert)",
+                    label="Phase A2 Code Synthesizer (e.g., Qwen3-Coder-30B)",
                     interactive=True,
                     scale=4
                 )
@@ -1088,8 +1104,12 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     )
 
     model_dropdown.change(fn=update_model_preference, inputs=[model_dropdown])
+    clef_model_dropdown.change(fn=update_clef_preference, inputs=[clef_model_dropdown])
     category_dropdown.change(fn=update_category_preference, inputs=[category_dropdown])
-    refresh_models_btn.click(fn=lambda: gr.Dropdown(choices=get_ollama_models()[0]), outputs=[model_dropdown])
+    refresh_models_btn.click(
+        fn=lambda: (gr.Dropdown(choices=get_ollama_models()[0]), gr.Dropdown(choices=get_ollama_models()[2])), 
+        outputs=[model_dropdown, clef_model_dropdown]
+    )
 
     filter_preset_dropdown.change(
         fn=handle_preset_dropdown_change,
@@ -1138,26 +1158,26 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     folder_checkboxes.change(fn=handle_folder_selection, inputs=[folder_checkboxes], outputs=[folder_checkboxes])
 
     start_btn.click(
-        fn=lambda files, repo, f_cb, e_cb, cat, mod, ctx, chars, batch, filters: task_manager.start_background_job(
-            files, repo, f_cb, e_cb, cat, mod, mode="standard", num_ctx=ctx, max_embed_chars=chars, batch_size=batch, custom_filters_raw=filters
+        fn=lambda files, repo, f_cb, e_cb, cat, mod, clef_mod, ctx, chars, batch, filters: task_manager.start_background_job(
+            files, repo, f_cb, e_cb, cat, mod, clef_mod, mode="standard", num_ctx=ctx, max_embed_chars=chars, batch_size=batch, custom_filters_raw=filters
         ),
-        inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown, num_ctx_slider, embed_chars_slider, batch_size_slider, custom_filters_input],
+        inputs=[file_input, repo_state, folder_checkboxes, ext_checkboxes, category_dropdown, model_dropdown, clef_model_dropdown, num_ctx_slider, embed_chars_slider, batch_size_slider, custom_filters_input],
         outputs=[status_banner]
     )
 
     start_mining_btn.click(
-        fn=lambda cat, mod, url, ctx, chars, batch, filters: task_manager.start_background_job(
-            None, None, None, None, cat, mod, mode="repo_mining", mining_repo_url=url, num_ctx=ctx, max_embed_chars=chars, batch_size=batch, custom_filters_raw=filters
+        fn=lambda cat, mod, clef_mod, url, ctx, chars, batch, filters: task_manager.start_background_job(
+            None, None, None, None, cat, mod, clef_mod, mode="repo_mining", mining_repo_url=url, num_ctx=ctx, max_embed_chars=chars, batch_size=batch, custom_filters_raw=filters
         ),
-        inputs=[category_dropdown, model_dropdown, mining_repo_input, num_ctx_slider, embed_chars_slider, batch_size_slider, custom_filters_input],
+        inputs=[category_dropdown, model_dropdown, clef_model_dropdown, mining_repo_input, num_ctx_slider, embed_chars_slider, batch_size_slider, custom_filters_input],
         outputs=[status_banner]
     )
 
     start_oshw_btn.click(
-        fn=lambda cat, mod, urls, ctx, chars, batch, filters: task_manager.start_background_job(
-            None, None, None, None, "⚡ PCB & Hardware Design", mod, mode="oshw_mining", mining_repo_url=urls, num_ctx=ctx, max_embed_chars=chars, batch_size=batch, custom_filters_raw=filters
+        fn=lambda cat, mod, clef_mod, urls, ctx, chars, batch, filters: task_manager.start_background_job(
+            None, None, None, None, "⚡ PCB & Hardware Design", mod, clef_mod, mode="oshw_mining", mining_repo_url=urls, num_ctx=ctx, max_embed_chars=chars, batch_size=batch, custom_filters_raw=filters
         ),
-        inputs=[category_dropdown, model_dropdown, oshw_preset_dropdown, num_ctx_slider, embed_chars_slider, batch_size_slider, custom_filters_input],
+        inputs=[category_dropdown, model_dropdown, clef_model_dropdown, oshw_preset_dropdown, num_ctx_slider, embed_chars_slider, batch_size_slider, custom_filters_input],
         outputs=[status_banner]
     )
 
