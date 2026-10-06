@@ -116,3 +116,6 @@ class OSHWCircuitProcessor:
         if not is_rel:
             return "GENERAL", "SKIP"
         return self.synthesize_code(rel_path, raw_text, tag, active_model, ollama_client, llm_options)
+
+# Alias für Abwärtskompatibilität und unterschiedliche Import-Schreibweisen in __init__.py
+OshwCircuitProcessor = OSHWCircuitProcessor
