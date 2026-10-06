@@ -24,7 +24,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_1")
-DEFAULT_CLEF_MODEL = os.getenv("CLEF_MODEL", "cloudflare/clef-27b")
+DEFAULT_CLEF_MODEL = os.getenv("CLEF_MODEL", "clef:latest")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "hf.co/Qwen/Qwen3-Embedding-8B-GGUF:Q5_K_M")
 CONFIG_FILE = "/tmp/rag_ingest_config.json"
 REPO_FILTERS_FILE = os.path.join(BASE_DIR, "repo_filters.json")
@@ -59,7 +59,7 @@ DEFAULT_OSHW_SOURCES = [
     {"name": "🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet, Power)", "url": "https://github.com/OLIMEX/ESP32-GATEWAY"},
     {"name": "🔌 Olimex ESP32-EVB (Ethernet, Relays, CAN Bus, Power)", "url": "https://github.com/OLIMEX/ESP32-EVB"},
     {"name": "⚡ Olimex ESP32-PoE (Power-over-Ethernet, LiPo Charge)", "url": "https://github.com/OLIMEX/ESP32-PoE"},
-    {"name": "⚙️️ SKiDL Core Engine (Python Circuit Synthesis & Pattern Reference)", "url": "https://github.com/xesscorp/skidl"},
+    {"name": "⚙️ SKiDL Core Engine (Python Circuit Synthesis & Pattern Reference)", "url": "https://github.com/xesscorp/skidl"},
     {"name": "🤖 KiBot Main Framework (Official KiCad Automation & DSN Pipelines)", "url": "https://github.com/INTI-CMNB/KiBot"},
     {"name": "🚦 Freerouting Core (Routing Engine & DSN/Rules Grammar)", "url": "https://github.com/freerouting/freerouting.git"}
 ]
@@ -574,7 +574,12 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                 if processor and hasattr(processor, "evaluate_gate"):
                     is_rel, initial_tag = processor.evaluate_gate(
-                        rel_path, raw_text, active_clef_model, ollama_worker, combined_llm_options
+                        rel_path=rel_path, 
+                        raw_text=raw_text, 
+                        active_clef_model=active_clef_model, 
+                        ollama_client=ollama_worker, 
+                        llm_options=combined_llm_options,
+                        log_list=log_list
                     )
                 else:
                     is_rel, initial_tag = True, "GENERAL"
@@ -617,7 +622,13 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                 if processor and hasattr(processor, "synthesize_code"):
                     tag, processed_md = processor.synthesize_code(
-                        rel_path, raw_text, initial_tag, active_model, ollama_worker, combined_llm_options
+                        rel_path=rel_path, 
+                        raw_text=raw_text, 
+                        initial_tag=initial_tag, 
+                        active_model=active_model, 
+                        ollama_client=ollama_worker, 
+                        llm_options=combined_llm_options,
+                        log_list=log_list
                     )
                 else:
                     tag, processed_md = registry.dispatch_parse(
