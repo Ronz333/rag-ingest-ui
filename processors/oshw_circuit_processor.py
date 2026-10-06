@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from typing import Tuple, Dict, Any, Optional
 
 class OSHWCircuitProcessor:
@@ -14,10 +15,16 @@ class OSHWCircuitProcessor:
         self.supported_extensions = OSHWCircuitProcessor.supported_extensions
 
     def can_handle(self, rel_path: str = "", content: Optional[str] = None, file_path: Optional[str] = None, **kwargs) -> bool:
-        """Prüft, ob das Dateiformat von diesem Processor unterstützt wird."""
         target_path = file_path or rel_path or ""
         ext = "." + target_path.rsplit(".", 1)[-1].lower() if "." in target_path else ""
         return ext in self.supported_extensions
+
+    def _log(self, log_list: Optional[Any], text: str):
+        if log_list is not None:
+            timestamp = time.strftime("%H:%M:%S", time.localtime())
+            log_list.append(f"[{timestamp}] {text}")
+        else:
+            print(text)
 
     def evaluate_gate(
         self, 
@@ -28,11 +35,9 @@ class OSHWCircuitProcessor:
         llm_options: Optional[Dict[str, Any]] = None,
         file_path: Optional[str] = None,
         content: Optional[str] = None,
+        log_list: Optional[Any] = None,
         **kwargs
     ) -> Tuple[bool, str]:
-        """
-        Phase A1: Schnellprüfung via Clef-27B (Batch-kompatibel)
-        """
         target_path = file_path or rel_path or ""
         text_data = content or raw_text or ""
         opts = llm_options or {}
@@ -74,7 +79,7 @@ class OSHWCircuitProcessor:
             return True, "SKIDL_SUBCIRCUIT"
 
         except Exception as gate_err:
-            print(f"⚠️ Decision Gate Fehler bei {target_path}: {gate_err}")
+            self._log(log_list, f"   ⚠️ Decision Gate Exception bei {target_path}: {gate_err}")
             return True, "SKIDL_SUBCIRCUIT"
 
     def synthesize_code(
@@ -87,11 +92,9 @@ class OSHWCircuitProcessor:
         llm_options: Optional[Dict[str, Any]] = None,
         file_path: Optional[str] = None,
         content: Optional[str] = None,
+        log_list: Optional[Any] = None,
         **kwargs
     ) -> Tuple[str, str]:
-        """
-        Phase A2: SKiDL Code-Synthese via Qwen3-Coder-30B (Batch-kompatibel)
-        """
         target_path = file_path or rel_path or ""
         text_data = content or raw_text or ""
         opts = llm_options or {}
@@ -124,7 +127,7 @@ class OSHWCircuitProcessor:
             return initial_tag, markdown_out
 
         except Exception as synth_err:
-            print(f"❌ Synthese-Fehler bei {target_path}: {synth_err}")
+            self._log(log_list, f"   ❌ Synthese-Fehler (Ollama Exception) bei {target_path}: {synth_err}")
             return initial_tag, "SKIP"
 
     def parse(
@@ -139,9 +142,9 @@ class OSHWCircuitProcessor:
         custom_filters: Optional[list] = None,
         file_path: Optional[str] = None,
         content: Optional[str] = None,
+        log_list: Optional[Any] = None,
         **kwargs
     ) -> Tuple[str, str]:
-        """Rückwärtskompatible Parse-Methode für Einzelaufrufe & Registry Dispatching"""
         target_path = file_path or rel_path or ""
         text_data = content or raw_text or ""
         opts = llm_options or {}
@@ -152,6 +155,7 @@ class OSHWCircuitProcessor:
             active_clef_model=active_clef_model, 
             ollama_client=ollama_client, 
             llm_options=opts,
+            log_list=log_list,
             **kwargs
         )
         if not is_rel:
@@ -163,8 +167,8 @@ class OSHWCircuitProcessor:
             active_model=active_model, 
             ollama_client=ollama_client, 
             llm_options=opts,
+            log_list=log_list,
             **kwargs
         )
 
-# Alias für Abwärtskompatibilität
 OshwCircuitProcessor = OSHWCircuitProcessor
