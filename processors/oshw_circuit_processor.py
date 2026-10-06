@@ -3,7 +3,6 @@ import re
 from typing import Tuple, Dict, Any, Optional
 
 class OSHWCircuitProcessor:
-    # Klassenattribut für Registry-Instanziierung
     supported_extensions = [
         ".py", ".kicad_sym", ".kicad_sch", ".kicad_pcb", 
         ".dsn", ".rules", ".json", ".yaml", ".yml", 
@@ -13,6 +12,11 @@ class OSHWCircuitProcessor:
     def __init__(self):
         self.category_name = "⚡ PCB & Hardware Design"
         self.supported_extensions = OSHWCircuitProcessor.supported_extensions
+
+    def can_handle(self, rel_path: str, content: Optional[str] = None) -> bool:
+        """Prüft, ob das Dateiformat von diesem Processor unterstützt wird."""
+        ext = "." + rel_path.rsplit(".", 1)[-1].lower() if "." in rel_path else ""
+        return ext in self.supported_extensions
 
     def evaluate_gate(
         self, 
