@@ -540,6 +540,28 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         total_batches = (total_files + batch_size - 1) // batch_size
         log_msg(log_list, f"📊 Gesamt zu verarbeiten: {total_files} Datei(en) in {total_batches} Batch(es) von max. {batch_size}\n")
 
+        # Tolerante und sichere Processor-Auflösung
+        processor = None
+        if hasattr(registry, "get_processor_for_category"):
+            processor = registry.get_processor_for_category(category_key)
+        if not processor and hasattr(registry, "get_processor"):
+            processor = registry.get_processor(category_key)
+        
+        if not processor and hasattr(registry, "processors"):
+            if isinstance(registry.processors, dict):
+                for p_key, p_inst in registry.processors.items():
+                    p_cat = getattr(p_inst, "category_name", "")
+                    if p_key == category_key or p_cat == category_key or category_key in p_cat:
+                        processor = p_inst
+                        break
+                if not processor and len(registry.processors) > 0:
+                    processor = list(registry.processors.values())[0]
+
+        if processor:
+            log_msg(log_list, f"⚙️ Aktiver Processor geladen: {processor.__class__.__name__} ({getattr(processor, 'category_name', 'Default')})")
+        else:
+            log_msg(log_list, f"⚠️ Kein spezifischer Processor für '{category_key}' gefunden. Nutze Standard-Dispatching.")
+
         for batch_start_idx in range(0, total_files, batch_size):
             batch_files = files_to_process[batch_start_idx : batch_start_idx + batch_size]
             batch_num = (batch_start_idx // batch_size) + 1
@@ -551,16 +573,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             log_msg(log_list, f"🎯 [Batch #{batch_num}] Lade Decision Gate ({active_clef_model}) & filtere {len(batch_files)} Dateien...")
             
             gate_passed_files = []
-
-            # Sichere Auflösung des Processors aus der Registry
-            if hasattr(registry, "get_processor_for_category"):
-                processor = registry.get_processor_for_category(category_key)
-            elif hasattr(registry, "get_processor"):
-                processor = registry.get_processor(category_key)
-            elif hasattr(registry, "processors") and isinstance(registry.processors, dict):
-                processor = registry.processors.get(category_key)
-            else:
-                processor = None
 
             for b_idx, (rel_path, file_path) in enumerate(batch_files, 1):
                 global_file_idx = batch_start_idx + b_idx
