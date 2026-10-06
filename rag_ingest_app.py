@@ -41,10 +41,11 @@ TAG_TO_COLLECTION = {
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
+# ENTSCHEIDUNG: .sch (alte KiCad-v5 Schaltpläne) strikt ausschließen
 STRICT_EXCLUDE_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".pdf",
     ".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".o", ".obj", ".elf", ".bin", ".hex",
-    ".zip", ".tar", ".gz", ".7z"
+    ".zip", ".tar", ".gz", ".7z", ".sch"
 }
 STRICT_EXCLUDE_NAMES = {
     "package-lock.json", "cargo.lock", "yarn.lock", "composer.lock", "pnpm-lock.yaml",
@@ -249,7 +250,6 @@ def fetch_repository(repo_url: str, target_dir: str, log_list: list) -> bool:
                 except Exception:
                     pass
 
-    # Fallback auf Git Clone
     git_env = get_git_env()
     res = subprocess.run(
         [
@@ -556,6 +556,15 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     log_msg(log_list, f"           ├── Kategorie : #{category_tag}")
                     log_msg(log_list, f"           └── QC-Status : ⚠️ QC FAILED ({qc_reason}) -> Verworfen!")
                     continue
+
+                # --- DYNAMISCHES CONTENT-REFINEMENT / AUTOMATISCHES TAG-UPGRADE ---
+                # Wenn Phase A2 sauberen SKiDL-Code erzeugt hat, wird die Datei automatisch in skidl_patterns_kb einsortiert!
+                if "from skidl import" in processed_md or "import skidl" in processed_md or ("Part(" in processed_md and "connect(" in processed_md):
+                    category_tag = "SKIDL_SUBCIRCUIT"
+                elif rel_path.lower().endswith(".kicad_sym") or "kicad_symbol" in processed_md.lower():
+                    category_tag = "KICAD_SYMBOL"
+                elif rel_path.lower().endswith((".rules", ".dsn")) or "rule " in processed_md.lower():
+                    category_tag = "DESIGN_RULE"
 
                 parse_duration = time.time() - parse_start_time
                 target_coll = TAG_TO_COLLECTION.get(category_tag, fallback_collection)
@@ -1073,7 +1082,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
 
             with gr.Tabs():
                 with gr.Tab("🔌 OSHW Library Mining"):
-                    gr.Markdown("### 🏛️ Vorkonfigurierte Open-Source Hardware Repositories")
+                    gr.Markdown("### 🏛️️ Vorkonfigurierte Open-Source Hardware Repositories")
                     oshw_preset_dropdown = gr.Dropdown(
                         choices=initial_oshw_choices,
                         value=initial_oshw_defaults,
