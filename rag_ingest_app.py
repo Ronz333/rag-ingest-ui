@@ -41,7 +41,7 @@ TAG_TO_COLLECTION = {
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# ENTSCHEIDUNG: .sch (alte KiCad-v5 Schaltpläne) strikt ausschließen
+# Strikte Ausschlussliste (.sch ausgeschlossen zur Vermeidung von Koordinaten-Spam und Loops)
 STRICT_EXCLUDE_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".pdf",
     ".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".o", ".obj", ".elf", ".bin", ".hex",
@@ -415,12 +415,27 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             if line.strip() and not line.strip().startswith("#")
         ]
 
-        llm_options = {
+        llm_options_clef = {
+            "num_ctx": min(num_ctx, 4096),
+            "temperature": 0.0,
+            "top_p": 0.8,
+            "top_k": 20,
+            "repeat_penalty": 1.05
+        }
+        
+        llm_options_synthesis = {
             "num_ctx": num_ctx,
             "temperature": 0.0,
             "top_p": 0.8,
             "top_k": 20,
             "repeat_penalty": 1.05
+        }
+
+        combined_llm_options = {
+            "clef_options": llm_options_clef,
+            "synthesis_options": llm_options_synthesis,
+            "num_ctx": num_ctx,
+            "temperature": 0.0
         }
 
         session_id = str(uuid.uuid4())[:8]
@@ -430,10 +445,10 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         files_to_process = []
 
         log_banner(log_list, "AUTONOMOUS PCB RAG INGESTION (CLEF-27B GATEWAY)", "🚀")
-        log_msg(log_list, f"🎯 Decision Gate    : {active_clef_model} (Phase A1 JSON Head)")
-        log_msg(log_list, f"🤖 Synthesis Model   : {active_model} (Phase A2 SKiDL/PCB Engine)")
+        log_msg(log_list, f"🎯 Decision Gate    : {active_clef_model} (Phase A1 max 4k Tokens)")
+        log_msg(log_list, f"🤖 Synthesis Model   : {active_model} (Phase A2 SKiDL/PCB Engine | max {num_ctx} Tokens)")
         log_msg(log_list, f"📐 Embed-Modell      : {EMBED_MODEL}")
-        log_msg(log_list, f"📦 Batch-Größe       : {batch_size} Dateien | Max Tokens: {num_ctx}")
+        log_msg(log_list, f"📦 Batch-Größe       : {batch_size} Dateien pro Durchlauf")
         log_msg(log_list, "─" * 70)
 
         if mode in ["repo_mining", "oshw_mining"]:
@@ -522,43 +537,100 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             return
 
         total_files = len(files_to_process)
-        log_msg(log_list, f"📊 Gesamt zu verarbeiten: {total_files} Datei(en)\n")
+        total_batches = (total_files + batch_size - 1) // batch_size
+        log_msg(log_list, f"📊 Gesamt zu verarbeiten: {total_files} Datei(en) in {total_batches} Batch(es) von max. {batch_size}\n")
 
-        batch_prepared_items = []
-        batch_count = 0
-        used_llm_in_current_batch = False
+        # ECHTES PHASEN-BATCHING PRO BATCH-PUFFER
+        for batch_start_idx in range(0, total_files, batch_size):
+            batch_files = files_to_process[batch_start_idx : batch_start_idx + batch_size]
+            batch_num = (batch_start_idx // batch_size) + 1
 
-        for global_idx, (rel_path, file_path) in enumerate(files_to_process, 1):
-            current_buffer_count = len(batch_prepared_items)
-            status_dict["header"] = f"🟢 Status: LÄUFT ({global_idx}/{total_files} | Puffer: {current_buffer_count}/{batch_size})"
-            status_dict["current_file"] = f"🔍 Phase A Analyse: {rel_path}"
+            log_banner(log_list, f"BATCH #{batch_num}/{total_batches} ({len(batch_files)} DATEIEN)", "📦")
 
-            raw_text = extract_text_from_file(file_path)
-            if not raw_text.strip():
-                continue
+            # --- SUB-PHASE 1: BATCH DECISION GATE (Clef-27B) ---
+            status_dict["header"] = f"🟢 Status: LÄUFT (Batch #{batch_num}/{total_batches} - Phase A1 Decision Gate)"
+            log_msg(log_list, f"🎯 [Batch #{batch_num}] Lade Decision Gate ({active_clef_model}) & filtere {len(batch_files)} Dateien...")
+            
+            gate_passed_files = []
+            processor = registry.get_processor_for_category(category_key)
 
-            content_hash = calculate_sha256(raw_text)
-            parse_start_time = time.time()
-
-            try:
-                category_tag, processed_md = registry.dispatch_parse(
-                    rel_path, raw_text, active_model, active_clef_model, ollama_worker, llm_options, max_embed_chars, 
-                    selected_category=category_key, custom_filters=active_custom_filters
-                )
-
-                if processed_md == "SKIP" or not processed_md or processed_md.strip() == "SKIP":
-                    log_msg(log_list, f"[{global_idx}/{total_files}] ⏭️ CLEF-GATE: {rel_path} -> 🚫 Irrelevant (SKIP)")
+            for b_idx, (rel_path, file_path) in enumerate(batch_files, 1):
+                global_file_idx = batch_start_idx + b_idx
+                status_dict["current_file"] = f"🎯 Phase A1 Gate ({global_file_idx}/{total_files}): {rel_path}"
+                
+                raw_text = extract_text_from_file(file_path)
+                if not raw_text.strip():
                     continue
 
-                is_valid, qc_reason = QualityControl.validate(category_tag, processed_md, rel_path)
+                content_hash = calculate_sha256(raw_text)
+
+                if hasattr(processor, "evaluate_gate"):
+                    is_rel, initial_tag = processor.evaluate_gate(
+                        rel_path, raw_text, active_clef_model, ollama_worker, combined_llm_options
+                    )
+                else:
+                    is_rel, initial_tag = True, "GENERAL"
+
+                if not is_rel:
+                    log_msg(log_list, f"[{global_file_idx}/{total_files}] ⏭️ CLEF-GATE: {rel_path} -> 🚫 Irrelevant (SKIP)")
+                else:
+                    log_msg(log_list, f"[{global_file_idx}/{total_files}] 🎯 CLEF-GATE: {rel_path} -> ✅ Relevant (#{initial_tag})")
+                    gate_passed_files.append({
+                        "rel_path": rel_path,
+                        "file_path": file_path,
+                        "raw_text": raw_text,
+                        "content_hash": content_hash,
+                        "initial_tag": initial_tag,
+                        "global_idx": global_file_idx
+                    })
+
+            # Entlade Decision Gate nach Abschluss von Phase A1 für den gesamten Batch
+            log_msg(log_list, f"🔄 Entlade Decision Gate ({active_clef_model}) aus VRAM...")
+            unload_ollama_model(ollama_worker, active_clef_model)
+            time.sleep(1.0)
+
+            if not gate_passed_files:
+                log_msg(log_list, f"ℹ️ [Batch #{batch_num}] Keine relevanten Dateien im Batch nach Gate-Prüfung.\n")
+                continue
+
+            # --- SUB-PHASE 2: BATCH SYNTHESE (Qwen3-Coder-30B) ---
+            status_dict["header"] = f"🟢 Status: LÄUFT (Batch #{batch_num}/{total_batches} - Phase A2 Synthese)"
+            log_msg(log_list, f"🤖 [Batch #{batch_num}] Lade Synthese-Modell ({active_model}) für {len(gate_passed_files)} relevante Dateien...")
+
+            batch_prepared_items = []
+            for item in gate_passed_files:
+                rel_path = item["rel_path"]
+                raw_text = item["raw_text"]
+                initial_tag = item["initial_tag"]
+                g_idx = item["global_idx"]
+                c_hash = item["content_hash"]
+
+                status_dict["current_file"] = f"🤖 Phase A2 Synthese ({g_idx}/{total_files}): {rel_path}"
+                parse_start_time = time.time()
+
+                if hasattr(processor, "synthesize_code"):
+                    tag, processed_md = processor.synthesize_code(
+                        rel_path, raw_text, initial_tag, active_model, ollama_worker, combined_llm_options
+                    )
+                else:
+                    tag, processed_md = registry.dispatch_parse(
+                        rel_path, raw_text, active_model, active_clef_model, ollama_worker, combined_llm_options, max_embed_chars,
+                        selected_category=category_key, custom_filters=active_custom_filters
+                    )
+
+                if processed_md == "SKIP" or not processed_md or processed_md.strip() == "SKIP":
+                    log_msg(log_list, f"[{g_idx}/{total_files}] ⏭️ SYNTHESE: {rel_path} -> 🚫 Verworfen (SKIP)")
+                    continue
+
+                is_valid, qc_reason = QualityControl.validate(tag, processed_md, rel_path)
                 if not is_valid:
-                    log_msg(log_list, f"[{global_idx}/{total_files}] 📄 EXTRAKTION & QC: {rel_path}")
-                    log_msg(log_list, f"           ├── Kategorie : #{category_tag}")
+                    log_msg(log_list, f"[{g_idx}/{total_files}] 📄 EXTRAKTION & QC: {rel_path}")
+                    log_msg(log_list, f"           ├── Kategorie : #{tag}")
                     log_msg(log_list, f"           └── QC-Status : ⚠️ QC FAILED ({qc_reason}) -> Verworfen!")
                     continue
 
-                # --- DYNAMISCHES CONTENT-REFINEMENT / AUTOMATISCHES TAG-UPGRADE ---
-                # Wenn Phase A2 sauberen SKiDL-Code erzeugt hat, wird die Datei automatisch in skidl_patterns_kb einsortiert!
+                # DYNAMISCHES TAG-UPGRADE: Sortiert synthetisierten SKiDL-Code automatisch in skidl_patterns_kb
+                category_tag = tag
                 if "from skidl import" in processed_md or "import skidl" in processed_md or ("Part(" in processed_md and "connect(" in processed_md):
                     category_tag = "SKIDL_SUBCIRCUIT"
                 elif rel_path.lower().endswith(".kicad_sym") or "kicad_symbol" in processed_md.lower():
@@ -571,110 +643,103 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                 batch_prepared_items.append({
                     "rel_path": rel_path,
-                    "content_hash": content_hash,
+                    "content_hash": c_hash,
                     "category_tag": category_tag,
                     "target_collection": target_coll,
                     "processed_md": processed_md,
                     "parse_duration": parse_duration,
-                    "global_idx": global_idx
+                    "global_idx": g_idx
                 })
-                used_llm_in_current_batch = True
 
-                new_buffer_count = len(batch_prepared_items)
-                log_msg(log_list, f"[{global_idx}/{total_files}] 📄 EXTRAKTION & QC: {rel_path}")
+                log_msg(log_list, f"[{g_idx}/{total_files}] 📄 EXTRAKTION & QC: {rel_path}")
                 log_msg(log_list, f"           ├── Ziel-DB   : [{target_coll}] (Tag: #{category_tag})")
-                log_msg(log_list, f"           ├── Dauer     : {parse_duration:.2f}s | Puffer: {new_buffer_count}/{batch_size}")
+                log_msg(log_list, f"           ├── Dauer     : {parse_duration:.2f}s")
                 log_msg(log_list, f"           └── QC-Status : ✅ PASS (Aktiv für Embedding)")
 
-            except Exception as parse_err:
-                log_msg(log_list, f"   ❌ Fehler bei {rel_path}: {str(parse_err)}")
+            # Entlade Synthese-Modell nach Abschluss von Phase A2 für den gesamten Batch
+            log_msg(log_list, f"🔄 Entlade Synthese-Modell ({active_model}) aus VRAM...")
+            unload_ollama_model(ollama_worker, active_model)
+            time.sleep(1.0)
 
-            is_last_file = (global_idx == total_files)
-            if len(batch_prepared_items) >= batch_size or (is_last_file and batch_prepared_items):
-                batch_count += 1
-                log_banner(log_list, f"VEKTORISIERUNG BATCH #{batch_count} ({len(batch_prepared_items)} DATEIEN)", "📦")
+            if not batch_prepared_items:
+                log_msg(log_list, f"ℹ️ [Batch #{batch_num}] Keine auswertbaren Ergebnisse nach Synthese & QC.\n")
+                continue
 
-                if used_llm_in_current_batch:
-                    status_dict["current_file"] = "🔄 VRAM-Switch: Entlade Anwendungs-LLMs..."
-                    log_msg(log_list, f"🔄 Entlade Anwendungs-LLMs ({active_model}, {active_clef_model}) aus VRAM...")
-                    unload_ollama_model(ollama_worker, active_model)
-                    unload_ollama_model(ollama_worker, active_clef_model)
-                    time.sleep(1.5)
+            # --- SUB-PHASE 3: BATCH VEKTORISIERUNG & QDRANT UPSERT (Qwen3-Embedding-8B) ---
+            status_dict["header"] = f"🟢 Status: LÄUFT (Batch #{batch_num}/{total_batches} - Phase B Embedding)"
+            log_msg(log_list, f"📐 [Batch #{batch_num}] Lade Embedding-Modell ({EMBED_MODEL}) für {len(batch_prepared_items)} Elemente...")
 
-                log_msg(log_list, f"📐 Erzeuge Embeddings ({EMBED_MODEL}) & speichere in Qdrant...")
-                overlap_val = max(200, int(max_embed_chars * 0.10))
+            overlap_val = max(200, int(max_embed_chars * 0.10))
 
-                for prep_item in batch_prepared_items:
-                    r_path = prep_item["rel_path"]
-                    c_hash = prep_item["content_hash"]
-                    c_tag = prep_item["category_tag"]
-                    item_target_coll = prep_item["target_collection"]
-                    p_md = prep_item["processed_md"]
-                    g_idx = prep_item["global_idx"]
+            for prep_item in batch_prepared_items:
+                r_path = prep_item["rel_path"]
+                c_hash = prep_item["content_hash"]
+                c_tag = prep_item["category_tag"]
+                item_target_coll = prep_item["target_collection"]
+                p_md = prep_item["processed_md"]
+                g_idx = prep_item["global_idx"]
 
-                    status_dict["current_file"] = f"📐 Phase B Embedding: {r_path}"
-                    embed_start_time = time.time()
-                    md_chunks = smart_markdown_chunking(p_md, max_chars=max_embed_chars, overlap_chars=overlap_val)
+                status_dict["current_file"] = f"📐 Phase B Embedding ({g_idx}/{total_files}): {r_path}"
+                embed_start_time = time.time()
+                md_chunks = smart_markdown_chunking(p_md, max_chars=max_embed_chars, overlap_chars=overlap_val)
 
-                    for chunk_idx, md_chunk in enumerate(md_chunks):
-                        chunk_success = False
-                        retry_count = 0
-                        current_chars = len(md_chunk)
+                for chunk_idx, md_chunk in enumerate(md_chunks):
+                    chunk_success = False
+                    retry_count = 0
+                    current_chars = len(md_chunk)
 
-                        while not chunk_success and retry_count < 3:
-                            try:
-                                chunk_ctx = calculate_dynamic_num_ctx(current_chars, max_limit=32768)
+                    while not chunk_success and retry_count < 3:
+                        try:
+                            chunk_ctx = calculate_dynamic_num_ctx(current_chars, max_limit=32768)
 
-                                embed_res = ollama_worker.embeddings(
-                                    model=EMBED_MODEL, 
-                                    prompt=md_chunk[:current_chars],
-                                    options={"num_ctx": chunk_ctx}
-                                )
+                            embed_res = ollama_worker.embeddings(
+                                model=EMBED_MODEL, 
+                                prompt=md_chunk[:current_chars],
+                                options={"num_ctx": chunk_ctx}
+                            )
 
-                                vector = embed_res['embedding']
-                                ensure_qdrant_collection(qdrant_worker, item_target_coll, len(vector))
+                            vector = embed_res['embedding']
+                            ensure_qdrant_collection(qdrant_worker, item_target_coll, len(vector))
 
-                                point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{item_target_coll}_{r_path}_chunk_{chunk_idx}"))
+                            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{item_target_coll}_{r_path}_chunk_{chunk_idx}"))
 
-                                qdrant_worker.upsert(
-                                    collection_name=item_target_coll,
-                                    points=[
-                                        PointStruct(
-                                            id=point_id,
-                                            vector=vector,
-                                            payload={
-                                                "title": os.path.basename(r_path),
-                                                "filename": os.path.basename(r_path),
-                                                "file_path": r_path,
-                                                "content_hash": c_hash,
-                                                "category_tag": c_tag,
-                                                "chunk_index": chunk_idx,
-                                                "total_chunks": len(md_chunks),
-                                                "content": md_chunk[:current_chars]
-                                            }
-                                        )
+                            qdrant_worker.upsert(
+                                collection_name=item_target_coll,
+                                points=[
+                                    PointStruct(
+                                        id=point_id,
+                                        vector=vector,
+                                        payload={
+                                            "title": os.path.basename(r_path),
+                                            "filename": os.path.basename(r_path),
+                                            "file_path": r_path,
+                                            "content_hash": c_hash,
+                                            "category_tag": c_tag,
+                                            "chunk_index": chunk_idx,
+                                            "total_chunks": len(md_chunks),
+                                            "content": md_chunk[:current_chars]
+                                        }
                                     ]
-                                )
-                                chunk_success = True
+                                ]
+                            )
+                            chunk_success = True
 
-                            except Exception as embed_err:
-                                retry_count += 1
-                                log_msg(log_list, f"   ⚠️ Vulkan-Reset bei {r_path} (Chunk {chunk_idx+1}/{len(md_chunks)}): {embed_err}")
-                                unload_ollama_model(ollama_worker, EMBED_MODEL)
-                                time.sleep(2.5)
-                                current_chars = int(current_chars * 0.80)
+                        except Exception as embed_err:
+                            retry_count += 1
+                            log_msg(log_list, f"   ⚠️ Vulkan-Reset bei {r_path} (Chunk {chunk_idx+1}/{len(md_chunks)}): {embed_err}")
+                            unload_ollama_model(ollama_worker, EMBED_MODEL)
+                            time.sleep(2.5)
+                            current_chars = int(current_chars * 0.80)
 
-                    embed_dur = time.time() - embed_start_time
-                    log_msg(log_list, f"[{g_idx}/{total_files}] 📐 EMBEDDING: {r_path}")
-                    log_msg(log_list, f"           ├── Collection: [{item_target_coll}]")
-                    log_msg(log_list, f"           └── Status    : ✅ Indiziert in {embed_dur:.2f}s ({len(md_chunks)} Chunks)")
+                embed_dur = time.time() - embed_start_time
+                log_msg(log_list, f"[{g_idx}/{total_files}] 📐 EMBEDDING: {r_path}")
+                log_msg(log_list, f"           ├── Collection: [{item_target_coll}]")
+                log_msg(log_list, f"           └── Status    : ✅ Indiziert in {embed_dur:.2f}s ({len(md_chunks)} Chunks)")
 
-                log_msg(log_list, f"🔄 Entlade Embedding-Modell ({EMBED_MODEL}) aus VRAM...\n")
-                unload_ollama_model(ollama_worker, EMBED_MODEL)
-                time.sleep(1.5)
-
-                batch_prepared_items.clear()
-                used_llm_in_current_batch = False
+            # Entlade Embedding-Modell nach Abschluss von Phase B für den gesamten Batch
+            log_msg(log_list, f"🔄 Entlade Embedding-Modell ({EMBED_MODEL}) aus VRAM...\n")
+            unload_ollama_model(ollama_worker, EMBED_MODEL)
+            time.sleep(1.0)
 
         log_banner(log_list, f"INGESTION ERFOLGREICH BEENDET ({total_files} DATEIEN)", "🎉")
         status_dict["header"] = f"✅ Status: ABGESCHLOSSEN ({total_files}/{total_files})"
@@ -1031,8 +1096,8 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                     maximum=200, 
                     step=5, 
                     value=initial_batch_size, 
-                    label="Batch-Größe (Gültig aufbereitete Dateien pro Wechsel)",
-                    info="Legt fest, nach wie vielen verarbeiteten Dateien VRAM entladen und Embeddings gespeichert werden."
+                    label="Batch-Größe (Dateien pro Phasen-Puffer)",
+                    info="Legt fest, wie viele Dateien am Stück pro Modellphase (Gate -> Synthese -> Embedding) verarbeitet werden."
                 )
                 num_ctx_slider = gr.Slider(
                     minimum=4096, 
@@ -1082,7 +1147,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
 
             with gr.Tabs():
                 with gr.Tab("🔌 OSHW Library Mining"):
-                    gr.Markdown("### 🏛️️ Vorkonfigurierte Open-Source Hardware Repositories")
+                    gr.Markdown("### 🏛 OSHW Library Mining")
                     oshw_preset_dropdown = gr.Dropdown(
                         choices=initial_oshw_choices,
                         value=initial_oshw_defaults,
