@@ -59,7 +59,7 @@ DEFAULT_OSHW_SOURCES = [
     {"name": "🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet, Power)", "url": "https://github.com/OLIMEX/ESP32-GATEWAY"},
     {"name": "🔌 Olimex ESP32-EVB (Ethernet, Relays, CAN Bus, Power)", "url": "https://github.com/OLIMEX/ESP32-EVB"},
     {"name": "⚡ Olimex ESP32-PoE (Power-over-Ethernet, LiPo Charge)", "url": "https://github.com/OLIMEX/ESP32-PoE"},
-    {"name": "⚙️ SKiDL Core Engine (Python Circuit Synthesis & Pattern Reference)", "url": "https://github.com/xesscorp/skidl"},
+    {"name": "⚙️️ SKiDL Core Engine (Python Circuit Synthesis & Pattern Reference)", "url": "https://github.com/xesscorp/skidl"},
     {"name": "🤖 KiBot Main Framework (Official KiCad Automation & DSN Pipelines)", "url": "https://github.com/INTI-CMNB/KiBot"},
     {"name": "🚦 Freerouting Core (Routing Engine & DSN/Rules Grammar)", "url": "https://github.com/freerouting/freerouting.git"}
 ]
@@ -551,7 +551,16 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
             log_msg(log_list, f"🎯 [Batch #{batch_num}] Lade Decision Gate ({active_clef_model}) & filtere {len(batch_files)} Dateien...")
             
             gate_passed_files = []
-            processor = registry.get_processor_for_category(category_key)
+
+            # Sichere Auflösung des Processors aus der Registry
+            if hasattr(registry, "get_processor_for_category"):
+                processor = registry.get_processor_for_category(category_key)
+            elif hasattr(registry, "get_processor"):
+                processor = registry.get_processor(category_key)
+            elif hasattr(registry, "processors") and isinstance(registry.processors, dict):
+                processor = registry.processors.get(category_key)
+            else:
+                processor = None
 
             for b_idx, (rel_path, file_path) in enumerate(batch_files, 1):
                 global_file_idx = batch_start_idx + b_idx
@@ -563,7 +572,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
                 content_hash = calculate_sha256(raw_text)
 
-                if hasattr(processor, "evaluate_gate"):
+                if processor and hasattr(processor, "evaluate_gate"):
                     is_rel, initial_tag = processor.evaluate_gate(
                         rel_path, raw_text, active_clef_model, ollama_worker, combined_llm_options
                     )
@@ -606,7 +615,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 status_dict["current_file"] = f"🤖 Phase A2 Synthese ({g_idx}/{total_files}): {rel_path}"
                 parse_start_time = time.time()
 
-                if hasattr(processor, "synthesize_code"):
+                if processor and hasattr(processor, "synthesize_code"):
                     tag, processed_md = processor.synthesize_code(
                         rel_path, raw_text, initial_tag, active_model, ollama_worker, combined_llm_options
                     )
