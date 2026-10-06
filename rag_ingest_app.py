@@ -540,7 +540,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         total_batches = (total_files + batch_size - 1) // batch_size
         log_msg(log_list, f"📊 Gesamt zu verarbeiten: {total_files} Datei(en) in {total_batches} Batch(es) von max. {batch_size}\n")
 
-        # ECHTES PHASEN-BATCHING PRO BATCH-PUFFER
         for batch_start_idx in range(0, total_files, batch_size):
             batch_files = files_to_process[batch_start_idx : batch_start_idx + batch_size]
             batch_num = (batch_start_idx // batch_size) + 1
@@ -584,7 +583,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                         "global_idx": global_file_idx
                     })
 
-            # Entlade Decision Gate nach Abschluss von Phase A1 für den gesamten Batch
             log_msg(log_list, f"🔄 Entlade Decision Gate ({active_clef_model}) aus VRAM...")
             unload_ollama_model(ollama_worker, active_clef_model)
             time.sleep(1.0)
@@ -629,7 +627,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     log_msg(log_list, f"           └── QC-Status : ⚠️ QC FAILED ({qc_reason}) -> Verworfen!")
                     continue
 
-                # DYNAMISCHES TAG-UPGRADE: Sortiert synthetisierten SKiDL-Code automatisch in skidl_patterns_kb
                 category_tag = tag
                 if "from skidl import" in processed_md or "import skidl" in processed_md or ("Part(" in processed_md and "connect(" in processed_md):
                     category_tag = "SKIDL_SUBCIRCUIT"
@@ -656,7 +653,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 log_msg(log_list, f"           ├── Dauer     : {parse_duration:.2f}s")
                 log_msg(log_list, f"           └── QC-Status : ✅ PASS (Aktiv für Embedding)")
 
-            # Entlade Synthese-Modell nach Abschluss von Phase A2 für den gesamten Batch
             log_msg(log_list, f"🔄 Entlade Synthese-Modell ({active_model}) aus VRAM...")
             unload_ollama_model(ollama_worker, active_model)
             time.sleep(1.0)
@@ -665,7 +661,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 log_msg(log_list, f"ℹ️ [Batch #{batch_num}] Keine auswertbaren Ergebnisse nach Synthese & QC.\n")
                 continue
 
-            # --- SUB-PHASE 3: BATCH VEKTORISIERUNG & QDRANT UPSERT (Qwen3-Embedding-8B) ---
+            # --- SUB-PHASE 3: BATCH VEKTORISIERUNG & QDRANT UPSERT ---
             status_dict["header"] = f"🟢 Status: LÄUFT (Batch #{batch_num}/{total_batches} - Phase B Embedding)"
             log_msg(log_list, f"📐 [Batch #{batch_num}] Lade Embedding-Modell ({EMBED_MODEL}) für {len(batch_prepared_items)} Elemente...")
 
@@ -719,7 +715,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                                             "total_chunks": len(md_chunks),
                                             "content": md_chunk[:current_chars]
                                         }
-                                    ]
+                                    )
                                 ]
                             )
                             chunk_success = True
@@ -736,7 +732,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 log_msg(log_list, f"           ├── Collection: [{item_target_coll}]")
                 log_msg(log_list, f"           └── Status    : ✅ Indiziert in {embed_dur:.2f}s ({len(md_chunks)} Chunks)")
 
-            # Entlade Embedding-Modell nach Abschluss von Phase B für den gesamten Batch
             log_msg(log_list, f"🔄 Entlade Embedding-Modell ({EMBED_MODEL}) aus VRAM...\n")
             unload_ollama_model(ollama_worker, EMBED_MODEL)
             time.sleep(1.0)
@@ -873,6 +868,10 @@ def get_ollama_models():
     fallback_choice = [(f"{DEFAULT_MODEL} (💻 Lokal)", DEFAULT_MODEL)]
     clef_fallback_choice = [(f"{DEFAULT_CLEF_MODEL} (💻 Decision Head)", DEFAULT_CLEF_MODEL)]
     return fallback_choice, DEFAULT_MODEL, clef_fallback_choice, DEFAULT_CLEF_MODEL
+
+def refresh_models_action():
+    m_choices, m_def, c_choices, c_def = get_ollama_models()
+    return gr.update(choices=m_choices, value=m_def), gr.update(choices=c_choices, value=c_def)
 
 def handle_folder_selection(selected):
     if not selected:
@@ -1223,7 +1222,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
     clef_model_dropdown.change(fn=update_clef_preference, inputs=[clef_model_dropdown])
     category_dropdown.change(fn=update_category_preference, inputs=[category_dropdown])
     refresh_models_btn.click(
-        fn=lambda: (gr.Dropdown(choices=get_ollama_models()[0]), gr.Dropdown(choices=get_ollama_models()[2])), 
+        fn=refresh_models_action, 
         outputs=[model_dropdown, clef_model_dropdown]
     )
 
