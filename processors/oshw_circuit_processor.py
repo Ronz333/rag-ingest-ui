@@ -3,8 +3,16 @@ import re
 from typing import Tuple, Dict, Any, Optional
 
 class OSHWCircuitProcessor:
+    # Klassenattribut für Registry-Instanziierung
+    supported_extensions = [
+        ".py", ".kicad_sym", ".kicad_sch", ".kicad_pcb", 
+        ".dsn", ".rules", ".json", ".yaml", ".yml", 
+        ".txt", ".md", ".cpp", ".h", ".c", ".ino"
+    ]
+
     def __init__(self):
         self.category_name = "⚡ PCB & Hardware Design"
+        self.supported_extensions = OSHWCircuitProcessor.supported_extensions
 
     def evaluate_gate(
         self, 
@@ -117,5 +125,5 @@ class OSHWCircuitProcessor:
             return "GENERAL", "SKIP"
         return self.synthesize_code(rel_path, raw_text, tag, active_model, ollama_client, llm_options)
 
-# Alias für Abwärtskompatibilität und unterschiedliche Import-Schreibweisen in __init__.py
+# Alias für Abwärtskompatibilität
 OshwCircuitProcessor = OSHWCircuitProcessor
