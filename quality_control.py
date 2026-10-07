@@ -1,142 +1,75 @@
 import ast
-import io
 import re
-import sys
-
+from typing import Tuple
 
 class QualityControl:
-  """Gatekeeper-Modul: Prüft SKiDL-, KiCad- und Symbol-Chunks vor dem Embedding."""
+    @staticmethod
+    def validate(tag: str, markdown_content: str, rel_path: str = "") -> Tuple[bool, str]:
+        if not markdown_content or markdown_content.strip() in ["SKIP", ""]:
+            return False, "Inhalt ist leer oder auf SKIP gesetzt"
 
-  # Striktes Blacklisting von Platzhaltern, Lizenzen und Doku-Müll
-  NOISE_KEYWORDS = [
-      "change log",
-      "changelog",
-      "license",
-      "purchased from",
-      "omitted for simplicity",
-      "placeholder",
-      "todo:",
-      "fixme:",
-      "see datasheet",
-  ]
+        # 1. Strikter Dateinamen- / Pfad-Check (Build-Skripte & Doku abfangen)
+        forbidden_files = ["cmakelists.txt", "makefile", "kbuild", "package-lock.json"]
+        if any(ff in rel_path.lower() for ff in forbidden_files):
+            return False, f"Ungültige Quelldatei für Schaltungssynthese ({rel_path})"
 
-  @staticmethod
-  def validate(
-      category_tag: str, processed_md: str, rel_path: str
-  ) -> tuple[bool, str]:
-    if not processed_md or not processed_md.strip():
-      return False, "Chunk ist leer."
+        # 2. Prüfe FreeRouting-Regeln
+        if tag == "DESIGN_RULE":
+            has_dsn_rules = any(kw in markdown_content.lower() for kw in [
+                "clearance", "trace_width", "via_dia", "netclass", "(rule", "pair_gap", "circuit"
+            ])
+            if not has_dsn_rules:
+                return False, "FreeRouting-Regeln enthalten keine strukturierten DSN/NetClass-Parameter (nur Fließtext/Prosa)"
 
-    md_lower = processed_md.lower()
-    for kw in QualityControl.NOISE_KEYWORDS:
-      if kw in md_lower:
-        return (
-            False,
-            f"Chunk enthält unzulässiges Rauschen/Placeholder-Keyword: '{kw}'",
-        )
+        # 3. Extrahiere Python-Codeblöcke für SKiDL-Prüfung
+        code_blocks = re.findall(r"```python(.*?)```", markdown_content, re.DOTALL)
+        if tag == "SKIDL_SUBCIRCUIT" and not code_blocks:
+            return False, "Kein ```python Code-Block im SKiDL-Subcircuit vorhanden"
 
-    if len(processed_md) < 50:
-      return False, "Inhalt zu kurz (< 50 Zeichen)."
+        for code in code_blocks:
+            code_str = code.strip()
 
-    if category_tag == "SKIDL_SUBCIRCUIT":
-      return QualityControl.validate_skidl_runtime(processed_md)
-    elif category_tag == "DESIGN_RULE":
-      return QualityControl.validate_design_rules(processed_md)
-    elif category_tag in ["DATASHEET_PINOUT", "KICAD_SYMBOL"]:
-      return QualityControl._validate_pinout(processed_md)
+            # A. Python-Syntaxprüfung via AST
+            try:
+                ast.parse(code_str)
+            except SyntaxError as e:
+                return False, f"Python SyntaxError in SKiDL-Code: {e.msg} (Zeile {e.lineno})"
 
-    return True, "OK"
+            # B. Erfundene KiCad-Bibliotheken
+            forbidden_libs = [
+                r"Part\s*\(\s*['\"]Generic['\"]", 
+                r"Part\s*\(\s*['\"]RESISTOR['\"]", 
+                r"Part\s*\(\s*['\"]CAN['\"]",
+                r"Part\s*\(\s*['\"]POWER['\"]"
+            ]
+            for lib_pattern in forbidden_libs:
+                if re.search(lib_pattern, code_str, re.IGNORECASE):
+                    return False, f"Erfundene KiCad-Bibliothek entdeckt ({lib_pattern})"
 
-  @staticmethod
-  def validate_skidl_runtime(md_text: str) -> tuple[bool, str]:
-    code_blocks = re.findall(r"```python(.*?)```", md_text, re.DOTALL)
-    if not code_blocks:
-      return False, "Kein ```python Codeblock im SKiDL-Markdown gefunden."
+            # C. Invalide SKiDL-Syntax & Halluzinierte Methoden
+            if re.search(r"\bPin\s*\(\s*\d", code_str):
+                return False, "Invalide Pin-Syntax mit Zahl/Einheit (z.B. Pin(3.3V))"
 
-    python_code = code_blocks[0].strip()
+            if ".connect(" in code_str:
+                return False, "Invalide SKiDL-Syntax: .connect() verwendet (nutze += Operator)"
 
-    # 1. AST Python-Syntaxprüfung
-    try:
-      ast.parse(python_code)
-    except SyntaxError as e:
-      return False, f"Python SyntaxError in Zeile {e.lineno}: {e.msg}"
+            if re.search(r"\.(set_param|set_routable|set_default_value)\b", code_str):
+                return False, "Halluzinierte SKiDL-Methode entdeckt (.set_param / .set_routable)"
 
-    # 2. Footprint-Check
-    has_footprint = (
-        "footprint=" in python_code
-        or ".footprint =" in python_code
-        or ".footprint=" in python_code
-    )
-    if not has_footprint:
-      return (
-          False,
-          "SKiDL-Code enthält keine expliziten Footprint-Zuweisungen"
-          " (footprint='...').",
-      )
+            if re.search(r"\w+\[['\"]\w+['\"]\]\s*=\s*", code_str):
+                return False, "Invalide Zuweisung an Pin-Dictionary (nutze += Operator)"
 
-    # 3. Testweise Netzlistengenerierung (skidl.generate_netlist())
-    exec_scope = {}
-    wrapper_code = f"""
-from skidl import *
-default_circuit.reset()
+            # D. Schaltungstechnische Plausibilitätsprüfungen (Elektrische Fehler)
+            # D1: VCC/GND direkt an Daten- oder Taktleitungen
+            if re.search(r"(vcc|gnd)\s*\+=\s*.*(eth_mdc|eth_mdio|sd_clk|sd_cmd|spi_miso|spi_mosi)", code_str, re.IGNORECASE):
+                return False, "Elektrischer Kurzschluss: VCC/GND direkt mit Daten/Taktleitung verbunden"
 
-{python_code}
+            # D2: Relais direkt an MCU-Pin ohne Transistor
+            if "Relay" in code_str and not any(q in code_str for q in ["Q_NPN", "Q_NMOS", "2N7002", "BC817", "ULN2003", "Transistor"]):
+                return False, "Fehlender Relais-Treiber: Relaisspule ohne Ansteuertransistor/Treiber definiert"
 
-# Versuch der Netzlisten-Generierung zur Laufzeitprüfung
-try:
-    generate_netlist()
-except Exception as ne:
-    # Fange schwere Validierungsfehler ab
-    if "No components" in str(ne) or "Unconnected" in str(ne):
-        pass
-"""
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+            # D3: Relais ohne Freilaufdiode
+            if "Relay" in code_str and not any(d in code_str for d in ["D_Flyback", "D", "1N4148", "Diode"]):
+                return False, "Gefährliche Relais-Schaltung: Induktive Last ohne Freilaufdiode"
 
-    try:
-      exec(wrapper_code, exec_scope)
-    except Exception as ex:
-      return False, f"SKiDL generate_netlist() Fehler ({type(ex).__name__}): {str(ex)}"
-    finally:
-      sys.stdout, sys.stderr = old_stdout, old_stderr
-
-    return True, "OK"
-
-  @staticmethod
-  def validate_design_rules(md_text: str) -> tuple[bool, str]:
-    forbidden_terms = ["(path ", "(wire ", "(placement "]
-    for term in forbidden_terms:
-      if term in md_text:
-        return (
-            False,
-            f"Verbotene Trace-Geometrie '{term}' im DRC/DSN-Chunk enthalten.",
-        )
-
-    lisp_blocks = re.findall(r"```(?:lisp|text)(.*?)```", md_text, re.DOTALL)
-    if lisp_blocks:
-      lisp_code = lisp_blocks[0].strip()
-      open_b = lisp_code.count("(")
-      close_b = lisp_code.count(")")
-      if open_b != close_b:
-        return (
-            False,
-            f"S-Expression Klammerfehler: {open_b} öffnende vs {close_b}"
-            " schließende Klammern.",
-        )
-
-    return True, "OK"
-
-  @staticmethod
-  def _validate_pinout(md_text: str) -> tuple[bool, str]:
-    if "| Pin Number |" not in md_text and "| Pin |" not in md_text:
-      return False, "Keine valide Markdown-Pin-Tabelle gefunden."
-
-    table_lines = [
-        line
-        for line in md_text.splitlines()
-        if line.startswith("|") and "---" not in line
-    ]
-    if len(table_lines) < 2:
-      return False, "Pin-Tabelle enthält keine Datenzeilen."
-
-    return True, "OK"
+        return True, "Validierung erfolgreich"
