@@ -40,8 +40,7 @@ TAG_TO_COLLECTION = {
 
 CATEGORIES = registry.get_categories_dict()
 
-# Ausschließlich echte Binärformate aussortieren, um Abstürze beim Text-Read zu verhindern.
-# Sämtliche inhaltlichen Entscheidungen trifft das LLM Decision Gate (Phase A1).
+# Ausschließlich echte Binärformate aussortieren
 BINARY_EXCLUDE_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".pdf",
     ".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".o", ".obj", 
@@ -558,6 +557,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     rel_path=rel_path, 
                     raw_text=raw_text, 
                     active_clef_model=active_clef_model, 
+                    active_model=active_model,
                     ollama_client=ollama_worker, 
                     llm_options=combined_llm_options,
                     log_list=log_list
