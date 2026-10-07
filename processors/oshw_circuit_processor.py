@@ -4,7 +4,6 @@ import time
 from typing import Tuple, Dict, Any, Optional
 
 class OSHWCircuitProcessor:
-    # Reine Hardware-, Code- und Regeldateien (KEINE CMakeLists, Makefiles, JSON, TXT)
     supported_extensions = [
         ".py", ".kicad_sym", ".kicad_sch", ".kicad_pcb", 
         ".dsn", ".rules", ".cpp", ".hpp", ".h", ".c", ".ino"
@@ -16,11 +15,6 @@ class OSHWCircuitProcessor:
 
     def can_handle(self, rel_path: str = "", content: Optional[str] = None, file_path: Optional[str] = None, **kwargs) -> bool:
         target_path = (file_path or rel_path or "").lower()
-        
-        # Strikter Ausschluss von Build- & Konfigurationsskripten
-        if any(bad in target_path for bad in ["cmakelists.txt", "makefile", "kbuild", "package-lock.json"]):
-            return False
-            
         ext = "." + target_path.rsplit(".", 1)[-1] if "." in target_path else ""
         return ext in self.supported_extensions
 
@@ -31,10 +25,24 @@ class OSHWCircuitProcessor:
         else:
             print(text)
 
-    def _llm_call(self, ollama_client: Any, model: str, prompt: str, options: Dict[str, Any], log_list: Optional[Any] = None) -> str:
+    def _llm_call(
+        self, 
+        ollama_client: Any, 
+        primary_model: str, 
+        fallback_model: str, 
+        prompt: str, 
+        options: Dict[str, Any], 
+        log_list: Optional[Any] = None
+    ) -> str:
+        """
+        Führt LLM-Aufruf mit dreistufigem Failover aus:
+        1. primary_model via chat()
+        2. primary_model via generate()
+        3. fallback_model via chat() (falls primary_model in Ollama defekt/unsupported ist)
+        """
         try:
             res = ollama_client.chat(
-                model=model,
+                model=primary_model,
                 messages=[{"role": "user", "content": prompt}],
                 options=options
             )
@@ -42,13 +50,26 @@ class OSHWCircuitProcessor:
         except Exception as chat_err:
             err_str = str(chat_err)
             if "does not support chat" in err_str or "400" in err_str:
-                self._log(log_list, f"   ⚠️ Modell '{model}' unterstützt kein 'chat()'. Wechsle zu 'generate()'...")
-                res = ollama_client.generate(
-                    model=model,
-                    prompt=prompt,
-                    options=options
-                )
-                return res['response'].strip()
+                try:
+                    self._log(log_list, f"   ⚠️ Modell '{primary_model}' unterstützt kein 'chat()'. Wechsle zu 'generate()'...")
+                    res = ollama_client.generate(
+                        model=primary_model,
+                        prompt=prompt,
+                        options=options
+                    )
+                    return res['response'].strip()
+                except Exception as gen_err:
+                    gen_str = str(gen_err)
+                    if ("does not support generate" in gen_str or "400" in gen_str) and fallback_model and fallback_model != primary_model:
+                        self._log(log_list, f"   ❌ Modell '{primary_model}' in Ollama defekt (Status 400 auf chat & generate).")
+                        self._log(log_list, f"   🔄 Wechsle für Decision Gate automatisch zum Fallback-Modell '{fallback_model}'...")
+                        res = ollama_client.chat(
+                            model=fallback_model,
+                            messages=[{"role": "user", "content": prompt}],
+                            options=options
+                        )
+                        return res['message']['content'].strip()
+                    raise gen_err
             raise chat_err
 
     def evaluate_gate(
@@ -56,6 +77,7 @@ class OSHWCircuitProcessor:
         rel_path: str = "", 
         raw_text: str = "", 
         active_clef_model: str = "", 
+        active_model: str = "",
         ollama_client: Any = None, 
         llm_options: Optional[Dict[str, Any]] = None,
         file_path: Optional[str] = None,
@@ -65,10 +87,6 @@ class OSHWCircuitProcessor:
     ) -> Tuple[bool, str]:
         target_path = file_path or rel_path or ""
         text_data = content or raw_text or ""
-
-        if not self.can_handle(rel_path=target_path):
-            self._log(log_list, f"   🚫 [GATE-SKIP] Dateityp/Buildskript ausgeschlossen: {target_path}")
-            return False, "SKIP"
 
         opts = llm_options or {}
         clef_opts = opts.get("clef_options", {"num_ctx": 4096, "temperature": 0.0})
@@ -96,7 +114,8 @@ class OSHWCircuitProcessor:
             start_t = time.time()
             gate_content = self._llm_call(
                 ollama_client=ollama_client,
-                model=active_clef_model,
+                primary_model=active_clef_model,
+                fallback_model=active_model,
                 prompt=gate_prompt,
                 options=clef_opts,
                 log_list=log_list
@@ -112,12 +131,13 @@ class OSHWCircuitProcessor:
                 if cat_tag not in ["SKIDL_SUBCIRCUIT", "KICAD_SYMBOL", "DESIGN_RULE"]:
                     cat_tag = "SKIDL_SUBCIRCUIT"
                 return is_rel, cat_tag
-            return False, "SKIP"
+            return True, "SKIDL_SUBCIRCUIT"
 
         except Exception as gate_err:
             err_msg = f"{type(gate_err).__name__}: {str(gate_err)}"
             self._log(log_list, f"   ❌ [GATE-FEHLER] Ollama Aufruf fehlgeschlagen für {target_path}: {err_msg}")
-            return False, "SKIP"
+            # Bei Modellabsturz Datei zur Sicherheit für Synthese zulassen
+            return True, "SKIDL_SUBCIRCUIT"
 
     def synthesize_code(
         self, 
@@ -160,7 +180,8 @@ class OSHWCircuitProcessor:
             start_t = time.time()
             markdown_out = self._llm_call(
                 ollama_client=ollama_client,
-                model=active_model,
+                primary_model=active_model,
+                fallback_model="",
                 prompt=synthesis_prompt,
                 options=synthesis_opts,
                 log_list=log_list
@@ -197,6 +218,7 @@ class OSHWCircuitProcessor:
             rel_path=target_path, 
             raw_text=text_data, 
             active_clef_model=active_clef_model, 
+            active_model=active_model,
             ollama_client=ollama_client, 
             llm_options=opts,
             log_list=log_list,
