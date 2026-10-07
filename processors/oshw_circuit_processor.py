@@ -1,13 +1,14 @@
 import json
 import re
 import time
+import traceback
 from typing import Tuple, Dict, Any, Optional
 
 class OSHWCircuitProcessor:
     supported_extensions = [
         ".py", ".kicad_sym", ".kicad_sch", ".kicad_pcb", 
         ".dsn", ".rules", ".json", ".yaml", ".yml", 
-        ".txt", ".md", ".cpp", ".h", ".c", ".ino"
+        ".txt", ".md", ".cpp", ".hpp", ".h", ".c", ".ino"
     ]
 
     def __init__(self):
@@ -15,9 +16,10 @@ class OSHWCircuitProcessor:
         self.supported_extensions = OSHWCircuitProcessor.supported_extensions
 
     def can_handle(self, rel_path: str = "", content: Optional[str] = None, file_path: Optional[str] = None, **kwargs) -> bool:
-        """Prüft, ob das Dateiformat von diesem Processor unterstützt wird."""
-        target_path = file_path or rel_path or ""
-        ext = "." + target_path.rsplit(".", 1)[-1].lower() if "." in target_path else ""
+        target_path = (file_path or rel_path or "").lower()
+        if "cmakelists.txt" in target_path:
+            return True
+        ext = "." + target_path.rsplit(".", 1)[-1] if "." in target_path else ""
         return ext in self.supported_extensions
 
     def _log(self, log_list: Optional[Any], text: str):
@@ -39,13 +41,12 @@ class OSHWCircuitProcessor:
         log_list: Optional[Any] = None,
         **kwargs
     ) -> Tuple[bool, str]:
-        """
-        Phase A1: Schnellprüfung via Clef-27B (Batch-kompatibel)
-        """
         target_path = file_path or rel_path or ""
         text_data = content or raw_text or ""
         opts = llm_options or {}
         clef_opts = opts.get("clef_options", {"num_ctx": 4096, "temperature": 0.0})
+
+        self._log(log_list, f"   🔍 [GATE-START] Sende Prompt an Model '{active_clef_model}' ({len(text_data)} Zeichen)...")
 
         gate_prompt = (
             f"You are a strict hardware engineering decision gate.\n"
@@ -63,12 +64,15 @@ class OSHWCircuitProcessor:
         )
 
         try:
+            start_t = time.time()
             gate_res = ollama_client.chat(
                 model=active_clef_model,
                 messages=[{"role": "user", "content": gate_prompt}],
                 options=clef_opts
             )
+            elapsed = time.time() - start_t
             gate_content = gate_res['message']['content'].strip()
+            self._log(log_list, f"   ⏱️ [GATE-OK] Antwort in {elapsed:.2f}s empfangen: {gate_content[:120]}...")
             
             json_match = re.search(r'\{.*\}', gate_content, re.DOTALL)
             if json_match:
@@ -79,8 +83,9 @@ class OSHWCircuitProcessor:
             return True, "SKIDL_SUBCIRCUIT"
 
         except Exception as gate_err:
-            self._log(log_list, f"   ⚠️ Decision Gate Exception ({active_clef_model}) bei {target_path}: {gate_err}")
-            return True, "GENERAL"
+            err_msg = f"{type(gate_err).__name__}: {str(gate_err)}"
+            self._log(log_list, f"   ❌ [GATE-FEHLER] Ollama Aufruf fehlgeschlagen für {target_path}: {err_msg}")
+            return True, "SKIDL_SUBCIRCUIT"
 
     def synthesize_code(
         self, 
@@ -95,13 +100,12 @@ class OSHWCircuitProcessor:
         log_list: Optional[Any] = None,
         **kwargs
     ) -> Tuple[str, str]:
-        """
-        Phase A2: SKiDL Code-Synthese via Qwen3-Coder-30B (Batch-kompatibel)
-        """
         target_path = file_path or rel_path or ""
         text_data = content or raw_text or ""
         opts = llm_options or {}
         synthesis_opts = opts.get("synthesis_options", {"num_ctx": opts.get("num_ctx", 32768), "temperature": 0.0})
+
+        self._log(log_list, f"   🤖 [SYNTHESE-START] Sende Prompt an Model '{active_model}' ({len(text_data)} Zeichen)...")
 
         synthesis_prompt = (
             f"You are an expert Hardware & Electronics Design Automation Assistant.\n"
@@ -117,16 +121,20 @@ class OSHWCircuitProcessor:
         )
 
         try:
+            start_t = time.time()
             synth_res = ollama_client.chat(
                 model=active_model,
                 messages=[{"role": "user", "content": synthesis_prompt}],
                 options=synthesis_opts
             )
+            elapsed = time.time() - start_t
             markdown_out = synth_res['message']['content'].strip()
+            self._log(log_list, f"   ✅ [SYNTHESE-OK] Synthese abgeschlossen in {elapsed:.2f}s ({len(markdown_out)} Zeichen generiert).")
             return initial_tag, markdown_out
 
         except Exception as synth_err:
-            self._log(log_list, f"   ❌ Synthese-Fehler (Ollama Exception) ({active_model}) bei {target_path}: {synth_err}")
+            err_msg = f"{type(synth_err).__name__}: {str(synth_err)}"
+            self._log(log_list, f"   ❌ [SYNTHESE-FEHLER] Ollama Aufruf ({active_model}) abgebrochen: {err_msg}")
             return initial_tag, "SKIP"
 
     def parse(
@@ -144,7 +152,6 @@ class OSHWCircuitProcessor:
         log_list: Optional[Any] = None,
         **kwargs
     ) -> Tuple[str, str]:
-        """Rückwärtskompatible Parse-Methode für Einzelaufrufe & Registry Dispatching"""
         target_path = file_path or rel_path or ""
         text_data = content or raw_text or ""
         opts = llm_options or {}
@@ -171,5 +178,4 @@ class OSHWCircuitProcessor:
             **kwargs
         )
 
-# Alias für Abwärtskompatibilität
 OshwCircuitProcessor = OSHWCircuitProcessor
