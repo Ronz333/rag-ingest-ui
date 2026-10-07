@@ -15,7 +15,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from pypdf import PdfReader
 
-# Dynamisches Plugin-System & Quality Control Modul importieren
+# Dynamisches Plugin-System, Processor & Quality Control Modul importieren
 from processors.processor_registry import registry
 from processors.oshw_circuit_processor import OSHWCircuitProcessor
 from quality_control import QualityControl
@@ -35,26 +35,18 @@ OSHW_SOURCES_FILE = os.path.join(BASE_DIR, "oshw_sources.json")
 TAG_TO_COLLECTION = {
     "SKIDL_SUBCIRCUIT": "skidl_patterns_kb",
     "KICAD_SYMBOL": "kicad_sym_kb",
-    "DESIGN_RULE": "freerouting_rules_kb",
-    "GENERAL": "general_knowledge_base"
+    "DESIGN_RULE": "freerouting_rules_kb"
 }
 
 CATEGORIES = registry.get_categories_dict()
-TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# Strikte Ausschlussliste (.sch ausgeschlossen zur Vermeidung von Koordinaten-Spam)
-STRICT_EXCLUDE_EXTS = {
+# Ausschließlich echte Binärformate aussortieren, um Abstürze beim Text-Read zu verhindern.
+# Sämtliche inhaltlichen Entscheidungen trifft das LLM Decision Gate (Phase A1).
+BINARY_EXCLUDE_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".pdf",
-    ".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".o", ".obj", ".elf", ".bin", ".hex",
-    ".zip", ".tar", ".gz", ".7z", ".sch"
+    ".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".o", ".obj", 
+    ".elf", ".bin", ".hex", ".zip", ".tar", ".gz", ".7z", ".a", ".lib"
 }
-STRICT_EXCLUDE_NAMES = {
-    "package-lock.json", "cargo.lock", "yarn.lock", "composer.lock", "pnpm-lock.yaml",
-    "license", "license.txt", "license.md", "copying", "notice"
-}
-STRICT_EXCLUDE_DIRS = [
-    "/.git/", "/build/", "/.vscode/", "/.idea/", "/cmakefiles/", "/node_modules/"
-]
 
 DEFAULT_OSHW_SOURCES = [
     {"name": "🌐 Olimex ESP32-GATEWAY (Industrial IoT, Ethernet, Power)", "url": "https://github.com/OLIMEX/ESP32-GATEWAY"},
@@ -323,20 +315,17 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
 
     for root, _, files in os.walk(base_search_path):
         root_lower = root.lower().replace("\\", "/")
-        if any(ex_dir in root_lower for ex_dir in STRICT_EXCLUDE_DIRS):
+        if "/.git/" in root_lower or "/.vscode/" in root_lower:
             continue
             
         for f in files:
-            f_lower = f.lower()
             ext = os.path.splitext(f)[1].lower()
-            
-            if ext in STRICT_EXCLUDE_EXTS or f_lower in STRICT_EXCLUDE_NAMES:
+            if ext in BINARY_EXCLUDE_EXTS:
                 continue
 
-            if ext in TEXT_EXTENSIONS or f_lower == "cmakelists.txt":
-                full_path = os.path.join(root, f)
-                rel_path = os.path.relpath(full_path, directory)
-                collected.append((rel_path, full_path))
+            full_path = os.path.join(root, f)
+            rel_path = os.path.relpath(full_path, directory)
+            collected.append((rel_path, full_path))
     return collected
 
 def unload_ollama_model(ollama_client, model_name: str):
@@ -406,8 +395,6 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         ollama_worker = ollama.Client(host=OLLAMA_HOST)
         qdrant_worker = QdrantClient(url=QDRANT_HOST)
 
-        category_info = CATEGORIES.get(category_key, CATEGORIES[list(CATEGORIES.keys())[0]])
-        fallback_collection = category_info["collection"]
         active_model = selected_model if selected_model else DEFAULT_MODEL
         active_clef_model = selected_clef_model if selected_clef_model else DEFAULT_CLEF_MODEL
 
@@ -481,21 +468,20 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 file_count = 0
                 for root, _, filenames in os.walk(mined_repo_dir):
                     root_lower = root.lower().replace("\\", "/")
-                    if any(ex_dir in root_lower for ex_dir in STRICT_EXCLUDE_DIRS):
+                    if "/.git/" in root_lower or "/.vscode/" in root_lower:
                         continue
 
                     for f in filenames:
-                        f_lower = f.lower()
                         ext = os.path.splitext(f)[1].lower()
-                        if ext in STRICT_EXCLUDE_EXTS or f_lower in STRICT_EXCLUDE_NAMES:
+                        if ext in BINARY_EXCLUDE_EXTS:
                             continue
-                        if ext in TEXT_EXTENSIONS or f_lower == "cmakelists.txt":
-                            full_p = os.path.join(root, f)
-                            rel_p = os.path.relpath(full_p, mined_repo_dir)
-                            files_to_process.append((f"{repo_base_name}/{rel_p}", full_p))
-                            file_count += 1
+
+                        full_p = os.path.join(root, f)
+                        rel_p = os.path.relpath(full_p, mined_repo_dir)
+                        files_to_process.append((f"{repo_base_name}/{rel_p}", full_p))
+                        file_count += 1
                 
-                log_msg(log_list, f"   ↳ Repo '{repo_base_name}' verarbeitet ({file_count} Dateien gesammelt).")
+                log_msg(log_list, f"   ↳ Repo '{repo_base_name}' verarbeitet ({file_count} Textdateien gesammelt).")
 
         else:
             if files:
@@ -511,7 +497,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                             zip_ref.extractall(zip_extract_dir)
                         extracted = collect_files_from_dir(zip_extract_dir)
                         files_to_process.extend(extracted)
-                    elif ext in TEXT_EXTENSIONS and ext not in STRICT_EXCLUDE_EXTS:
+                    elif ext not in BINARY_EXCLUDE_EXTS:
                         files_to_process.append((fname, fpath))
 
             if scanned_repo_path and os.path.exists(scanned_repo_path) and selected_folders:
@@ -541,9 +527,9 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         total_batches = (total_files + batch_size - 1) // batch_size
         log_msg(log_list, f"📊 Gesamt zu verarbeiten: {total_files} Datei(en) in {total_batches} Batch(es) von max. {batch_size}\n")
 
-        # DIREKTER ERZWUNGENERE EINSATZ DES OSHW-PROCESSORS (Keine Umwege über Registry)
+        # Erzwinge OSHWCircuitProcessor direkt für Hardware & EDA Ingestion
         processor = OSHWCircuitProcessor()
-        log_msg(log_list, f"⚙️ Erzwinge OSHWCircuitProcessor direkt für Hardware & EDA Mining.")
+        log_msg(log_list, f"⚙️ Aktiver Processor: OSHWCircuitProcessor (Semantische Evaluierung via Decision Gate)")
 
         for batch_start_idx in range(0, total_files, batch_size):
             batch_files = files_to_process[batch_start_idx : batch_start_idx + batch_size]
@@ -553,7 +539,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
 
             # --- SUB-PHASE 1: BATCH DECISION GATE (Clef-27B) ---
             status_dict["header"] = f"🟢 Status: LÄUFT (Batch #{batch_num}/{total_batches} - Phase A1 Decision Gate)"
-            log_msg(log_list, f"🎯 [Batch #{batch_num}] Lade Decision Gate ({active_clef_model}) & filtere {len(batch_files)} Dateien...")
+            log_msg(log_list, f"🎯 [Batch #{batch_num}] Lade Decision Gate ({active_clef_model}) & analysiere {len(batch_files)} Dateien...")
             
             gate_passed_files = []
 
@@ -562,7 +548,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 status_dict["current_file"] = f"🎯 Phase A1 Gate ({global_file_idx}/{total_files}): {rel_path}"
                 
                 raw_text = extract_text_from_file(file_path)
-                if not raw_text.strip():
+                if not raw_text or not raw_text.strip():
                     log_msg(log_list, f"[{global_file_idx}/{total_files}] ⏭️ Datei ist leer: {rel_path}")
                     continue
 
@@ -577,8 +563,8 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     log_list=log_list
                 )
 
-                if not is_rel:
-                    log_msg(log_list, f"[{global_file_idx}/{total_files}] ⏭️ CLEF-GATE: {rel_path} -> 🚫 Irrelevant (SKIP)")
+                if not is_rel or initial_tag == "SKIP":
+                    log_msg(log_list, f"[{global_file_idx}/{total_files}] ⏭️ CLEF-GATE: {rel_path} -> 🚫 Semantisch irrelevant (SKIP)")
                 else:
                     log_msg(log_list, f"[{global_file_idx}/{total_files}] 🎯 CLEF-GATE: {rel_path} -> ✅ Relevant (#{initial_tag})")
                     gate_passed_files.append({
@@ -623,10 +609,11 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     log_list=log_list
                 )
 
-                if processed_md == "SKIP" or not processed_md or processed_md.strip() == "SKIP":
+                if processed_md in ["SKIP", ""] or not processed_md:
                     log_msg(log_list, f"[{g_idx}/{total_files}] ⏭️ SYNTHESE: {rel_path} -> 🚫 Verworfen (SKIP)")
                     continue
 
+                # Automatisierter AST- & Hardware-Linter Check
                 is_valid, qc_reason = QualityControl.validate(tag, processed_md, rel_path)
                 if not is_valid:
                     log_msg(log_list, f"[{g_idx}/{total_files}] 📄 EXTRAKTION & QC: {rel_path}")
@@ -634,16 +621,15 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                     log_msg(log_list, f"           └── QC-Status : ⚠️ QC FAILED ({qc_reason}) -> Verworfen!")
                     continue
 
+                # Striktes Routing an Ziel-KB (Verwirft allgemeine Prosa)
                 category_tag = tag
-                if "from skidl import" in processed_md or "import skidl" in processed_md or ("Part(" in processed_md and "connect(" in processed_md):
-                    category_tag = "SKIDL_SUBCIRCUIT"
-                elif rel_path.lower().endswith(".kicad_sym") or "kicad_symbol" in processed_md.lower():
-                    category_tag = "KICAD_SYMBOL"
-                elif rel_path.lower().endswith((".rules", ".dsn")) or "rule " in processed_md.lower():
-                    category_tag = "DESIGN_RULE"
+                target_coll = TAG_TO_COLLECTION.get(category_tag)
+                
+                if not target_coll:
+                    log_msg(log_list, f"[{g_idx}/{total_files}] ⏭️ ROUTING: {rel_path} -> Keine spezifische Hardware-KB (Verworfen)")
+                    continue
 
                 parse_duration = time.time() - parse_start_time
-                target_coll = TAG_TO_COLLECTION.get(category_tag, fallback_collection)
 
                 batch_prepared_items.append({
                     "rel_path": rel_path,
@@ -940,18 +926,16 @@ def scan_github_repository(github_url, old_scanned_repo):
 
     for root, _, files in os.walk(repo_dir):
         root_lower = root.lower().replace("\\", "/")
-        if any(ex_dir in root_lower for ex_dir in STRICT_EXCLUDE_DIRS):
+        if "/.git/" in root_lower or "/.vscode/" in root_lower:
             continue
 
         has_valid = False
         for f in files:
-            f_lower = f.lower()
             ext = os.path.splitext(f)[1].lower()
-            if ext in STRICT_EXCLUDE_EXTS or f_lower in STRICT_EXCLUDE_NAMES:
+            if ext in BINARY_EXCLUDE_EXTS:
                 continue
-            if ext in TEXT_EXTENSIONS or f_lower == "cmakelists.txt":
-                has_valid = True
-                ext_counts[ext] = ext_counts.get(ext, 0) + 1
+            has_valid = True
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
         
         if has_valid:
             rel = os.path.relpath(root, repo_dir)
@@ -1096,7 +1080,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                 interactive=True
             )
 
-            with gr.Accordion("⚙️️ Kontext- & Performance-Einstellungen", open=True):
+            with gr.Accordion("⚙️ Kontext- & Performance-Einstellungen", open=True):
                 batch_size_slider = gr.Slider(
                     minimum=5, 
                     maximum=200, 
