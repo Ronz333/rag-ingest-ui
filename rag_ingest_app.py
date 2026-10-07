@@ -17,6 +17,7 @@ from pypdf import PdfReader
 
 # Dynamisches Plugin-System & Quality Control Modul importieren
 from processors.processor_registry import registry
+from processors.oshw_circuit_processor import OSHWCircuitProcessor
 from quality_control import QualityControl
 
 # --- KONFIGURATION & KONSTANTEN ---
@@ -41,7 +42,7 @@ TAG_TO_COLLECTION = {
 CATEGORIES = registry.get_categories_dict()
 TEXT_EXTENSIONS = registry.get_all_supported_extensions()
 
-# Strikte Ausschlussliste (.sch ausgeschlossen zur Vermeidung von Koordinaten-Spam und Loops)
+# Strikte Ausschlussliste (.sch ausgeschlossen zur Vermeidung von Koordinaten-Spam)
 STRICT_EXCLUDE_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".pdf",
     ".exe", ".dll", ".so", ".dylib", ".pyc", ".pyo", ".o", ".obj", ".elf", ".bin", ".hex",
@@ -332,7 +333,7 @@ def collect_files_from_dir(directory: str, target_subfolder: str = ""):
             if ext in STRICT_EXCLUDE_EXTS or f_lower in STRICT_EXCLUDE_NAMES:
                 continue
 
-            if ext in TEXT_EXTENSIONS:
+            if ext in TEXT_EXTENSIONS or f_lower == "cmakelists.txt":
                 full_path = os.path.join(root, f)
                 rel_path = os.path.relpath(full_path, directory)
                 collected.append((rel_path, full_path))
@@ -488,7 +489,7 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                         ext = os.path.splitext(f)[1].lower()
                         if ext in STRICT_EXCLUDE_EXTS or f_lower in STRICT_EXCLUDE_NAMES:
                             continue
-                        if ext in TEXT_EXTENSIONS:
+                        if ext in TEXT_EXTENSIONS or f_lower == "cmakelists.txt":
                             full_p = os.path.join(root, f)
                             rel_p = os.path.relpath(full_p, mined_repo_dir)
                             files_to_process.append((f"{repo_base_name}/{rel_p}", full_p))
@@ -540,27 +541,9 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
         total_batches = (total_files + batch_size - 1) // batch_size
         log_msg(log_list, f"📊 Gesamt zu verarbeiten: {total_files} Datei(en) in {total_batches} Batch(es) von max. {batch_size}\n")
 
-        # Tolerante und sichere Processor-Auflösung
-        processor = None
-        if hasattr(registry, "get_processor_for_category"):
-            processor = registry.get_processor_for_category(category_key)
-        if not processor and hasattr(registry, "get_processor"):
-            processor = registry.get_processor(category_key)
-        
-        if not processor and hasattr(registry, "processors"):
-            if isinstance(registry.processors, dict):
-                for p_key, p_inst in registry.processors.items():
-                    p_cat = getattr(p_inst, "category_name", "")
-                    if p_key == category_key or p_cat == category_key or category_key in p_cat:
-                        processor = p_inst
-                        break
-                if not processor and len(registry.processors) > 0:
-                    processor = list(registry.processors.values())[0]
-
-        if processor:
-            log_msg(log_list, f"⚙️ Aktiver Processor geladen: {processor.__class__.__name__} ({getattr(processor, 'category_name', 'Default')})")
-        else:
-            log_msg(log_list, f"⚠️ Kein spezifischer Processor für '{category_key}' gefunden. Nutze Standard-Dispatching.")
+        # DIREKTER ERZWUNGENERE EINSATZ DES OSHW-PROCESSORS (Keine Umwege über Registry)
+        processor = OSHWCircuitProcessor()
+        log_msg(log_list, f"⚙️ Erzwinge OSHWCircuitProcessor direkt für Hardware & EDA Mining.")
 
         for batch_start_idx in range(0, total_files, batch_size):
             batch_files = files_to_process[batch_start_idx : batch_start_idx + batch_size]
@@ -580,21 +563,19 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 
                 raw_text = extract_text_from_file(file_path)
                 if not raw_text.strip():
+                    log_msg(log_list, f"[{global_file_idx}/{total_files}] ⏭️ Datei ist leer: {rel_path}")
                     continue
 
                 content_hash = calculate_sha256(raw_text)
 
-                if processor and hasattr(processor, "evaluate_gate"):
-                    is_rel, initial_tag = processor.evaluate_gate(
-                        rel_path=rel_path, 
-                        raw_text=raw_text, 
-                        active_clef_model=active_clef_model, 
-                        ollama_client=ollama_worker, 
-                        llm_options=combined_llm_options,
-                        log_list=log_list
-                    )
-                else:
-                    is_rel, initial_tag = True, "GENERAL"
+                is_rel, initial_tag = processor.evaluate_gate(
+                    rel_path=rel_path, 
+                    raw_text=raw_text, 
+                    active_clef_model=active_clef_model, 
+                    ollama_client=ollama_worker, 
+                    llm_options=combined_llm_options,
+                    log_list=log_list
+                )
 
                 if not is_rel:
                     log_msg(log_list, f"[{global_file_idx}/{total_files}] ⏭️ CLEF-GATE: {rel_path} -> 🚫 Irrelevant (SKIP)")
@@ -632,21 +613,15 @@ def worker_process_entry(log_list, status_dict, files, scanned_repo_path, select
                 status_dict["current_file"] = f"🤖 Phase A2 Synthese ({g_idx}/{total_files}): {rel_path}"
                 parse_start_time = time.time()
 
-                if processor and hasattr(processor, "synthesize_code"):
-                    tag, processed_md = processor.synthesize_code(
-                        rel_path=rel_path, 
-                        raw_text=raw_text, 
-                        initial_tag=initial_tag, 
-                        active_model=active_model, 
-                        ollama_client=ollama_worker, 
-                        llm_options=combined_llm_options,
-                        log_list=log_list
-                    )
-                else:
-                    tag, processed_md = registry.dispatch_parse(
-                        rel_path, raw_text, active_model, active_clef_model, ollama_worker, combined_llm_options, max_embed_chars,
-                        selected_category=category_key, custom_filters=active_custom_filters
-                    )
+                tag, processed_md = processor.synthesize_code(
+                    rel_path=rel_path, 
+                    raw_text=raw_text, 
+                    initial_tag=initial_tag, 
+                    active_model=active_model, 
+                    ollama_client=ollama_worker, 
+                    llm_options=combined_llm_options,
+                    log_list=log_list
+                )
 
                 if processed_md == "SKIP" or not processed_md or processed_md.strip() == "SKIP":
                     log_msg(log_list, f"[{g_idx}/{total_files}] ⏭️ SYNTHESE: {rel_path} -> 🚫 Verworfen (SKIP)")
@@ -974,7 +949,7 @@ def scan_github_repository(github_url, old_scanned_repo):
             ext = os.path.splitext(f)[1].lower()
             if ext in STRICT_EXCLUDE_EXTS or f_lower in STRICT_EXCLUDE_NAMES:
                 continue
-            if ext in TEXT_EXTENSIONS:
+            if ext in TEXT_EXTENSIONS or f_lower == "cmakelists.txt":
                 has_valid = True
                 ext_counts[ext] = ext_counts.get(ext, 0) + 1
         
@@ -1121,7 +1096,7 @@ with gr.Blocks(title="Universal RAG Control Center") as demo:
                 interactive=True
             )
 
-            with gr.Accordion("⚙️ Kontext- & Performance-Einstellungen", open=True):
+            with gr.Accordion("⚙️️ Kontext- & Performance-Einstellungen", open=True):
                 batch_size_slider = gr.Slider(
                     minimum=5, 
                     maximum=200, 
