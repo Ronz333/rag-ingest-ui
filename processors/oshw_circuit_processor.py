@@ -1,7 +1,6 @@
 import json
 import re
 import time
-import traceback
 from typing import Tuple, Dict, Any, Optional
 
 class OSHWCircuitProcessor:
@@ -28,6 +27,30 @@ class OSHWCircuitProcessor:
             log_list.append(f"[{timestamp}] {text}")
         else:
             print(text)
+
+    def _llm_call(self, ollama_client: Any, model: str, prompt: str, options: Dict[str, Any], log_list: Optional[Any] = None) -> str:
+        """
+        Führt den LLM-Aufruf durch und schaltet automatisch von chat() auf generate() um,
+        falls das Modell kein Chat-Template unterstützt (Status 400).
+        """
+        try:
+            res = ollama_client.chat(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                options=options
+            )
+            return res['message']['content'].strip()
+        except Exception as chat_err:
+            err_str = str(chat_err)
+            if "does not support chat" in err_str or "400" in err_str:
+                self._log(log_list, f"   ⚠️ Modell '{model}' unterstützt kein 'chat()'. Wechsle automatisch zu 'generate()' Fallback...")
+                res = ollama_client.generate(
+                    model=model,
+                    prompt=prompt,
+                    options=options
+                )
+                return res['response'].strip()
+            raise chat_err
 
     def evaluate_gate(
         self, 
@@ -65,13 +88,14 @@ class OSHWCircuitProcessor:
 
         try:
             start_t = time.time()
-            gate_res = ollama_client.chat(
+            gate_content = self._llm_call(
+                ollama_client=ollama_client,
                 model=active_clef_model,
-                messages=[{"role": "user", "content": gate_prompt}],
-                options=clef_opts
+                prompt=gate_prompt,
+                options=clef_opts,
+                log_list=log_list
             )
             elapsed = time.time() - start_t
-            gate_content = gate_res['message']['content'].strip()
             self._log(log_list, f"   ⏱️ [GATE-OK] Antwort in {elapsed:.2f}s empfangen: {gate_content[:120]}...")
             
             json_match = re.search(r'\{.*\}', gate_content, re.DOTALL)
@@ -122,13 +146,14 @@ class OSHWCircuitProcessor:
 
         try:
             start_t = time.time()
-            synth_res = ollama_client.chat(
+            markdown_out = self._llm_call(
+                ollama_client=ollama_client,
                 model=active_model,
-                messages=[{"role": "user", "content": synthesis_prompt}],
-                options=synthesis_opts
+                prompt=synthesis_prompt,
+                options=synthesis_opts,
+                log_list=log_list
             )
             elapsed = time.time() - start_t
-            markdown_out = synth_res['message']['content'].strip()
             self._log(log_list, f"   ✅ [SYNTHESE-OK] Synthese abgeschlossen in {elapsed:.2f}s ({len(markdown_out)} Zeichen generiert).")
             return initial_tag, markdown_out
 
